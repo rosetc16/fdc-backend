@@ -41,6 +41,16 @@ paymentsRouter.post('/checkout', requireAuth, async (req, res) => {
 // (signature verification requires the exact unparsed body). NOT added to the JSON-parsed router.
 export async function stripeWebhookHandler(req, res) {
   if (!stripe) return res.status(503).end();
+  // --- diagnostics (temporary): confirm what the handler actually receives ---
+  log.info({
+    bodyIsBuffer: Buffer.isBuffer(req.body),
+    bodyType: typeof req.body,
+    bodyLen: req.body && req.body.length,
+    hasSigHeader: !!req.headers['stripe-signature'],
+    secretLoaded: !!config.stripe.webhookSecret,
+    secretPrefix: config.stripe.webhookSecret ? config.stripe.webhookSecret.slice(0, 8) : null,
+    secretLen: config.stripe.webhookSecret ? config.stripe.webhookSecret.length : 0,
+  }, 'webhook received');
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], config.stripe.webhookSecret);
