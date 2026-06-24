@@ -1,0 +1,162 @@
+-- Fantasy Draft Compass — database schema
+-- Postgres. Implements the data-layer spec: canonical players, format-tagged ADP
+-- observations + consensus, projections, depth charts, news, plus users/leagues/drafts.
+
+-- ============================================================ PLAYERS (canonical identity)
+-- The spine. Every external number resolves to one player_id before it is stored.
+CREATE TABLE IF NOT EXISTS players (
+  player_id      TEXT PRIMARY KEY,          -- our canonical id (we anchor on sleeper_id)
+  sleeper_id     TEXT UNIQUE,
+  espn_id        TEXT,
+  yahoo_id       TEXT,
+  rotowire_id    TEXT,
+  sportradar_id  TEXT,
+  gsis_id        TEXT,
+  full_name      TEXT NOT NULL,
+  norm_name      TEXT NOT NULL,             -- lowercased, punctuation-stripped, for matching
+  team           TEXT,
+  position       TEXT,                      -- QB/RB/WR/TE/K/DST/DL/LB/DB
+  age            INT,
+  bye_week       INT,
+  injury_status  TEXT,
+  active         BOOLEAN DEFAULT TRUE,
+  updated_at     TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_players_norm ON players (norm_name, position);
+CREATE INDEX IF NOT EXISTS idx_players_team ON players (team);
+
+-- Unresolved external rows go here for review instead of being guessed into the engine.
+CREATE TABLE IF NOT EXISTS player_resolution_queue (
+  id         BIGSERIAL PRIMARY KEY,
+  source     TEXT NOT NULL,
+  raw_name   TEXT NOT NULL,
+  raw_team   TEXT,
+  raw_pos    TEXT,
+  payload    JSONB,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================ ADP
+-- Format key buckets every observation. Example: 'PPR|SF|TEP|DYNASTY|12'.
+-- Raw observations from every source (your Sleeper harvest + external feeds).
+CREATE TABLE IF NOT EXISTS adp_observations (
+  id           BIGSERIAL PRIMARY KEY,
+  player_id    TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+  format_key   TEXT NOT NULL,
+  season       INT NOT NULL,
+  source       TEXT NOT NULL,               -- 'sleeper_harvest','fantasypros','yahoo',...
+  source_type  TEXT,                        -- 'aggregated_drafts','expert_consensus','platform_adp'
+  pick         NUMERIC NOT NULL,            -- the observed ADP/pick (single draft pick OR a source's ADP)
+  weight       NUMERIC DEFAULT 1,           -- base source weight (before recency decay)
+  observed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_adp_obs_lookup ON adp_observations (player_id, format_key, season, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_adp_obs_source ON adp_observations (source, observed_at);
+
+-- Pre-computed consensus per (player, format, season). Recomputed by the refresh job.
+CREATE TABLE IF NOT EXISTS adp_consensus (
+  player_id    TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+  format_key   TEXT NOT NULL,
+  season       INT NOT NULL,
+  consensus    NUMERIC NOT NULL,
+  lo           NUMERIC,
+  hi           NUMERIC,
+  stdev        NUMERIC,
+  sample_n     INT,
+  trend        NUMERIC,                      -- change over the trailing window (negative = rising)
+  sources      JSONB,                        -- [{source,value,weight,observed_at,stale}]
+  computed_at  TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (player_id, format_key, season)
+);
+CREATE INDEX IF NOT EXISTS idx_adp_consensus_fmt ON adp_consensus (format_key, season, consensus);
+
+-- ============================================================ PROJECTIONS
+-- Store RAW stat projections; the engine converts to points per league scoring.
+CREATE TABLE IF NOT EXISTS projections (
+  player_id   TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+  season      INT NOT NULL,
+  source      TEXT NOT NULL,                 -- 'sleeper','espn',...
+  stats       JSONB NOT NULL,                -- {passYd, passTD, rushYd, rec, solo, idpSack, ...}
+  floor_pts   NUMERIC,
+  ceil_pts    NUMERIC,
+  updated_at  TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (player_id, season, source)
+);
+CREATE INDEX IF NOT EXISTS idx_proj_season ON projections (season);
+
+-- ============================================================ DEPTH CHARTS
+CREATE TABLE IF NOT EXISTS depth_charts (
+  team        TEXT NOT NULL,
+  position    TEXT NOT NULL,
+  player_id   TEXT REFERENCES players(player_id) ON DELETE CASCADE,
+  rank        INT NOT NULL,                  -- 1 = starter
+  role        TEXT,                          -- 'starter','committee','backup'
+  source      TEXT,
+  updated_at  TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (team, position, rank)
+);
+
+-- ============================================================ NEWS / TRENDS
+CREATE TABLE IF NOT EXISTS news_items (
+  id          BIGSERIAL PRIMARY KEY,
+  player_id   TEXT REFERENCES players(player_id) ON DELETE SET NULL,
+  kind        TEXT,                          -- 'injury','signing','depth_change','suspension'
+  headline    TEXT NOT NULL,
+  body        TEXT,
+  source      TEXT,
+  published_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_news_player ON news_items (player_id, published_at DESC);
+
+-- ============================================================ USERS
+CREATE TABLE IF NOT EXISTS users (
+  id            BIGSERIAL PRIMARY KEY,
+  email         CITEXT UNIQUE NOT NULL,       -- case-insensitive (requires citext extension)
+  password_hash TEXT,
+  is_admin      BOOLEAN DEFAULT FALSE,        -- SERVER-SIDE authority (set from ADMIN_EMAILS at signup)
+  paid_until    TIMESTAMPTZ,                  -- season pass expiry; NULL = not paid
+  comp          BOOLEAN DEFAULT FALSE,        -- comped subscription
+  rank_sets     JSONB DEFAULT '[]'::jsonb,    -- personal rankings (mirrors prototype)
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================ LEAGUES + DRAFTS
+CREATE TABLE IF NOT EXISTS leagues (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  cfg         JSONB NOT NULL,                 -- full league config (teams, scoring, slots, sf, te, ...)
+  connect     JSONB,                          -- {platform, external_id} when synced
+  draft_mode  TEXT,                           -- 'auto'|'manual'|'sleeper'|'espn'|...
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS drafts (
+  id          BIGSERIAL PRIMARY KEY,
+  league_id   BIGINT NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL,                  -- 'official'|'mock'
+  picks       JSONB DEFAULT '[]'::jsonb,      -- [player_id,...] in pick order
+  preds       JSONB DEFAULT '[]'::jsonb,
+  complete    BOOLEAN DEFAULT FALSE,
+  ran_at      TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_league ON drafts (league_id, ran_at DESC);
+
+-- ============================================================ JOB BOOKKEEPING
+CREATE TABLE IF NOT EXISTS job_runs (
+  id          BIGSERIAL PRIMARY KEY,
+  job         TEXT NOT NULL,
+  ok          BOOLEAN,
+  detail      JSONB,
+  started_at  TIMESTAMPTZ DEFAULT now(),
+  finished_at TIMESTAMPTZ
+);
+
+-- Track which Sleeper drafts we've already harvested so we never double-count.
+CREATE TABLE IF NOT EXISTS harvested_drafts (
+  draft_id     TEXT PRIMARY KEY,
+  format_key   TEXT,
+  season       INT,
+  pick_count   INT,
+  harvested_at TIMESTAMPTZ DEFAULT now()
+);

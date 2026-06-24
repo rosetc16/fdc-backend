@@ -1,0 +1,30 @@
+{
+  "name": "fdc-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fantasy Draft Compass — backend API + data-aggregation layer",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node scripts/migrate.js",
+    "harvest": "node src/jobs/harvestSleeperDrafts.js",
+    "refresh": "node src/jobs/refreshAll.js",
+    "test:smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pg": "^8.13.1",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "zod": "^3.24.1",
+    "node-cron": "^3.0.3",
+    "stripe": "^17.5.0",
+    "cors": "^2.8.5",
+    "helmet": "^8.0.0",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0"
+  },
+  "devDependencies": {}
+}
