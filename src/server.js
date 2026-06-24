@@ -20,7 +20,14 @@ import { refreshAll } from './jobs/refreshAll.js';
 const app = express();
 
 app.use(helmet());
-app.use(cors({ origin: config.corsOrigins.length ? config.corsOrigins : true, credentials: true }));
+// CORS: if CORS_ORIGINS is empty or contains "*", allow any origin (reflect it back). Otherwise
+// allow only the listed origins. We reflect the specific origin rather than literally sending "*"
+// so that credentialed requests also work.
+const corsAllowAll = config.corsOrigins.length === 0 || config.corsOrigins.includes('*');
+app.use(cors({
+  origin: corsAllowAll ? true : config.corsOrigins,
+  credentials: true,
+}));
 app.use(pinoHttp({ logger: log }));
 
 // IMPORTANT: Stripe webhook needs the RAW body for signature verification, so mount it BEFORE
