@@ -37,7 +37,9 @@ paymentsRouter.post('/checkout', requireAuth, async (req, res) => {
 });
 
 // Stripe webhook. MUST receive the raw body (wired with express.raw in server.js for this path).
-paymentsRouter.post('/webhook', async (req, res) => {
+// Stripe webhook handler. Exported standalone so server.js can mount it with a raw-body parser
+// (signature verification requires the exact unparsed body). NOT added to the JSON-parsed router.
+export async function stripeWebhookHandler(req, res) {
   if (!stripe) return res.status(503).end();
   let event;
   try {
@@ -55,4 +57,4 @@ paymentsRouter.post('/webhook', async (req, res) => {
     }
   }
   res.json({ received: true });
-});
+}

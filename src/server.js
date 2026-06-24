@@ -13,7 +13,7 @@ import { authRouter } from './routes/auth.js';
 import { adpRouter } from './routes/adp.js';
 import { projectionsRouter } from './routes/projections.js';
 import { leaguesRouter } from './routes/leagues.js';
-import { paymentsRouter } from './routes/payments.js';
+import { paymentsRouter, stripeWebhookHandler } from './routes/payments.js';
 import { adminRouter } from './routes/admin.js';
 import { refreshAll } from './jobs/refreshAll.js';
 
@@ -30,13 +30,16 @@ app.use(cors({
 }));
 app.use(pinoHttp({ logger: log }));
 
-// IMPORTANT: Stripe webhook needs the RAW body for signature verification, so mount it BEFORE
-// the JSON body parser, with express.raw for just that path.
-app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
-  paymentsRouter.handle(req, res, next);
-});
+// IMPORTANT: Stripe webhook signature verification needs the EXACT raw request body. So we mount
+// a dedicated raw-body handler for just this one path, BEFORE the JSON parser, and we import the
+// handler directly (not the whole router) so nothing else touches the body first.
+app.post('/api/payments/webhook', express.raw({ type: '*/*' }), stripeWebhookHandler);
 
-app.use(express.json({ limit: '1mb' }));
+// JSON parser for everything else. We skip the webhook path so its raw body is never re-parsed.
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/payments/webhook') return next();
+  return express.json({ limit: '1mb' })(req, res, next);
+});
 app.use(attachUser);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, season: config.activeSeason, env: config.env }));
