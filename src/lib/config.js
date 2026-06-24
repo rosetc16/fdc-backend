@@ -1,5 +1,7 @@
 // Centralized config from environment. Fails loud on missing critical secrets in production.
-import 'dotenv/config';
+// dotenv is only used to load a local .env file in development; on hosting platforms the env vars
+// are provided directly, so we load it best-effort and never crash if it isn't installed.
+try { await import('dotenv/config'); } catch { /* dotenv optional — env comes from the platform */ }
 
 const required = (key, fallback) => {
   const v = process.env[key] ?? fallback;
