@@ -23,17 +23,18 @@ export async function syncPlayers() {
       const fullName = p.full_name || `${p.first_name || ''} ${p.last_name || ''}`.trim() || sid;
       await client.query(
         `INSERT INTO players (player_id, sleeper_id, espn_id, yahoo_id, rotowire_id, sportradar_id, gsis_id,
-            full_name, norm_name, team, position, age, injury_status, active, updated_at)
-         VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now())
+            full_name, norm_name, team, position, age, years_exp, injury_status, active, updated_at)
+         VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now())
          ON CONFLICT (player_id) DO UPDATE SET
             espn_id=EXCLUDED.espn_id, yahoo_id=EXCLUDED.yahoo_id, rotowire_id=EXCLUDED.rotowire_id,
             sportradar_id=EXCLUDED.sportradar_id, gsis_id=EXCLUDED.gsis_id,
             full_name=EXCLUDED.full_name, norm_name=EXCLUDED.norm_name, team=EXCLUDED.team,
-            position=EXCLUDED.position, age=EXCLUDED.age, injury_status=EXCLUDED.injury_status,
-            active=EXCLUDED.active, updated_at=now()`,
+            position=EXCLUDED.position, age=EXCLUDED.age, years_exp=EXCLUDED.years_exp,
+            injury_status=EXCLUDED.injury_status, active=EXCLUDED.active, updated_at=now()`,
         [sid, p.espn_id || null, p.yahoo_id || null, p.rotowire_id || null,
          p.sportradar_id || null, p.gsis_id || null,
          fullName, normName(fullName), p.team || null, pos, p.age || null,
+         (p.years_exp != null ? p.years_exp : null),
          p.injury_status || null, p.active !== false]
       );
       upserts++;

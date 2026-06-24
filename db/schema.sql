@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS players (
   team           TEXT,
   position       TEXT,                      -- QB/RB/WR/TE/K/DST/DL/LB/DB
   age            INT,
+  years_exp      INT,
   bye_week       INT,
   injury_status  TEXT,
   active         BOOLEAN DEFAULT TRUE,

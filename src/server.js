@@ -11,6 +11,7 @@ import { attachUser } from './lib/auth.js';
 
 import { authRouter } from './routes/auth.js';
 import { adpRouter } from './routes/adp.js';
+import { playerPackRouter } from './routes/playerPack.js';
 import { projectionsRouter } from './routes/projections.js';
 import { leaguesRouter } from './routes/leagues.js';
 import { paymentsRouter, stripeWebhookHandler } from './routes/payments.js';
@@ -46,6 +47,7 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, season: config.active
 
 app.use('/api/auth', authRouter);
 app.use('/api/adp', adpRouter);
+app.use('/api/player-pack', playerPackRouter);
 app.use('/api/projections', projectionsRouter);
 app.use('/api/leagues', leaguesRouter);
 app.use('/api/payments', paymentsRouter);
