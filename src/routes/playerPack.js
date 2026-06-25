@@ -38,7 +38,46 @@ playerPackRouter.get('/', async (req, res) => {
   const season = Number(req.query.season || config.activeSeason);
   const format = String(req.query.format || 'PPR|1QB|STD|REDRAFT|12');
 
-  // 1) consensus ADP for the format (with fallback to a richer profile)
+  // ---- ADP: published Sleeper ADP is the PRIMARY source ------------------------------------------
+  // This early in the year, harvested-draft ADP is thin and rookie-contaminated, so it badly distorts the
+  // board (veterans buried, retired players surfacing). Sleeper's PUBLISHED ADP is the real market every
+  // owner sees, with clean full coverage. So we read published ADP DIRECTLY and use it as the ADP, and
+  // only fall back to harvested consensus where no published number exists for the format.
+  //
+  // Published ADP is stored as observations keyed by format. We resolve the best matching format with a
+  // fallback chain that also degrades SF->1QB and ROOKIE/KEEPER->DYNASTY (so an SF-rookie league still
+  // finds the closest real market number instead of falling through to junk).
+  const pubFallbacks = (key) => {
+    const [scoring, qb, te, pool, teams] = key.split('|');
+    const pools = pool === 'ROOKIE' || pool === 'KEEPER' ? [pool, 'DYNASTY', 'REDRAFT'] : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
+    const qbs = qb === 'SF' ? ['SF', '1QB'] : ['1QB'];
+    const scorings = [scoring, 'PPR'];
+    const out = [];
+    for (const pl of pools) for (const qx of qbs) for (const sc of scorings) for (const tx of [te, 'STD']) for (const tm of [teams, '12'])
+      out.push([sc, qx, tx, pl, tm].join('|'));
+    return [...new Set(out)];
+  };
+  // Pull all published observations for this season once, index by (format_key -> player_id -> pick).
+  const pubRows = (await q(
+    `SELECT player_id, format_key, pick FROM adp_observations
+       WHERE season=$1 AND source='sleeper_published'`,
+    [season]
+  )).rows;
+  const pubByFormat = new Map(); // format_key -> Map(player_id -> pick)
+  for (const r of pubRows) {
+    if (!pubByFormat.has(r.format_key)) pubByFormat.set(r.format_key, new Map());
+    pubByFormat.get(r.format_key).set(r.player_id, Number(r.pick));
+  }
+  // Resolve the published ADP map for THIS format via the fallback chain (first format with coverage).
+  let publishedAdp = new Map();
+  let usedPubFormat = null;
+  for (const fkey of pubFallbacks(format)) {
+    const m = pubByFormat.get(fkey);
+    if (m && m.size > 20) { publishedAdp = m; usedPubFormat = fkey; break; } // need real coverage
+  }
+  const publishedIds = new Set(publishedAdp.keys());
+
+  // Harvested consensus (fallback only — used to fill players with no published number, and for lo/hi/trend)
   let adpRows = [];
   let usedFormat = format;
   for (const fkey of formatFallbacks(format)) {
@@ -50,15 +89,6 @@ playerPackRouter.get('/', async (req, res) => {
     if (r.rows.length) { adpRows = r.rows; usedFormat = fkey; break; }
   }
   const adpById = new Map(adpRows.map((a) => [a.player_id, a]));
-
-  // Which players have a PUBLISHED (real market) ADP observation this season? Published ADP = Sleeper's
-  // own draft board, which only lists currently-relevant players. We use this as the inclusion gate so
-  // long-retired players (who only have stale harvested ADP from odd old mocks) are excluded entirely.
-  const publishedIds = new Set((await q(
-    `SELECT DISTINCT player_id FROM adp_observations
-       WHERE season=$1 AND source='sleeper_published'`,
-    [season]
-  )).rows.map((r) => r.player_id));
 
   // 2) projections for the season
   const projRows = (await q(
@@ -108,6 +138,17 @@ playerPackRouter.get('/', async (req, res) => {
     // long-retired players (Adrian Peterson, Frank Gore, etc.) leak in. This is the hard filter for them.
     if (!proj && !hasPublished) continue;
     const stats = proj ? mapStats(proj.stats) : {};
+    // ADP: prefer the PUBLISHED Sleeper number (the real market). Only if there's no published number
+    // for this player do we fall back to harvested consensus (and only with a healthy sample). This is
+    // what makes the app's ADP match Sleeper — e.g. Tua/Chris Brazzell show their real Sleeper ADP.
+    const pubPick = publishedAdp.get(pl.player_id);
+    let adpVal = null, adpLo = null, adpHi = null, trend = null, sampleN = 0;
+    if (pubPick != null && pubPick > 0) {
+      adpVal = pubPick; sampleN = 999; // published = high confidence
+      if (adp) { adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); }
+    } else if (adp) {
+      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n;
+    }
     pack.push({
       id: pl.player_id,
       name: pl.full_name,
@@ -115,11 +156,8 @@ playerPackRouter.get('/', async (req, res) => {
       team: pl.team || null,
       age: pl.age || null,
       bye: pl.bye_week || null,
-      adp: adp ? Number(adp.consensus) : null,
-      adpLo: adp ? Number(adp.lo) : null,
-      adpHi: adp ? Number(adp.hi) : null,
-      trend: adp ? Number(adp.trend) : null,
-      sampleN: adp ? adp.sample_n : 0,
+      adp: adpVal,
+      adpLo, adpHi, trend, sampleN,
       inj: pl.injury_status || null,
       rookie: pl.years_exp != null && pl.years_exp === 0,
       stats,
@@ -136,5 +174,5 @@ playerPackRouter.get('/', async (req, res) => {
     return a.adp - b.adp;
   });
 
-  res.json({ format: usedFormat, requestedFormat: format, season, count: pack.length, players: pack });
+  res.json({ format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, players: pack });
 });

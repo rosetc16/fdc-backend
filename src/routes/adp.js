@@ -7,6 +7,40 @@ import { formatFallbacks } from '../lib/formatKey.js';
 
 export const adpRouter = Router();
 
+// GET /api/adp/diag?season=2026 — quick data-health check so you can SEE what's in the DB without
+// guessing whether the refresh job ran. Reports published-ADP coverage, harvested coverage, sample
+// players (Tua, a top rookie), and which published formats exist. Open this in a browser after a deploy.
+adpRouter.get('/diag', async (req, res) => {
+  const season = Number(req.query.season || config.activeSeason);
+  try {
+    const pubCount = (await q(`SELECT count(*)::int n, count(DISTINCT player_id)::int players, count(DISTINCT format_key)::int formats FROM adp_observations WHERE season=$1 AND source='sleeper_published'`, [season])).rows[0];
+    const pubFormats = (await q(`SELECT format_key, count(*)::int n FROM adp_observations WHERE season=$1 AND source='sleeper_published' GROUP BY format_key ORDER BY n DESC LIMIT 20`, [season])).rows;
+    const harvestCount = (await q(`SELECT count(*)::int n FROM adp_observations WHERE season=$1 AND source != 'sleeper_published'`, [season])).rows[0];
+    const consensusCount = (await q(`SELECT count(*)::int n, count(DISTINCT format_key)::int formats FROM adp_consensus WHERE season=$1`, [season])).rows[0];
+    const projCount = (await q(`SELECT count(*)::int n FROM projections WHERE season=$1`, [season])).rows[0];
+    const lastJobs = (await q(`SELECT name, ok, detail, created_at FROM job_runs ORDER BY created_at DESC LIMIT 8`).catch(() => ({ rows: [] }))).rows;
+    // sample a couple of players' published ADP across formats
+    const sample = async (nameLike) => (await q(
+      `SELECT p.full_name, p.position, o.format_key, o.pick FROM adp_observations o JOIN players p ON p.player_id=o.player_id
+        WHERE o.season=$1 AND o.source='sleeper_published' AND p.full_name ILIKE $2 ORDER BY o.format_key LIMIT 12`,
+      [season, `%${nameLike}%`]
+    )).rows;
+    res.json({
+      season,
+      published: pubCount, publishedFormats: pubFormats,
+      harvestedObservations: harvestCount, consensus: consensusCount, projections: projCount,
+      sampleTua: await sample('Tua'), sampleBrazzell: await sample('Brazzell'),
+      recentJobs: lastJobs,
+      hint: published_hint(pubCount),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+function published_hint(pub) {
+  if (!pub || pub.n === 0) return 'NO published ADP in the DB — run `npm run refresh` (or `npm run published-adp`) in the Render shell. This is almost certainly why ADP looks wrong.';
+  return `Published ADP present: ${pub.players} players across ${pub.formats} formats.`;
+}
+
+
 // GET /api/adp/board?format=PPR|1QB|STD|REDRAFT|12&season=2026&limit=300
 // Returns the consensus board for a format (sorted by consensus ADP), with fallback.
 adpRouter.get('/board', async (req, res) => {
