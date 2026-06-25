@@ -66,17 +66,41 @@ playerPackRouter.get('/', async (req, res) => {
         AND active = true`
   )).rows;
 
-  // 4) assemble. Prefer players who have either ADP or a projection (keeps the pool meaningful).
+  // Which positions does THIS format actually draft? Parse the format key's QB/TE bits and always
+  // include core skill positions. K/DST are only included when the league rosters them — otherwise a
+  // pile of kickers from harvested K-leagues pollutes the board (e.g. 40 kickers in a row). We infer
+  // K/DST inclusion from the request (?k=1&dst=1) defaulting to OFF, since most modern leagues skip them.
+  const wantK = String(req.query.k || '') === '1';
+  const wantDST = String(req.query.dst || '') === '1';
+  const wantIDP = String(req.query.idp || '') === '1';
+  const posAllowed = (pos) => {
+    if (['QB', 'RB', 'WR', 'TE'].includes(pos)) return true;
+    if (pos === 'K') return wantK;
+    if (pos === 'DST' || pos === 'DEF') return wantDST;
+    if (['DL', 'LB', 'DB'].includes(pos)) return wantIDP;
+    return false;
+  };
+
+  // 4) assemble. A player must have a TRUSTWORTHY signal: a projection, OR ADP from a healthy sample.
+  // Tiny-sample ADP (a player who showed up in one or two old/odd drafts — e.g. a long-retired player)
+  // is NOT trustworthy and gets dropped, which removes the retired-player / junk-ADP contamination.
+  const MIN_ADP_SAMPLE = 4; // need at least a few drafts before we trust a harvested ADP number
   const pack = [];
   for (const pl of players) {
-    const adp = adpById.get(pl.player_id);
+    const pos = pl.position === 'DEF' ? 'DST' : pl.position;
+    if (!posAllowed(pos)) continue; // drop K/DST/IDP the league doesn't use
+    const adpRaw = adpById.get(pl.player_id);
     const proj = projById.get(pl.player_id);
-    if (!adp && !proj) continue; // skip players with neither signal
+    // trust ADP only with a healthy sample; otherwise treat as "no ADP" (projection still keeps them)
+    const adp = adpRaw && Number(adpRaw.sample_n) >= MIN_ADP_SAMPLE ? adpRaw : null;
+    // A player needs a projection (they're a real, projected contributor) OR trustworthy ADP. This
+    // drops retired/irrelevant players who only have stale low-sample ADP and no current projection.
+    if (!proj && !adp) continue;
     const stats = proj ? mapStats(proj.stats) : {};
     pack.push({
       id: pl.player_id,
       name: pl.full_name,
-      pos: pl.position === 'DEF' ? 'DST' : pl.position,
+      pos,
       team: pl.team || null,
       age: pl.age || null,
       bye: pl.bye_week || null,
