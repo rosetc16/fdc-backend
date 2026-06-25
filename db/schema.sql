@@ -117,8 +117,27 @@ CREATE TABLE IF NOT EXISTS users (
   is_admin      BOOLEAN DEFAULT FALSE,        -- SERVER-SIDE authority (set from ADMIN_EMAILS at signup)
   paid_until    TIMESTAMPTZ,                  -- season pass expiry; NULL = not paid
   comp          BOOLEAN DEFAULT FALSE,        -- comped subscription
+  disabled      BOOLEAN DEFAULT FALSE,        -- admin can switch off access entirely
   rank_sets     JSONB DEFAULT '[]'::jsonb,    -- personal rankings (mirrors prototype)
   created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+-- Feedback submitted from the site's contact form. Read in the admin inbox.
+CREATE TABLE IF NOT EXISTS feedback (
+  id          BIGSERIAL PRIMARY KEY,
+  email       CITEXT,                          -- submitter email (may be null if not signed in)
+  category    TEXT,                            -- bug | idea | question | other
+  message     TEXT NOT NULL,
+  status      TEXT DEFAULT 'new',              -- new | read | resolved
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- Pre-granted free access for emails that may not have signed up yet. On signup, if the email has a
+-- pending invite, the account is created already comped.
+CREATE TABLE IF NOT EXISTS comp_invites (
+  email       CITEXT PRIMARY KEY,
+  scope       TEXT DEFAULT 'season',           -- season | forever
+  created_at  TIMESTAMPTZ DEFAULT now()
 );
 
 -- ============================================================ LEAGUES + DRAFTS

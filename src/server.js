@@ -16,6 +16,7 @@ import { projectionsRouter } from './routes/projections.js';
 import { leaguesRouter } from './routes/leagues.js';
 import { paymentsRouter, stripeWebhookHandler } from './routes/payments.js';
 import { adminRouter } from './routes/admin.js';
+import { feedbackRouter } from './routes/feedback.js';
 import { refreshAll } from './jobs/refreshAll.js';
 
 const app = express();
@@ -52,6 +53,7 @@ app.use('/api/projections', projectionsRouter);
 app.use('/api/leagues', leaguesRouter);
 app.use('/api/payments', paymentsRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/feedback', feedbackRouter);
 
 // fallback 404 for unknown api routes
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));

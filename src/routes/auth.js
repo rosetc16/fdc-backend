@@ -18,10 +18,18 @@ authRouter.post('/signup', async (req, res) => {
   if (existing[0]) return res.status(409).json({ error: 'An account with that email already exists' });
   const hash = await hashPassword(parsed.data.password);
   const admin = isAdminEmail(email); // SERVER decides admin
+  // Apply a pending free-access invite, if one exists for this email.
+  const { rows: inv } = await q('SELECT scope FROM comp_invites WHERE email=$1', [email]);
+  let paidUntil = null, comp = false;
+  if (inv[0]) {
+    comp = true;
+    paidUntil = inv[0].scope === 'forever' ? new Date('9999-01-01') : new Date(config.leagueYearCutoff);
+  }
   const { rows } = await q(
-    `INSERT INTO users (email, password_hash, is_admin) VALUES ($1,$2,$3) RETURNING *`,
-    [email, hash, admin]
+    `INSERT INTO users (email, password_hash, is_admin, comp, paid_until) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [email, hash, admin, comp, paidUntil]
   );
+  if (inv[0]) await q('DELETE FROM comp_invites WHERE email=$1', [email]); // consume the invite
   const user = rows[0];
   res.json({ token: signToken(user), user: publicUser(user) });
 });
@@ -48,10 +56,11 @@ authRouter.get('/me', requireAuth, (req, res) => {
 });
 
 function publicUser(u) {
-  const paidActive = u.comp || (u.paid_until && new Date(u.paid_until) > new Date());
+  const disabled = !!u.disabled;
+  const paidActive = !disabled && (u.comp || (u.paid_until && new Date(u.paid_until) > new Date()));
   return {
-    id: u.id, email: u.email, admin: !!u.is_admin,
-    paid: !!paidActive, paidUntil: u.paid_until, comp: !!u.comp,
+    id: u.id, email: u.email, admin: !!u.is_admin && !disabled,
+    paid: !!paidActive, paidUntil: u.paid_until, comp: !!u.comp, disabled,
     rankSets: u.rank_sets || [],
   };
 }
