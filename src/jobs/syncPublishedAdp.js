@@ -22,11 +22,18 @@ const TEAM_BUCKETS = ['8-10', '12', '14+'];
 // dimensions the field doesn't pin down (e.g. redraft PPR ADP applies to both TE-std and TE-premium,
 // 1QB only). Each entry: { field, scoring, qb, pool }. TE is left to expand to STD+TEP unless implied.
 const ADP_FIELDS = [
-  // ---- Redraft (no dynasty/rookie qualifier) ----
+  // ---- Real Sleeper projection ADP fields (confirmed names; these are the ones that actually exist).
+  //      Sleeper's primary ADP in the projections payload is `adp_dd_ppr` (and STD/HALF variants). These
+  //      are what populate the board everyone sees. We map them to the matching format keys.
+  { field: 'adp_dd_ppr',         scoring: 'PPR',  qb: '1QB', pool: 'REDRAFT' },
+  { field: 'adp_dd_std',         scoring: 'STD',  qb: '1QB', pool: 'REDRAFT' },
+  { field: 'adp_dd_half_ppr',    scoring: 'HALF', qb: '1QB', pool: 'REDRAFT' },
+  { field: 'adp_dd_2qb',         scoring: 'PPR',  qb: 'SF',  pool: 'REDRAFT' },
+  // ---- Legacy/alternate names kept as fallbacks (harmless if absent) ----
   { field: 'adp_std',            scoring: 'STD',  qb: '1QB', pool: 'REDRAFT' },
   { field: 'adp_half_ppr',       scoring: 'HALF', qb: '1QB', pool: 'REDRAFT' },
   { field: 'adp_ppr',            scoring: 'PPR',  qb: '1QB', pool: 'REDRAFT' },
-  { field: 'adp_2qb',            scoring: 'PPR',  qb: 'SF',  pool: 'REDRAFT' }, // Sleeper's 2QB ADP ~ PPR base
+  { field: 'adp_2qb',            scoring: 'PPR',  qb: 'SF',  pool: 'REDRAFT' },
   // ---- Dynasty ----
   { field: 'adp_dynasty',        scoring: 'PPR',  qb: '1QB', pool: 'DYNASTY' },
   { field: 'adp_dynasty_std',    scoring: 'STD',  qb: '1QB', pool: 'DYNASTY' },
@@ -64,21 +71,23 @@ export async function syncPublishedAdp({ season = config.activeSeason } = {}) {
   const values = [];
   let players = 0, fieldsFound = 0;
   const byField = {};
+  // DIAGNOSTIC: capture the keys present on the first projection object so we can see where Sleeper puts
+  // the adp_* fields (top-level vs nested in stats). Surfaced in the job detail + logs.
+  let sampleKeys = null, sampleStatsKeys = null;
   for (const r of rows || []) {
     const sid = r.player_id;
     if (!sid || !have.has(sid)) continue;
     const stats = r.stats || {};
+    if (sampleKeys == null) { sampleKeys = Object.keys(r).slice(0, 40); sampleStatsKeys = Object.keys(stats).filter((k) => k.includes('adp')).slice(0, 40); }
     let any = false;
     for (const def of ADP_FIELDS) {
-      const v = stats[def.field];
+      // Sleeper has placed published ADP at the TOP LEVEL of the projection object in some payloads and
+      // inside `stats` in others — check both so we don't silently miss it (the cause of published.n=0).
+      const v = (r[def.field] != null ? r[def.field] : stats[def.field]);
       if (v == null || !(v > 0)) continue;
       any = true; fieldsFound++;
       byField[def.field] = (byField[def.field] || 0) + 1;
       for (const fkey of expandFormatKeys(def)) {
-        // weight 6: published ADP is the REAL market board every owner sees, with full veteran coverage.
-        // It must dominate the thin, rookie-contaminated harvested ADP we get early in the summer (which
-        // otherwise drags veterans like Tua down to junk values). Harvested drafts still nudge the exact
-        // size/TE bucket, but they can no longer override the published market number.
         values.push([sid, fkey, season, 'sleeper_published', 'platform_adp', Number(v), 6]);
       }
     }
@@ -102,7 +111,7 @@ export async function syncPublishedAdp({ season = config.activeSeason } = {}) {
     written += slice.length;
   }
 
-  const detail = { season, players, fieldsFound, observationsWritten: written, byField, ms: Date.now() - started };
+  const detail = { season, projectionRowsSeen: (rows || []).length, players, fieldsFound, observationsWritten: written, byField, sampleObjectKeys: sampleKeys, sampleAdpKeysInStats: sampleStatsKeys, ms: Date.now() - started };
   log.info(detail, 'syncPublishedAdp done');
   await recordJob('syncPublishedAdp', true, detail);
   return detail;

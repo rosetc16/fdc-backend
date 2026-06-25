@@ -7,6 +7,32 @@ import { formatFallbacks } from '../lib/formatKey.js';
 
 export const adpRouter = Router();
 
+// GET /api/adp/raw-projection?season=2026 — fetch ONE live Sleeper projection object and dump its raw
+// keys, so we can see EXACTLY what ADP fields Sleeper provides (and where). Definitive check for whether
+// ADP lives in the projections payload and under what key names. Open in a browser.
+adpRouter.get('/raw-projection', async (req, res) => {
+  const season = Number(req.query.season || config.activeSeason);
+  try {
+    const { getSeasonProjections } = await import('../lib/sleeper.js');
+    const rows = await getSeasonProjections(season);
+    const n = (rows || []).length;
+    if (!n) return res.json({ season, rowsReturned: 0, note: 'Sleeper returned no projections for this season — it may not be published yet, or the endpoint/season is off.' });
+    const sample = rows.find((r) => r.stats && Object.keys(r.stats).some((k) => k.includes('adp'))) || rows[0];
+    const adpKeysAnywhere = new Set();
+    for (const r of rows.slice(0, 300)) {
+      Object.keys(r || {}).forEach((k) => { if (k.toLowerCase().includes('adp')) adpKeysAnywhere.add('TOP:' + k); });
+      Object.keys((r && r.stats) || {}).forEach((k) => { if (k.toLowerCase().includes('adp')) adpKeysAnywhere.add('stats:' + k); });
+    }
+    res.json({
+      season, rowsReturned: n,
+      sampleTopLevelKeys: Object.keys(sample || {}),
+      sampleStatsKeys: Object.keys((sample && sample.stats) || {}),
+      allAdpKeysFound: [...adpKeysAnywhere],
+      hint: adpKeysAnywhere.size ? 'ADP keys exist — see allAdpKeysFound for exact names.' : 'No ADP keys in projections — Sleeper ADP comes from elsewhere; we will switch sources.',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/adp/diag?season=2026 — quick data-health check so you can SEE what's in the DB without
 // guessing whether the refresh job ran. Reports published-ADP coverage, harvested coverage, sample
 // players (Tua, a top rookie), and which published formats exist. Open this in a browser after a deploy.
