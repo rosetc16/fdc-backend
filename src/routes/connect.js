@@ -157,12 +157,20 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       });
     });
 
+    // Draft type: Sleeper reports type "snake"/"linear"/"auction", but THIRD-ROUND REVERSAL is a
+    // separate setting (reversal_round = 3), not a distinct type. Detect it so future picks order
+    // correctly. Map: reversal_round>=1 → "3rr"; linear → "linear"; else "snake".
+    const reversalRound = draft && draft.settings && Number(draft.settings.reversal_round || 0);
+    let resolvedType = (draft && draft.type) === 'linear' ? 'linear' : 'snake';
+    if (reversalRound && reversalRound >= 1) resolvedType = '3rr';
+
     res.json({
       league_id: leagueId, name: league.name, draft_id: draftMeta.draft_id,
       status: draft?.status || draftMeta.status || 'unknown', // pre_draft | drafting | complete | paused
       teams: teamsN,
       cfg: cfgFromLeague(league, draft),
-      draftType: (draft && draft.type) || 'snake', // snake | linear
+      draftType: resolvedType,   // snake | linear | 3rr
+      reversalRound: reversalRound || null,
       yourSlot,                 // 1-based slot of the connecting user (null if not resolved)
       slotNames: slotName,      // { slot: teamName } for all teams
       tradedPicks,              // resolved to slots
