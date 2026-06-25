@@ -71,6 +71,7 @@ export async function getSeasonProjections(season, { positions } = {}) {
 // ---- Drafts ----
 export const getDraft = (draftId) => getJson(`/draft/${draftId}`);
 export const getDraftPicks = (draftId) => getJson(`/draft/${draftId}/picks`);
+export const getDraftTradedPicks = (draftId) => getJson(`/draft/${draftId}/traded_picks`);
 export const getLeagueDrafts = (leagueId) => getJson(`/league/${leagueId}/drafts`);
 export const getUser = (username) => getJson(`/user/${username}`);
 export const getUserDrafts = (userId, season) => getJson(`/user/${userId}/drafts/nfl/${season}`);

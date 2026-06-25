@@ -7,7 +7,7 @@ import { config } from '../lib/config.js';
 import { requireAuth } from '../lib/auth.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
-  getDraft, getDraftPicks, getAllPlayers,
+  getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers,
 } from '../lib/sleeper.js';
 
 export const connectRouter = Router();
@@ -69,17 +69,60 @@ connectRouter.get('/sleeper/leagues', async (req, res) => {
 connectRouter.get('/sleeper/draft', async (req, res) => {
   const leagueId = String(req.query.league_id || '').trim();
   if (!leagueId) return res.status(400).json({ error: 'league_id required' });
+  const username = String(req.query.username || '').trim().toLowerCase();
   try {
     const league = await getLeague(leagueId);
     if (!league) return res.status(404).json({ error: 'League not found' });
     const drafts = (await getLeagueDrafts(leagueId)) || [];
     const draftMeta = drafts[0];
     if (!draftMeta) return res.json({ league_id: leagueId, name: league.name, status: 'no_draft', picks: [], cfg: cfgFromLeague(league, null) });
-    const draft = await getDraft(draftMeta.draft_id);
-    const picksRaw = (await getDraftPicks(draftMeta.draft_id)) || [];
-    // Map Sleeper player_id -> name/pos/team using the cached player dictionary.
-    const players = await getAllPlayers();
-    const picks = picksRaw
+
+    const [draft, picksRaw, leagueUsers, rosters, tradedRaw, players] = await Promise.all([
+      getDraft(draftMeta.draft_id),
+      getDraftPicks(draftMeta.draft_id),
+      getLeagueUsers(leagueId).catch(() => []),
+      getLeagueRosters(leagueId).catch(() => []),
+      getDraftTradedPicks(draftMeta.draft_id).catch(() => []),
+      getAllPlayers(),
+    ]);
+
+    const teamsN = (league && league.total_rosters) || (draft && draft.settings && draft.settings.teams) || 12;
+
+    // ----- team identities -----
+    // user_id -> display info (team name preferred, else display_name)
+    const userById = {};
+    (leagueUsers || []).forEach((u) => {
+      const tn = (u.metadata && (u.metadata.team_name || u.metadata.team_name_update)) || null;
+      userById[u.user_id] = { name: tn || u.display_name || 'Team', display_name: u.display_name || null, user_id: u.user_id };
+    });
+    // roster_id -> owner user_id (for mapping picks/rosters to a team)
+    const rosterOwner = {}; const rosterPlayers = {};
+    (rosters || []).forEach((r) => { rosterOwner[r.roster_id] = r.owner_id; rosterPlayers[r.roster_id] = r.players || []; });
+
+    // ----- slot ↔ team mapping -----
+    // draft.draft_order: { user_id: slot } ; draft.slot_to_roster_id: { slot: roster_id }
+    const draftOrder = (draft && draft.draft_order) || {};        // user_id -> slot (1-based)
+    const slotToRoster = (draft && draft.slot_to_roster_id) || {}; // slot -> roster_id
+    // Build slot (1-based) -> team name, and figure out which slot is the connecting user.
+    const slotName = {}; // slot -> name
+    let yourSlot = null, yourUserId = null;
+    // resolve the connecting user's id from username (via leagueUsers display_name match)
+    if (username) {
+      const me = (leagueUsers || []).find((u) => (u.display_name || '').toLowerCase() === username);
+      if (me) yourUserId = me.user_id;
+    }
+    for (let slot = 1; slot <= teamsN; slot++) {
+      // prefer explicit draft_order; else fall back to slot_to_roster -> owner
+      let uid = Object.keys(draftOrder).find((k) => draftOrder[k] === slot);
+      if (!uid) { const rid = slotToRoster[slot]; if (rid != null) uid = rosterOwner[rid]; }
+      if (uid && userById[uid]) slotName[slot] = userById[uid].name;
+      if (uid && yourUserId && uid === yourUserId) yourSlot = slot;
+    }
+    // last resort: match your slot via draft_order directly
+    if (yourSlot == null && yourUserId && draftOrder[yourUserId]) yourSlot = draftOrder[yourUserId];
+
+    // ----- picks (mapped to names) -----
+    const picks = (picksRaw || [])
       .filter((pk) => pk.player_id && pk.pick_no)
       .sort((a, b) => a.pick_no - b.pick_no)
       .map((pk) => {
@@ -87,19 +130,37 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
         const name = p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || (p.position === 'DEF' ? `${pk.player_id} DST` : pk.player_id);
         return {
           pick_no: pk.pick_no, round: pk.round, draft_slot: pk.draft_slot,
-          player_id: pk.player_id, name,
-          pos: p.position || null, team: p.team || null,
+          player_id: pk.player_id, name, pos: p.position || null, team: p.team || null,
           picked_by: pk.picked_by || null,
         };
       });
+
+    // ----- traded draft picks (so the board knows who really owns each slot's pick) -----
+    // Sleeper traded_picks: { season, round, roster_id (original), owner_id (current), previous_owner_id }
+    const tradedPicks = (tradedRaw || []).map((t) => ({
+      round: t.round,
+      fromRoster: t.roster_id, toRoster: t.owner_id,
+      fromSlot: rosterToSlot(slotToRoster, t.roster_id),
+      toSlot: rosterToSlot(slotToRoster, t.owner_id),
+    })).filter((t) => t.fromSlot && t.toSlot);
+
     res.json({
       league_id: leagueId, name: league.name, draft_id: draftMeta.draft_id,
       status: draft?.status || draftMeta.status || 'unknown', // pre_draft | drafting | complete | paused
+      teams: teamsN,
       cfg: cfgFromLeague(league, draft),
-      slotToName: draft?.draft_order || null,
+      draftType: (draft && draft.type) || 'snake', // snake | linear
+      yourSlot,                 // 1-based slot of the connecting user (null if not resolved)
+      slotNames: slotName,      // { slot: teamName } for all teams
+      tradedPicks,              // resolved to slots
       picks,
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
   }
 });
+
+function rosterToSlot(slotToRoster, rosterId) {
+  const slot = Object.keys(slotToRoster).find((s) => slotToRoster[s] === rosterId);
+  return slot ? Number(slot) : null;
+}
