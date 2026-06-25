@@ -8,6 +8,27 @@ import { requireAdmin } from '../lib/auth.js';
 export const adminRouter = Router();
 adminRouter.use(requireAdmin);
 
+// Trigger a data job from the browser (admin only) — so you don't need the Render Shell. Returns the
+// job's result detail (observationsWritten, etc.) so you can confirm it actually wrote data.
+//   POST /api/admin/run-job  { job: 'adp' | 'published' | 'refresh' }
+adminRouter.post('/run-job', async (req, res) => {
+  const job = String(req.body.job || 'adp');
+  try {
+    let detail;
+    if (job === 'refresh') {
+      const { refreshAll } = await import('../jobs/refreshAll.js');
+      detail = await refreshAll();
+    } else if (job === 'published') {
+      const { syncPublishedAdp } = await import('../jobs/syncPublishedAdp.js');
+      detail = await syncPublishedAdp();
+    } else {
+      const { refreshAdpOnly } = await import('../jobs/refreshAdpOnly.js');
+      detail = await refreshAdpOnly();
+    }
+    res.json({ ok: true, job, detail });
+  } catch (e) { res.status(500).json({ ok: false, job, error: e.message, stack: e.stack }); }
+});
+
 // grant a comp (free) subscription
 adminRouter.post('/comp', async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
