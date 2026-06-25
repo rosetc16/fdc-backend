@@ -22,7 +22,12 @@ function cfgFromLeague(league, draft) {
   const qb = count('QB') + (superflex ? 1 : 0);
   const scoring = (league && league.scoring_settings) || {};
   const rec = scoring.rec || 0; // 1 = PPR, 0.5 = half, 0 = standard
-  const tep = (scoring.bonus_rec_te || scoring.rec_te) ? true : false;
+  // TE premium: Sleeper stores the EXTRA points-per-reception for TEs in `bonus_rec_te` (e.g. 0.5
+  // for a half-point premium, 1.0 for full). Capture the real amount, not just a boolean, so elite
+  // TEs are lifted by the correct magnitude. Fall back to a sensible default if only a flag exists.
+  const teBonus = Number(scoring.bonus_rec_te || 0);
+  const tePremMult = teBonus > 0 ? teBonus : (scoring.rec_te && scoring.rec_te > rec ? Number(scoring.rec_te) - rec : 0);
+  const tep = tePremMult > 0;
   const start = {
     QB: count('QB') || 1, RB: count('RB') || 2, WR: count('WR') || 2, TE: count('TE') || 1,
     FLEX: count('FLEX') || 1, SUPER: superflex ? 1 : 0, DST: count('DEF') || 0, K: count('K') || 0,
@@ -31,7 +36,7 @@ function cfgFromLeague(league, draft) {
     teams, rounds: (draft && draft.settings && draft.settings.rounds) || 15,
     sf: superflex, qbType: superflex ? 'SF' : qb >= 2 ? '2QB' : '1QB',
     scoringType: rec >= 1 ? 'ppr' : rec >= 0.5 ? 'half' : 'std',
-    tePrem: tep, tePremMult: tep ? 1 : 0,
+    tePrem: tep, tePremMult: Math.round(tePremMult * 100) / 100,
     type: (league && league.settings && league.settings.type === 2) ? 'dynasty' : 'redraft',
     start,
   };
