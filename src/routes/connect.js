@@ -144,6 +144,19 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       toSlot: rosterToSlot(slotToRoster, t.owner_id),
     })).filter((t) => t.fromSlot && t.toSlot);
 
+    // ----- keepers ----- Sleeper stores kept players on each roster's `keepers` array (player_ids).
+    // Map each to the owning team's slot + player name so the board can pre-place them.
+    const keepers = [];
+    (rosters || []).forEach((r) => {
+      const slot = rosterToSlot(slotToRoster, r.roster_id);
+      if (slot == null) return;
+      (r.keepers || []).forEach((pid) => {
+        const p = players[pid] || {};
+        const name = p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || (p.position === 'DEF' ? `${pid} DST` : pid);
+        keepers.push({ slot, player_id: pid, name, pos: p.position || null });
+      });
+    });
+
     res.json({
       league_id: leagueId, name: league.name, draft_id: draftMeta.draft_id,
       status: draft?.status || draftMeta.status || 'unknown', // pre_draft | drafting | complete | paused
@@ -153,6 +166,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       yourSlot,                 // 1-based slot of the connecting user (null if not resolved)
       slotNames: slotName,      // { slot: teamName } for all teams
       tradedPicks,              // resolved to slots
+      keepers,                  // [{ slot, player_id, name, pos }]
       picks,
     });
   } catch (e) {
