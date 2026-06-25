@@ -51,6 +51,15 @@ playerPackRouter.get('/', async (req, res) => {
   }
   const adpById = new Map(adpRows.map((a) => [a.player_id, a]));
 
+  // Which players have a PUBLISHED (real market) ADP observation this season? Published ADP = Sleeper's
+  // own draft board, which only lists currently-relevant players. We use this as the inclusion gate so
+  // long-retired players (who only have stale harvested ADP from odd old mocks) are excluded entirely.
+  const publishedIds = new Set((await q(
+    `SELECT DISTINCT player_id FROM adp_observations
+       WHERE season=$1 AND source='sleeper_published'`,
+    [season]
+  )).rows.map((r) => r.player_id));
+
   // 2) projections for the season
   const projRows = (await q(
     `SELECT player_id, stats, floor_pts, ceil_pts FROM projections WHERE season=$1 AND source='sleeper'`,
@@ -91,11 +100,13 @@ playerPackRouter.get('/', async (req, res) => {
     if (!posAllowed(pos)) continue; // drop K/DST/IDP the league doesn't use
     const adpRaw = adpById.get(pl.player_id);
     const proj = projById.get(pl.player_id);
+    const hasPublished = publishedIds.has(pl.player_id);
     // trust ADP only with a healthy sample; otherwise treat as "no ADP" (projection still keeps them)
     const adp = adpRaw && Number(adpRaw.sample_n) >= MIN_ADP_SAMPLE ? adpRaw : null;
-    // A player needs a projection (they're a real, projected contributor) OR trustworthy ADP. This
-    // drops retired/irrelevant players who only have stale low-sample ADP and no current projection.
-    if (!proj && !adp) continue;
+    // INCLUSION GATE: a player must be a current, relevant player — meaning they have a season projection
+    // OR a published (real market) ADP. Stale harvested ADP alone is NOT enough; that's what was letting
+    // long-retired players (Adrian Peterson, Frank Gore, etc.) leak in. This is the hard filter for them.
+    if (!proj && !hasPublished) continue;
     const stats = proj ? mapStats(proj.stats) : {};
     pack.push({
       id: pl.player_id,

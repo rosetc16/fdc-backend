@@ -75,9 +75,11 @@ export async function syncPublishedAdp({ season = config.activeSeason } = {}) {
       any = true; fieldsFound++;
       byField[def.field] = (byField[def.field] || 0) + 1;
       for (const fkey of expandFormatKeys(def)) {
-        // weight 0.9: published ADP is a strong, broad base signal — high, but real size/TE-specific
-        // harvested drafts (weight ~varies) can still pull the consensus toward the exact bucket.
-        values.push([sid, fkey, season, 'sleeper_published', 'platform_adp', Number(v), 0.9]);
+        // weight 6: published ADP is the REAL market board every owner sees, with full veteran coverage.
+        // It must dominate the thin, rookie-contaminated harvested ADP we get early in the summer (which
+        // otherwise drags veterans like Tua down to junk values). Harvested drafts still nudge the exact
+        // size/TE bucket, but they can no longer override the published market number.
+        values.push([sid, fkey, season, 'sleeper_published', 'platform_adp', Number(v), 6]);
       }
     }
     if (any) players++;
