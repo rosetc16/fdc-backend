@@ -169,6 +169,20 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
     let resolvedType = (draft && draft.type) === 'linear' ? 'linear' : 'snake';
     if (reversalRound && reversalRound >= 1) resolvedType = '3rr';
 
+    // ---- Live clock ----------------------------------------------------------------------------
+    // Sleeper drives the draft clock from: settings.pick_timer (seconds allowed per pick) and the
+    // timestamp the LAST pick was made (draft.last_picked, epoch ms). The current pick's deadline is
+    // last_picked + pick_timer. We pass both the raw inputs and a computed server-side deadline so the
+    // app can show a clock that matches Sleeper exactly (and survives refreshes) instead of resetting.
+    const pickTimerSec = draft && draft.settings ? Number(draft.settings.pick_timer || 0) : 0;
+    const lastPickedMs = draft ? Number(draft.last_picked || draft.start_time || 0) : 0;
+    const nowMs = Date.now();
+    // If the draft is actively "drafting" and there's a timer, compute the current pick's deadline.
+    let pickDeadlineMs = null;
+    if ((draft?.status === 'drafting') && pickTimerSec > 0 && lastPickedMs > 0) {
+      pickDeadlineMs = lastPickedMs + pickTimerSec * 1000;
+    }
+
     res.json({
       league_id: leagueId, name: league.name, draft_id: draftMeta.draft_id,
       status: draft?.status || draftMeta.status || 'unknown', // pre_draft | drafting | complete | paused
@@ -181,6 +195,11 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       tradedPicks,              // resolved to slots
       keepers,                  // [{ slot, player_id, name, pos }]
       picks,
+      // live clock fields (all epoch ms / seconds); server_now lets the client correct for clock skew
+      pickTimerSec,             // seconds allowed per pick (0 = untimed / slow draft)
+      lastPickedMs,             // when the last pick was made
+      pickDeadlineMs,           // computed deadline for the CURRENT pick (null if untimed/not drafting)
+      serverNowMs: nowMs,       // server's current time, so the client can align its countdown
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });

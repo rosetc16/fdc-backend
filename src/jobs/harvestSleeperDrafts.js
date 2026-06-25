@@ -17,59 +17,93 @@ import { recordJob } from '../lib/jobs.js';
 
 // Seed usernames to bootstrap discovery before you have connected users. Replace/expand freely.
 const SEED_USERNAMES = (process.env.HARVEST_SEED_USERS || '').split(',').map((s) => s.trim()).filter(Boolean);
-// One-hop expansion: from each seed user, also discover their leaguemates and harvest THEIR drafts
-// too. This multiplies the draft pool from the same seed list and pulls in many more redraft/SF
-// drafts. Controlled by env so you can cap API usage. Default on.
+// Breadth-first crawl of the Sleeper league graph. Each run pulls a batch of not-yet-crawled users
+// from discovered_users (the "frontier"), expands each into all their leaguemates (adding NEW users
+// to the frontier for future runs), and harvests their drafts. This keeps reaching fresh leagues every
+// night instead of re-walking the same cluster — which is how you broaden ADP across many league types.
 const EXPAND_HOP = process.env.HARVEST_EXPAND !== '0';
-const MAX_SEED_USERS = Number(process.env.HARVEST_MAX_USERS || 400); // safety cap on discovered users
+const FRONTIER_BATCH = Number(process.env.HARVEST_FRONTIER_BATCH || 150); // users to crawl per run
+const MAX_SEED_USERS = Number(process.env.HARVEST_MAX_USERS || 600);      // cap users touched per run
 
-async function seedUserIds() {
-  // connected users who linked Sleeper (stored on leagues.connect)
+// Seed the discovered_users table from connected accounts + env seed usernames (idempotent).
+async function seedFrontier(season) {
   const { rows } = await q(
     `SELECT DISTINCT connect->>'external_user_id' AS uid
        FROM leagues WHERE connect->>'platform' = 'sleeper' AND connect ? 'external_user_id'`
   );
   const connected = rows.map((r) => r.uid).filter(Boolean);
-  const seeds = [];
-  for (const uname of SEED_USERNAMES) {
-    const u = await getUser(uname);
-    if (u?.user_id) seeds.push(u.user_id);
+  for (const uid of connected) {
+    await q(
+      `INSERT INTO discovered_users (user_id, source, found_via) VALUES ($1,'connected','connect')
+       ON CONFLICT (user_id) DO NOTHING`, [uid]
+    );
   }
-  return [...new Set([...connected, ...seeds])];
+  for (const uname of SEED_USERNAMES) {
+    try {
+      const u = await getUser(uname);
+      if (u?.user_id) {
+        await q(
+          `INSERT INTO discovered_users (user_id, display_name, source, found_via)
+           VALUES ($1,$2,'seed','env') ON CONFLICT (user_id) DO NOTHING`,
+          [u.user_id, u.display_name || uname]
+        );
+      }
+    } catch { /* skip bad usernames */ }
+  }
 }
 
-// One-hop: expand a set of user ids by adding everyone who shares a league with them this season.
-async function expandByLeaguemates(userIds, season, cap) {
-  const expanded = new Set(userIds);
-  for (const uid of userIds) {
-    if (expanded.size >= cap) break;
+// Pull the next frontier batch (never-crawled users first), expand each user's leagues into NEW
+// discovered users, mark them crawled, and return the set of user ids to harvest drafts from.
+async function crawlFrontier(season, cap) {
+  const { rows: frontier } = await q(
+    `SELECT user_id FROM discovered_users
+      WHERE crawled_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT $1`, [Math.min(FRONTIER_BATCH, cap)]
+  );
+  const toHarvest = new Set(frontier.map((r) => r.user_id));
+  if (!EXPAND_HOP) return [...toHarvest];
+
+  let touched = 0;
+  for (const { user_id: uid } of frontier) {
+    if (touched >= cap) break;
     let leagues = [];
     try { leagues = (await getUserLeagues(uid, season)) || []; } catch { /* skip */ }
     for (const lg of leagues) {
       if (!lg.league_id) continue;
       let members = [];
       try { members = (await getLeagueUsers(lg.league_id)) || []; } catch { /* skip */ }
-      for (const m of members) { if (m.user_id) expanded.add(m.user_id); }
-      if (expanded.size >= cap) break;
+      for (const m of members) {
+        if (!m.user_id) continue;
+        toHarvest.add(m.user_id);
+        // add newly-seen users to the frontier for FUTURE runs (dedup via PK)
+        await q(
+          `INSERT INTO discovered_users (user_id, display_name, source, found_via)
+           VALUES ($1,$2,'leaguemate',$3) ON CONFLICT (user_id) DO NOTHING`,
+          [m.user_id, m.display_name || null, lg.league_id]
+        );
+      }
+      touched += members.length;
+      if (touched >= cap) break;
     }
+    // mark this frontier user crawled so we don't re-expand them next run
+    await q(`UPDATE discovered_users SET crawled_at = now() WHERE user_id = $1`, [uid]);
   }
-  return [...expanded].slice(0, cap);
+  return [...toHarvest].slice(0, cap);
 }
 
 export async function harvestSleeperDrafts({ season = config.activeSeason, maxDrafts = config.harvest.batch } = {}) {
   const started = Date.now();
-  let userIds = await seedUserIds();
+  // 1) make sure connected + seed users are on the frontier, then 2) crawl a fresh batch.
+  await seedFrontier(season);
+  const userIds = await crawlFrontier(season, MAX_SEED_USERS);
   if (userIds.length === 0) {
-    const detail = { skipped: 'no seed/connected Sleeper users yet', hint: 'set HARVEST_SEED_USERS or connect a Sleeper account' };
+    const detail = { skipped: 'frontier empty', hint: 'set HARVEST_SEED_USERS or connect a Sleeper account; frontier refills as it crawls' };
     log.warn(detail, 'harvest: nothing to discover');
     await recordJob('harvestSleeperDrafts', true, detail);
     return detail;
   }
-
   const seedCount = userIds.length;
-  if (EXPAND_HOP) {
-    userIds = await expandByLeaguemates(userIds, season, MAX_SEED_USERS);
-  }
 
   // collect candidate draft ids from each user — both their personal drafts AND their leagues'
   // drafts (league drafts catch redraft/keeper drafts that user-drafts sometimes miss).
@@ -130,7 +164,10 @@ export async function harvestSleeperDrafts({ season = config.activeSeason, maxDr
     drafted++;
   }
 
-  const detail = { seedUsers: seedCount, expandedUsers: userIds.length, candidates: ids.length, harvested: drafted, observations, byFormat, ms: Date.now() - started };
+  // report how big the frontier still is, so you can see the crawl growing
+  const { rows: fr } = await q(`SELECT count(*)::int AS n FROM discovered_users WHERE crawled_at IS NULL`);
+  const { rows: tot } = await q(`SELECT count(*)::int AS n FROM discovered_users`);
+  const detail = { usersHarvested: seedCount, frontierRemaining: fr[0]?.n ?? 0, totalDiscovered: tot[0]?.n ?? 0, candidates: ids.length, harvested: drafted, observations, byFormat, ms: Date.now() - started };
   log.info(detail, 'harvestSleeperDrafts done');
   await recordJob('harvestSleeperDrafts', true, detail);
   return detail;

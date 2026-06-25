@@ -85,6 +85,21 @@ CREATE TABLE IF NOT EXISTS projections (
 );
 CREATE INDEX IF NOT EXISTS idx_proj_season ON projections (season);
 
+-- ============================================================ DISCOVERED USERS (harvest crawl frontier)
+-- Persistent memory of every Sleeper user we've discovered while crawling the league graph. Lets the
+-- nightly harvest keep reaching NEW leagues each run (breadth-first) instead of re-walking the same
+-- cluster of seed users. `crawled_at` = when we last expanded this user's leagues; NULL = frontier.
+CREATE TABLE IF NOT EXISTS discovered_users (
+  user_id      TEXT PRIMARY KEY,
+  display_name TEXT,
+  source       TEXT,                          -- 'seed','connected','leaguemate'
+  found_via    TEXT,                          -- league_id or user_id we discovered them through
+  crawled_at   TIMESTAMPTZ,                   -- last time we expanded this user's leagues (NULL = not yet)
+  drafts_found INT DEFAULT 0,
+  created_at   TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_uncrawled ON discovered_users (crawled_at NULLS FIRST, created_at);
+
 -- ============================================================ DEPTH CHARTS
 CREATE TABLE IF NOT EXISTS depth_charts (
   team        TEXT NOT NULL,

@@ -10,6 +10,7 @@
     "dev": "node --watch src/server.js",
     "migrate": "node scripts/migrate.js",
     "harvest": "node src/jobs/harvestSleeperDrafts.js",
+    "published-adp": "node src/jobs/syncPublishedAdp.js",
     "refresh": "node src/jobs/refreshAll.js",
     "test:smoke": "node scripts/smoke.js"
   },
