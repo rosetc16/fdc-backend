@@ -162,9 +162,22 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       });
     });
 
-    // Draft type: Sleeper reports type "snake"/"linear"/"auction", but THIRD-ROUND REVERSAL is a
-    // separate setting (reversal_round = 3), not a distinct type. Detect it so future picks order
-    // correctly. Map: reversal_round>=1 → "3rr"; linear → "linear"; else "snake".
+    // ----- existing rosters ----- For rookie/keeper/dynasty drafts, each team already has a roster.
+    // Those holdings drive prediction (a team with two elite QBs won't draft a rookie QB). Map each
+    // team's current players to its slot, with name + position, so the engine can factor them in.
+    const existingRosters = {}; // slot -> [{ player_id, name, pos }]
+    (rosters || []).forEach((r) => {
+      const slot = rosterToSlot(slotToRoster, r.roster_id);
+      if (slot == null) return;
+      const list = [];
+      (r.players || []).forEach((pid) => {
+        const p = players[pid] || {};
+        const name = p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || (p.position === 'DEF' ? `${pid} DST` : pid);
+        if (p.position) list.push({ player_id: pid, name, pos: p.position });
+      });
+      existingRosters[slot] = list;
+    });
+
     const reversalRound = draft && draft.settings && Number(draft.settings.reversal_round || 0);
     let resolvedType = (draft && draft.type) === 'linear' ? 'linear' : 'snake';
     if (reversalRound && reversalRound >= 1) resolvedType = '3rr';
@@ -194,6 +207,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       slotNames: slotName,      // { slot: teamName } for all teams
       tradedPicks,              // resolved to slots
       keepers,                  // [{ slot, player_id, name, pos }]
+      existingRosters,          // { slot: [{ player_id, name, pos }] } — current holdings (rookie/dynasty)
       picks,
       // live clock fields (all epoch ms / seconds); server_now lets the client correct for clock skew
       pickTimerSec,             // seconds allowed per pick (0 = untimed / slow draft)
