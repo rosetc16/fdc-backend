@@ -76,3 +76,5 @@ export const getUser = (username) => getJson(`/user/${username}`);
 export const getUserDrafts = (userId, season) => getJson(`/user/${userId}/drafts/nfl/${season}`);
 export const getUserLeagues = (userId, season) => getJson(`/user/${userId}/leagues/nfl/${season}`);
 export const getLeagueUsers = (leagueId) => getJson(`/league/${leagueId}/users`);
+export const getLeague = (leagueId) => getJson(`/league/${leagueId}`);
+export const getLeagueRosters = (leagueId) => getJson(`/league/${leagueId}/rosters`);
