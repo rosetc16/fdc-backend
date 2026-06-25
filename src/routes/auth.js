@@ -55,6 +55,19 @@ authRouter.get('/me', requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
+// Persist the user's personal ranking sets (their custom boards). Stored on the user row so they
+// survive across sessions/devices.
+authRouter.post('/rank-sets', requireAuth, async (req, res) => {
+  const sets = Array.isArray(req.body.rankSets) ? req.body.rankSets : [];
+  // basic guard: cap size so a runaway payload can't bloat the row
+  const json = JSON.stringify(sets);
+  if (json.length > 2_000_000) return res.status(413).json({ error: 'rankings too large' });
+  const { rows } = await q(
+    `UPDATE users SET rank_sets=$1::jsonb WHERE id=$2 RETURNING *`, [json, req.user.id]
+  );
+  res.json({ user: publicUser(rows[0]) });
+});
+
 function publicUser(u) {
   const disabled = !!u.disabled;
   const paidActive = !disabled && (u.comp || (u.paid_until && new Date(u.paid_until) > new Date()));
