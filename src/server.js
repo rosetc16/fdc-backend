@@ -69,14 +69,35 @@ app.use((err, _req, res, _next) => {
 app.listen(config.port, () => {
   log.info(`FDC API listening on :${config.port} (${config.env})`);
 
-  // OPTIONAL in-process scheduler. On platforms with their own Cron Jobs (Render/Railway), prefer
-  // those and set DISABLE_INPROCESS_CRON=1. This is a convenience for single-instance hosting.
+  // SELF-SUSTAINING DATA REFRESH. The app keeps its ADP/projections current on its own:
+  //  • A daily full refresh (players, projections, published ADP, harvest, consensus).
+  //  • A lighter published-ADP refresh midday so ADP tracks the market as it moves through the summer.
+  //  • A one-time STARTUP CATCH-UP: if the DB has no published ADP yet (e.g. first deploy), pull it now
+  //    so the board is correct without anyone having to click anything or open a shell.
+  // Set DISABLE_INPROCESS_CRON=1 only if you've configured a platform cron to call these instead.
   if (process.env.DISABLE_INPROCESS_CRON !== '1') {
-    // daily at 4:15am server time — full refresh
     cron.schedule('15 4 * * *', () => {
       log.info('cron: daily refreshAll starting');
       refreshAll().catch((e) => log.error(e, 'cron refreshAll failed'));
     });
-    log.info('in-process daily cron scheduled (set DISABLE_INPROCESS_CRON=1 to use platform cron instead)');
+    // midday published-ADP-only refresh (fast; keeps ADP fresh as it moves)
+    cron.schedule('15 16 * * *', async () => {
+      try { const { refreshAdpOnly } = await import('./jobs/refreshAdpOnly.js'); log.info('cron: midday ADP refresh'); await refreshAdpOnly(); }
+      catch (e) { log.error(e, 'cron midday ADP failed'); }
+    });
+    log.info('in-process daily + midday cron scheduled');
+    // Startup catch-up: ensure published ADP exists shortly after boot (non-blocking).
+    setTimeout(async () => {
+      try {
+        const { q } = await import('./lib/db.js');
+        const r = await q(`SELECT count(*)::int n FROM adp_observations WHERE source='sleeper_published'`).catch(() => ({ rows: [{ n: 0 }] }));
+        if (!r.rows[0] || r.rows[0].n === 0) {
+          log.info('startup: no published ADP found — running one-time ADP pull');
+          const { refreshAdpOnly } = await import('./jobs/refreshAdpOnly.js');
+          await refreshAdpOnly();
+          log.info('startup: ADP pull complete');
+        }
+      } catch (e) { log.error(e, 'startup ADP catch-up failed'); }
+    }, 8000);
   }
 });
