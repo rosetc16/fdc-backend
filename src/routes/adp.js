@@ -33,6 +33,43 @@ adpRouter.get('/raw-projection', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/adp/overlay?format=PPR|SF|TEP|DYNASTY|12&season=2026
+// Returns { format, adp: { "normalized name": pickNumber } } for a specific format, using PUBLISHED
+// Sleeper ADP (with the same fallback chain as the player pack). The frontend overlays these numbers
+// onto its stable player pool BY NAME — so the board shows the correct-format ADP WITHOUT swapping the
+// pool (which would corrupt picks). This is the safe way to make ADP format-accurate.
+adpRouter.get('/overlay', async (req, res) => {
+  const season = Number(req.query.season || config.activeSeason);
+  const format = String(req.query.format || 'PPR|1QB|STD|REDRAFT|12');
+  try {
+    const pubFallbacks = (key) => {
+      const [scoring, qb, te, pool, teams] = key.split('|');
+      const pools = pool === 'ROOKIE' || pool === 'KEEPER' ? [pool, 'DYNASTY', 'REDRAFT'] : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
+      const qbs = qb === 'SF' ? ['SF', '1QB'] : ['1QB'];
+      const scorings = [scoring, 'PPR'];
+      const out = [];
+      for (const pl of pools) for (const qx of qbs) for (const sc of scorings) for (const tx of [te, 'STD']) for (const tm of [teams, '12'])
+        out.push([sc, qx, tx, pl, tm].join('|'));
+      return [...new Set(out)];
+    };
+    let used = null, rows = [];
+    for (const fkey of pubFallbacks(format)) {
+      const r = await q(
+        `SELECT p.full_name, o.pick FROM adp_observations o JOIN players p ON p.player_id=o.player_id
+          WHERE o.season=$1 AND o.source='sleeper_published' AND o.format_key=$2`,
+        [season, fkey]
+      );
+      if (r.rows.length > 20) { used = fkey; rows = r.rows; break; }
+    }
+    const adp = {};
+    for (const r of rows) {
+      const nm = String(r.full_name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (nm && (adp[nm] == null || Number(r.pick) < adp[nm])) adp[nm] = Number(r.pick);
+    }
+    res.json({ format, usedFormat: used, season, count: Object.keys(adp).length, adp });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/adp/diag?season=2026 — quick data-health check so you can SEE what's in the DB without
 // guessing whether the refresh job ran. Reports published-ADP coverage, harvested coverage, sample
 // players (Tua, a top rookie), and which published formats exist. Open this in a browser after a deploy.
