@@ -76,7 +76,9 @@ app.listen(config.port, () => {
   //    so the board is correct without anyone having to click anything or open a shell.
   // Set DISABLE_INPROCESS_CRON=1 only if you've configured a platform cron to call these instead.
   if (process.env.DISABLE_INPROCESS_CRON !== '1') {
-    cron.schedule('15 4 * * *', () => {
+    // Daily full refresh (players, projections, published ADP, harvest, consensus, AND player news)
+    // at 4:00 AM. Player news refreshes here automatically — no manual admin run needed.
+    cron.schedule('0 4 * * *', () => {
       log.info('cron: daily refreshAll starting');
       refreshAll().catch((e) => log.error(e, 'cron refreshAll failed'));
     });
@@ -98,6 +100,18 @@ app.listen(config.port, () => {
           log.info('startup: ADP pull complete');
         }
       } catch (e) { log.error(e, 'startup ADP catch-up failed'); }
+      // Player news catch-up: if we have no cached news yet, pull once on boot so it works without
+      // waiting for the 4 AM cron or any manual admin action.
+      try {
+        const { q } = await import('./lib/db.js');
+        const rn = await q(`SELECT count(*)::int n FROM player_news`).catch(() => ({ rows: [{ n: 0 }] }));
+        if (!rn.rows[0] || rn.rows[0].n === 0) {
+          log.info('startup: no player news cached — running one-time news pull');
+          const { syncPlayerNews } = await import('./jobs/syncPlayerNews.js');
+          await syncPlayerNews();
+          log.info('startup: player news pull complete');
+        }
+      } catch (e) { log.error(e, 'startup news catch-up failed'); }
     }, 8000);
   }
 });

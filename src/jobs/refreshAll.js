@@ -5,6 +5,7 @@ import { syncProjections } from './syncProjections.js';
 import { syncPublishedAdp } from './syncPublishedAdp.js';
 import { harvestSleeperDrafts } from './harvestSleeperDrafts.js';
 import { refreshConsensus } from './refreshConsensus.js';
+import { syncPlayerNews } from './syncPlayerNews.js';
 import { log } from '../lib/log.js';
 
 export async function refreshAll() {
@@ -16,6 +17,8 @@ export async function refreshAll() {
   try { out.publishedAdp = await syncPublishedAdp(); } catch (e) { out.publishedAdp = { error: e.message }; log.error(e); }
   try { out.harvest = await harvestSleeperDrafts(); } catch (e) { out.harvest = { error: e.message }; log.error(e); }
   try { out.consensus = await refreshConsensus(); } catch (e) { out.consensus = { error: e.message }; log.error(e); }
+  // Player news is best-effort and must never fail the refresh.
+  try { out.news = await syncPlayerNews(); } catch (e) { out.news = { error: e.message }; log.error(e); }
   log.info(out, 'refreshAll complete');
   return out;
 }

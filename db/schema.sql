@@ -20,11 +20,25 @@ CREATE TABLE IF NOT EXISTS players (
   years_exp      INT,
   bye_week       INT,
   injury_status  TEXT,
+  news_updated   BIGINT,                    -- Sleeper's news_updated epoch ms (recency signal only)
   active         BOOLEAN DEFAULT TRUE,
   updated_at     TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_players_norm ON players (norm_name, position);
 CREATE INDEX IF NOT EXISTS idx_players_team ON players (team);
+
+-- Cached player news/notes. We pull free injury + news from ESPN's public API (matched to our players
+-- by espn_id) plus Sleeper's news_updated recency timestamp. Refreshed periodically, read at draft time.
+CREATE TABLE IF NOT EXISTS player_news (
+  player_id      TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+  headline       TEXT,            -- short note headline
+  body           TEXT,            -- the news blurb / outlook summary
+  news_type      TEXT,            -- 'injury' | 'news' | 'note'
+  source         TEXT,            -- 'espn' | 'sleeper'
+  published_at   TIMESTAMPTZ,     -- when the news broke (from the source)
+  updated_at     TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_player_news_updated ON player_news (updated_at);
 
 -- Unresolved external rows go here for review instead of being guessed into the engine.
 CREATE TABLE IF NOT EXISTS player_resolution_queue (

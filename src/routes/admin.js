@@ -21,6 +21,9 @@ adminRouter.post('/run-job', async (req, res) => {
     } else if (job === 'published') {
       const { syncPublishedAdp } = await import('../jobs/syncPublishedAdp.js');
       detail = await syncPublishedAdp();
+    } else if (job === 'news') {
+      const { syncPlayerNews } = await import('../jobs/syncPlayerNews.js');
+      detail = await syncPlayerNews();
     } else {
       const { refreshAdpOnly } = await import('../jobs/refreshAdpOnly.js');
       detail = await refreshAdpOnly();

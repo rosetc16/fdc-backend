@@ -13,6 +13,8 @@ async function migrate() {
   await pool.query('CREATE EXTENSION IF NOT EXISTS citext;');
   const sql = await readFile(join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
   await pool.query(sql);
+  // Idempotent column adds for existing tables (CREATE TABLE IF NOT EXISTS won't add new columns).
+  await pool.query('ALTER TABLE players ADD COLUMN IF NOT EXISTS news_updated BIGINT;');
   log.info('migration applied');
 }
 
