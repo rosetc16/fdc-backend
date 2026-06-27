@@ -97,15 +97,6 @@ playerPackRouter.get('/', async (req, res) => {
   )).rows;
   const projById = new Map(projRows.map((p) => [p.player_id, p]));
 
-  // 2b) cached player news (best-effort; table may be empty if the news job hasn't run). Keyed by player.
-  let newsById = new Map();
-  try {
-    const newsRows = (await q(
-      `SELECT player_id, headline, body, news_type, source, published_at FROM player_news`
-    )).rows;
-    newsById = new Map(newsRows.map((n) => [n.player_id, n]));
-  } catch { /* table may not exist yet on older DBs — ignore */ }
-
   // 3) players (identity + status). Only fantasy-relevant, active, on a team.
   // news_updated may be absent on a DB that hasn't migrated yet — fall back to a query without it rather
   // than letting the whole pack fail (which would empty the board).
@@ -180,8 +171,6 @@ playerPackRouter.get('/', async (req, res) => {
       adp: adpVal,
       adpLo, adpHi, trend, sampleN,
       inj: pl.injury_status || null,
-      newsUpdated: pl.news_updated != null ? Number(pl.news_updated) : null,
-      news: (() => { const n = newsById.get(pl.player_id); return n && (n.headline || n.body) ? { headline: n.headline || null, body: n.body || null, type: n.news_type || null, source: n.source || null, at: n.published_at || null } : null; })(),
       rookie: pl.years_exp != null && pl.years_exp === 0,
       stats,
       floor: proj && proj.floor_pts != null ? Number(proj.floor_pts) : null,

@@ -100,18 +100,6 @@ app.listen(config.port, () => {
           log.info('startup: ADP pull complete');
         }
       } catch (e) { log.error(e, 'startup ADP catch-up failed'); }
-      // Player news catch-up: if we have no cached news yet, pull once on boot so it works without
-      // waiting for the 4 AM cron or any manual admin action.
-      try {
-        const { q } = await import('./lib/db.js');
-        const rn = await q(`SELECT count(*)::int n FROM player_news`).catch(() => ({ rows: [{ n: 0 }] }));
-        if (!rn.rows[0] || rn.rows[0].n === 0) {
-          log.info('startup: no player news cached — running one-time news pull');
-          const { syncPlayerNews } = await import('./jobs/syncPlayerNews.js');
-          await syncPlayerNews();
-          log.info('startup: player news pull complete');
-        }
-      } catch (e) { log.error(e, 'startup news catch-up failed'); }
     }, 8000);
   }
 
