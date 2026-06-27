@@ -12,6 +12,12 @@ export async function syncPlayers() {
   const ids = Object.keys(players || {});
   let upserts = 0;
 
+  // Defensive: make sure the news_updated column exists before we reference it. If a deploy shipped this
+  // code before the migration ran, the INSERT below would throw and roll back the WHOLE player sync —
+  // which empties the players table and cascades (no players → no projections → near-empty board). This
+  // idempotent ALTER guarantees the column is present so that can't happen.
+  try { await q('ALTER TABLE players ADD COLUMN IF NOT EXISTS news_updated BIGINT;'); } catch (e) { log.error(e, 'ensure news_updated column'); }
+
   await tx(async (client) => {
     for (const sid of ids) {
       const p = players[sid];

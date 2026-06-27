@@ -114,4 +114,23 @@ app.listen(config.port, () => {
       } catch (e) { log.error(e, 'startup news catch-up failed'); }
     }, 8000);
   }
+
+  // ALWAYS-ON RECOVERY (runs regardless of DISABLE_INPROCESS_CRON): if the players or projections tables
+  // are empty/tiny — e.g. a deploy broke the sync and emptied the board — repopulate automatically a few
+  // seconds after boot. This is a safety net so a broken board self-heals without any manual admin action,
+  // even when the scheduled in-process crons are turned off.
+  setTimeout(async () => {
+    try {
+      const { q } = await import('./lib/db.js');
+      const pc = await q(`SELECT count(*)::int n FROM players`).catch(() => ({ rows: [{ n: 0 }] }));
+      const jc = await q(`SELECT count(*)::int n FROM projections`).catch(() => ({ rows: [{ n: 0 }] }));
+      const nPlayers = pc.rows[0] ? pc.rows[0].n : 0;
+      const nProj = jc.rows[0] ? jc.rows[0].n : 0;
+      if (nPlayers < 500 || nProj < 200) {
+        log.info({ nPlayers, nProj }, 'startup recovery: players/projections look empty — running full refresh');
+        await refreshAll();
+        log.info('startup recovery: full refresh complete');
+      }
+    } catch (e) { log.error(e, 'startup recovery failed'); }
+  }, 10000);
 });

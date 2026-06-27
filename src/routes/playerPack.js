@@ -107,12 +107,24 @@ playerPackRouter.get('/', async (req, res) => {
   } catch { /* table may not exist yet on older DBs — ignore */ }
 
   // 3) players (identity + status). Only fantasy-relevant, active, on a team.
-  const players = (await q(
-    `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status, news_updated
-       FROM players
-      WHERE position IN ('QB','RB','WR','TE','K','DEF','DL','LB','DB')
-        AND active = true`
-  )).rows;
+  // news_updated may be absent on a DB that hasn't migrated yet — fall back to a query without it rather
+  // than letting the whole pack fail (which would empty the board).
+  let players;
+  try {
+    players = (await q(
+      `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status, news_updated
+         FROM players
+        WHERE position IN ('QB','RB','WR','TE','K','DEF','DL','LB','DB')
+          AND active = true`
+    )).rows;
+  } catch {
+    players = (await q(
+      `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status
+         FROM players
+        WHERE position IN ('QB','RB','WR','TE','K','DEF','DL','LB','DB')
+          AND active = true`
+    )).rows;
+  }
 
   // Which positions does THIS format actually draft? Parse the format key's QB/TE bits and always
   // include core skill positions. K/DST are only included when the league rosters them — otherwise a
