@@ -209,3 +209,12 @@ CREATE TABLE IF NOT EXISTS harvested_drafts (
   pick_count   INT,
   harvested_at TIMESTAMPTZ DEFAULT now()
 );
+-- ============================================================ PER-USER APP STATE
+-- A single JSON blob per user mirroring the client's local "gs-state" (leagues, picks, preds,
+-- priority queues, mocks, etc.). This makes a user's data follow them across devices and survive
+-- sign-out, without re-architecting the client's local-first model. Last-write-wins by updated_at.
+CREATE TABLE IF NOT EXISTS user_state (
+  user_id     BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  state       JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at  TIMESTAMPTZ DEFAULT now()
+);

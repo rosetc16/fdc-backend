@@ -68,13 +68,30 @@ playerPackRouter.get('/', async (req, res) => {
     if (!pubByFormat.has(r.format_key)) pubByFormat.set(r.format_key, new Map());
     pubByFormat.get(r.format_key).set(r.player_id, Number(r.pick));
   }
-  // Resolve the published ADP map for THIS format via the fallback chain (first format with coverage).
-  let publishedAdp = new Map();
-  let usedPubFormat = null;
-  for (const fkey of pubFallbacks(format)) {
-    const m = pubByFormat.get(fkey);
-    if (m && m.size > 20) { publishedAdp = m; usedPubFormat = fkey; break; } // need real coverage
+  // Resolve published ADP PER PLAYER across the fallback chain, rather than picking one format map for
+  // the whole board. Picking a single map meant that if the exact league format (e.g. SF|TEP|DYNASTY)
+  // was sparse, EVERY player fell back to a distant format (e.g. REDRAFT|STD) — which is what made a
+  // TE-premium player like Hunter Henry show a redraft-standard number far from his real league ADP.
+  // Now each player takes the FIRST format in the chain that actually has a number for HIM, so a player
+  // covered in the exact format keeps that number while only genuinely-missing players degrade.
+  const chain = pubFallbacks(format);
+  const publishedAdp = new Map();   // player_id -> pick (best-matching format)
+  const publishedFmtById = new Map(); // player_id -> which format supplied it (for diagnostics)
+  const fmtUsageCount = {};         // format_key -> how many players it supplied (to report the dominant one)
+  // Consider a format "available" only if it has real coverage somewhere on the board; this avoids a
+  // one-off stray observation in an odd format hijacking a player.
+  const usableChain = chain.filter((fk) => { const m = pubByFormat.get(fk); return m && m.size > 8; });
+  const resolveChain = usableChain.length ? usableChain : chain;
+  // Pre-fetch the maps once.
+  const chainMaps = resolveChain.map((fk) => [fk, pubByFormat.get(fk)]).filter(([, m]) => m);
+  for (const [fk, m] of chainMaps) {
+    for (const [pid, pick] of m) {
+      if (!publishedAdp.has(pid)) { publishedAdp.set(pid, pick); publishedFmtById.set(pid, fk); fmtUsageCount[fk] = (fmtUsageCount[fk] || 0) + 1; }
+    }
   }
+  // The "dominant" published format = the one that supplied the most players (for the version-tag debug).
+  let usedPubFormat = null, _bestN = 0;
+  for (const [fk, n] of Object.entries(fmtUsageCount)) { if (n > _bestN) { _bestN = n; usedPubFormat = fk; } }
   const publishedIds = new Set(publishedAdp.keys());
 
   // Harvested consensus (fallback only — used to fill players with no published number, and for lo/hi/trend)
@@ -170,6 +187,7 @@ playerPackRouter.get('/', async (req, res) => {
       bye: pl.bye_week || null,
       adp: adpVal,
       adpLo, adpHi, trend, sampleN,
+      pubFmt: pubPick != null ? (publishedFmtById.get(pl.player_id) || null) : null, // which format gave this ADP
       inj: pl.injury_status || null,
       rookie: pl.years_exp != null && pl.years_exp === 0,
       stats,
