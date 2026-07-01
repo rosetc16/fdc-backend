@@ -8,7 +8,7 @@ import { requireAuth } from '../lib/auth.js';
 import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
-  getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers,
+  getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
 } from '../lib/sleeper.js';
 
 export const connectRouter = Router();
@@ -140,6 +140,122 @@ function cfgFromLeague(league, draft) {
     start,
   };
 }
+
+// ---- In-season team hub (Phase 2 live data) ----
+// Everything the post-draft hub needs for ONE linked league, in a single call. We return raw Sleeper
+// player_ids (not enriched player objects) so the frontend can join them against the player pack it already
+// loads — same projections/VBD the draft board uses, no duplicated assembly here.
+//
+// GET /api/connect/sleeper/team-hub?league_id=...[&week=N]
+//   -> { league:{cfg,name}, week, myRosterId, rostered:[ids], teams:[{rosterId,ownerName,teamName,players,
+//        starters,record,pointsFor,pointsAgainst}], matchup:{me,opp}|null, standings:[...] }
+connectRouter.get('/sleeper/team-hub', async (req, res) => {
+  const leagueId = String(req.query.league_id || '').trim();
+  if (!leagueId) return res.status(400).json({ error: 'league_id required' });
+  try {
+    await ensureLinkCols();
+    const { rows } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
+    const sid = rows[0] && rows[0].sleeper_user_id;
+
+    // Pull league, its users (owners), rosters, and NFL state in parallel.
+    const [league, users, rosters, nfl] = await Promise.all([
+      getLeague(leagueId),
+      getLeagueUsers(leagueId),
+      getLeagueRosters(leagueId),
+      getNflState().catch(() => null),
+    ]);
+    if (!league) return res.status(404).json({ error: 'League not found on Sleeper' });
+
+    // Determine the week to show: explicit query, else the current NFL week (min 1).
+    let week = Number(req.query.week || 0);
+    if (!week || Number.isNaN(week)) week = (nfl && (nfl.week || nfl.display_week)) || 1;
+    week = Math.max(1, week);
+
+    // Owner lookup: Sleeper user_id -> display info. Prefer a custom team_name over the display_name.
+    const ownerById = new Map();
+    (users || []).forEach((u) => {
+      const teamName = (u.metadata && u.metadata.team_name) ? u.metadata.team_name : null;
+      ownerById.set(u.user_id, { ownerName: u.display_name || 'Unknown', teamName: teamName || u.display_name || 'Team' });
+    });
+
+    // Matchups for the week (each roster's starters + points). May be empty pre-season.
+    let matchupByRoster = new Map();
+    try {
+      const ms = (await getMatchups(leagueId, week)) || [];
+      ms.forEach((m) => matchupByRoster.set(m.roster_id, m));
+    } catch { /* no matchups yet */ }
+
+    // Assemble per-team roster info + records. Track all rostered player ids for free-agent computation.
+    const rostered = new Set();
+    let myRosterId = null;
+    const teams = (rosters || []).map((r) => {
+      const owner = ownerById.get(r.owner_id) || { ownerName: 'Unknown', teamName: 'Team' };
+      const players = Array.isArray(r.players) ? r.players : [];
+      players.forEach((pid) => rostered.add(String(pid)));
+      const m = matchupByRoster.get(r.roster_id);
+      const starters = (m && Array.isArray(m.starters)) ? m.starters : (Array.isArray(r.starters) ? r.starters : []);
+      const s = r.settings || {};
+      if (sid && r.owner_id === sid) myRosterId = r.roster_id;
+      return {
+        rosterId: r.roster_id,
+        ownerId: r.owner_id,
+        ownerName: owner.ownerName,
+        teamName: owner.teamName,
+        players: players.map(String),
+        starters: starters.map((x) => (x == null ? null : String(x))),
+        weekPoints: m && m.points != null ? Number(m.points) : null,
+        matchupId: m ? m.matchup_id : null,
+        record: { wins: Number(s.wins || 0), losses: Number(s.losses || 0), ties: Number(s.ties || 0) },
+        pointsFor: Number(s.fpts || 0) + Number(s.fpts_decimal || 0) / 100,
+        pointsAgainst: Number(s.fpts_against || 0) + Number(s.fpts_against_decimal || 0) / 100,
+      };
+    });
+
+    // My matchup this week: find my team, then the opponent sharing my matchup_id.
+    let matchup = null;
+    if (myRosterId != null) {
+      const me = teams.find((t) => t.rosterId === myRosterId);
+      if (me && me.matchupId != null) {
+        const opp = teams.find((t) => t.rosterId !== myRosterId && t.matchupId === me.matchupId);
+        matchup = { me, opp: opp || null };
+      } else if (me) {
+        matchup = { me, opp: null };
+      }
+    }
+
+    // Standings: sort by wins, then points-for.
+    const standings = teams.slice().sort((a, b) =>
+      (b.record.wins - a.record.wins) || (b.pointsFor - a.pointsFor)
+    ).map((t, i) => ({
+      rank: i + 1, rosterId: t.rosterId, teamName: t.teamName, ownerName: t.ownerName,
+      record: t.record, pointsFor: Math.round(t.pointsFor * 10) / 10, pointsAgainst: Math.round(t.pointsAgainst * 10) / 10,
+      isMe: t.rosterId === myRosterId,
+    }));
+
+    // Best-effort cfg from the league so the hub knows starting requirements/scoring.
+    let cfg = null;
+    try {
+      const drafts = (await getLeagueDrafts(leagueId)) || [];
+      const d = drafts[0] ? await getDraft(drafts[0].draft_id).catch(() => null) : null;
+      cfg = cfgFromLeague(league, d);
+    } catch { cfg = cfgFromLeague(league, null); }
+
+    res.json({
+      leagueName: league.name,
+      cfg,
+      week,
+      seasonType: nfl ? nfl.season_type : null,
+      myRosterId,
+      linked: !!sid,
+      rostered: Array.from(rostered),
+      teams,
+      matchup,
+      standings,
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
 
 // 1) A user's leagues (so they can pick which one to connect)
 connectRouter.get('/sleeper/leagues', async (req, res) => {
