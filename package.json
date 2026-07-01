@@ -26,6 +26,7 @@
     "stripe": "^17.5.0",
     "cors": "^2.8.5",
     "helmet": "^8.0.0",
+    "express-rate-limit": "^7.4.1",
     "pino": "^9.6.0",
     "pino-http": "^10.4.0"
   },

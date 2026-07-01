@@ -26,14 +26,19 @@ export function verifyToken(token) {
   catch { return null; }
 }
 
-// Express middleware: attach req.user (full row) if a valid token is present. Does not block.
+// Express middleware: attach req.user (full row) if a valid token is present. Does not block, and never
+// throws — a transient DB hiccup on the lookup must not 500 an otherwise-anonymous-safe request.
 export async function attachUser(req, _res, next) {
-  const hdr = req.headers.authorization || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
-  const payload = token ? verifyToken(token) : null;
-  if (payload?.uid) {
-    const { rows } = await q('SELECT * FROM users WHERE id=$1', [payload.uid]);
-    if (rows[0]) req.user = rows[0];
+  try {
+    const hdr = req.headers.authorization || '';
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+    const payload = token ? verifyToken(token) : null;
+    if (payload?.uid) {
+      const { rows } = await q('SELECT * FROM users WHERE id=$1', [payload.uid]);
+      if (rows[0]) req.user = rows[0];
+    }
+  } catch (e) {
+    // Leave req.user unset; downstream requireAuth will handle it as unauthenticated rather than crashing.
   }
   next();
 }

@@ -2,6 +2,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import pinoHttp from 'pino-http';
 import cron from 'node-cron';
 
@@ -22,6 +23,10 @@ import { feedbackRouter } from './routes/feedback.js';
 import { refreshAll } from './jobs/refreshAll.js';
 
 const app = express();
+
+// Behind Render/Cloudflare there's a proxy in front of us; trust it so req.ip (used by the rate limiter)
+// reflects the real client IP from X-Forwarded-For rather than the proxy's address.
+app.set('trust proxy', 1);
 
 app.use(helmet());
 // CORS: if CORS_ORIGINS is empty or contains "*", allow any origin (reflect it back). Otherwise
@@ -46,9 +51,30 @@ app.use((req, res, next) => {
 });
 app.use(attachUser);
 
+// ---- Rate limiting (anti-abuse / basic DoS protection) ----
+// A generous general limit so real users (even hammering the board during a live draft) are never
+// throttled, but a runaway script or scraper is capped. The health check is exempt so uptime pingers and
+// load balancers are never rate-limited.
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,                     // 600 req/min per IP — well above normal drafting traffic
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/api/health',
+});
+// A strict limit on auth endpoints to stop brute-force / credential-stuffing on login & signup.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,                      // 30 attempts / 15 min per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts — please wait a few minutes and try again.' },
+});
+app.use('/api', generalLimiter);
+
 app.get('/api/health', (_req, res) => res.json({ ok: true, season: config.activeSeason, env: config.env }));
 
-app.use('/api/auth', authRouter);
+app.use('/api/auth', authLimiter, authRouter);
 app.use('/api/adp', adpRouter);
 app.use('/api/player-pack', playerPackRouter);
 app.use('/api/projections', projectionsRouter);
@@ -68,7 +94,27 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-app.listen(config.port, () => {
+// PROCESS-LEVEL SAFETY NET. A single unexpected error anywhere must never take the whole API down while
+// people are mid-draft. We log and keep running rather than letting the process exit. (A process manager
+// on the host will still restart us if the process ever does die.)
+process.on('unhandledRejection', (reason) => {
+  log.error({ reason: reason && reason.message ? reason.message : String(reason) }, 'unhandledRejection — kept alive');
+});
+process.on('uncaughtException', (err) => {
+  log.error({ err: err && err.message ? err.message : String(err) }, 'uncaughtException — kept alive');
+});
+// Graceful shutdown: on a platform stop/restart, finish in-flight requests before exiting so no
+// save is cut off mid-write.
+let server;
+function shutdown(sig) {
+  log.info({ sig }, 'shutting down');
+  if (server) server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 8000).unref(); // hard cap so we don't hang forever
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+server = app.listen(config.port, () => {
   log.info(`FDC API listening on :${config.port} (${config.env})`);
 
   // SELF-SUSTAINING DATA REFRESH. The app keeps its ADP/projections current on its own:
