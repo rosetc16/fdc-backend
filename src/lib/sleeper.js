@@ -79,3 +79,8 @@ export const getUserLeagues = (userId, season) => getJson(`/user/${userId}/leagu
 export const getLeagueUsers = (leagueId) => getJson(`/league/${leagueId}/users`);
 export const getLeague = (leagueId) => getJson(`/league/${leagueId}`);
 export const getLeagueRosters = (leagueId) => getJson(`/league/${leagueId}/rosters`);
+// Current NFL state (season, week, etc.) — used to know which week's matchups to pull.
+export const getNflState = () => getJson(`/state/nfl`);
+// A league's matchups for a given week (each roster's starters, points, matchup pairing).
+export const getMatchups = (leagueId, week) => getJson(`/league/${leagueId}/matchups/${week}`);
+

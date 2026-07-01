@@ -148,6 +148,8 @@ CREATE TABLE IF NOT EXISTS users (
   comp          BOOLEAN DEFAULT FALSE,        -- comped subscription
   disabled      BOOLEAN DEFAULT FALSE,        -- admin can switch off access entirely
   rank_sets     JSONB DEFAULT '[]'::jsonb,    -- personal rankings (mirrors prototype)
+  sleeper_user_id   TEXT,                      -- linked Sleeper account id (persists until unlinked)
+  sleeper_username  TEXT,                      -- linked Sleeper display username (for showing who's linked)
   created_at    TIMESTAMPTZ DEFAULT now()
 );
 

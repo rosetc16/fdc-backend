@@ -75,5 +75,7 @@ function publicUser(u) {
     id: u.id, email: u.email, admin: !!u.is_admin && !disabled,
     paid: !!paidActive, paidUntil: u.paid_until, comp: !!u.comp, disabled,
     rankSets: u.rank_sets || [],
+    sleeperUserId: u.sleeper_user_id || null,
+    sleeperUsername: u.sleeper_username || null,
   };
 }

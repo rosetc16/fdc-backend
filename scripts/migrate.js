@@ -15,6 +15,8 @@ async function migrate() {
   await pool.query(sql);
   // Idempotent column adds for existing tables (CREATE TABLE IF NOT EXISTS won't add new columns).
   await pool.query('ALTER TABLE players ADD COLUMN IF NOT EXISTS news_updated BIGINT;');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS sleeper_user_id TEXT;');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS sleeper_username TEXT;');
   log.info('migration applied');
 }
 

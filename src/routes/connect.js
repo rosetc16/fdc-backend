@@ -5,6 +5,7 @@
 import { Router } from 'express';
 import { config } from '../lib/config.js';
 import { requireAuth } from '../lib/auth.js';
+import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers,
@@ -12,6 +13,79 @@ import {
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
+
+// Lazily make sure the Sleeper-link columns exist, so linking works even if a manual migration
+// hasn't been run yet (the user is non-technical; we don't want to require a shell step).
+let linkColsEnsured = false;
+async function ensureLinkCols() {
+  if (linkColsEnsured) return;
+  try {
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS sleeper_user_id TEXT;');
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS sleeper_username TEXT;');
+  } catch (e) { /* if this fails we surface a clear error at call time */ }
+  linkColsEnsured = true;
+}
+
+// ---- Persistent Sleeper account link ----
+// The link is stored on the user row and stays until the user unlinks (or links a different account).
+// GET  /api/connect/sleeper/account            -> { linked, sleeperUserId, sleeperUsername }
+// POST /api/connect/sleeper/link { username }   -> resolves the username to a Sleeper id and stores it
+// POST /api/connect/sleeper/unlink              -> clears the stored link
+
+connectRouter.get('/sleeper/account', async (req, res) => {
+  try {
+    await ensureLinkCols();
+    const { rows } = await q('SELECT sleeper_user_id, sleeper_username FROM users WHERE id=$1', [req.user.id]);
+    const r = rows[0] || {};
+    res.json({ linked: !!r.sleeper_user_id, sleeperUserId: r.sleeper_user_id || null, sleeperUsername: r.sleeper_username || null });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not read Sleeper link' });
+  }
+});
+
+connectRouter.post('/sleeper/link', async (req, res) => {
+  const username = String((req.body && req.body.username) || '').trim();
+  if (!username) return res.status(400).json({ error: 'Sleeper username required' });
+  try {
+    await ensureLinkCols();
+    const user = await getUser(username);
+    if (!user || !user.user_id) return res.status(404).json({ error: 'No Sleeper user with that username' });
+    await q('UPDATE users SET sleeper_user_id=$1, sleeper_username=$2 WHERE id=$3', [user.user_id, user.username || username, req.user.id]);
+    res.json({ linked: true, sleeperUserId: user.user_id, sleeperUsername: user.username || username });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
+
+connectRouter.post('/sleeper/unlink', async (req, res) => {
+  try {
+    await ensureLinkCols();
+    await q('UPDATE users SET sleeper_user_id=NULL, sleeper_username=NULL WHERE id=$1', [req.user.id]);
+    res.json({ linked: false });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not unlink' });
+  }
+});
+
+// A linked user's leagues, pulled from the STORED account (no username needed at call time).
+connectRouter.get('/sleeper/my-leagues', async (req, res) => {
+  try {
+    await ensureLinkCols();
+    const { rows } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
+    const sid = rows[0] && rows[0].sleeper_user_id;
+    if (!sid) return res.status(400).json({ error: 'No Sleeper account linked' });
+    const season = Number(req.query.season || config.activeSeason);
+    const leagues = (await getUserLeagues(sid, season)) || [];
+    const out = leagues.map((lg) => ({
+      league_id: lg.league_id, name: lg.name, total_rosters: lg.total_rosters,
+      season: lg.season, draft_id: lg.draft_id || null,
+    }));
+    res.json({ sleeperUserId: sid, leagues: out });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
+
 
 // Map a Sleeper draft's scoring/roster settings to our league cfg shape (best-effort; user can edit).
 function cfgFromLeague(league, draft) {
