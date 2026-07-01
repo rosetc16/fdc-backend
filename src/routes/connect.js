@@ -125,6 +125,16 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
     }
     // last resort: match your slot via draft_order directly
     if (yourSlot == null && yourUserId && draftOrder[yourUserId]) yourSlot = draftOrder[yourUserId];
+    // Robust fallback: fill any still-unnamed slots from the ACTUAL picks. Each Sleeper pick carries
+    // `picked_by` (the real user_id) and its `draft_slot`, so even when draft_order/slot_to_roster are
+    // incomplete (common in pre-draft or oddly-configured leagues), the picks themselves reveal who owns
+    // each slot. This is what makes real manager/team names show up reliably.
+    (picksRaw || []).forEach((pk) => {
+      const slot = pk.draft_slot;
+      if (!slot || slotName[slot]) return;
+      const uid = pk.picked_by;
+      if (uid && userById[uid]) slotName[slot] = userById[uid].name;
+    });
 
     // ----- picks (mapped to names) -----
     const picks = (picksRaw || [])
