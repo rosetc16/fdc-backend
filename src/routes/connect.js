@@ -76,10 +76,35 @@ connectRouter.get('/sleeper/my-leagues', async (req, res) => {
     if (!sid) return res.status(400).json({ error: 'No Sleeper account linked' });
     const season = Number(req.query.season || config.activeSeason);
     const leagues = (await getUserLeagues(sid, season)) || [];
-    const out = leagues.map((lg) => ({
-      league_id: lg.league_id, name: lg.name, total_rosters: lg.total_rosters,
-      season: lg.season, draft_id: lg.draft_id || null,
-    }));
+    // Enrich each league with its draft state (pre-draft / drafting + round / complete) so the UI can show
+    // where each team stands. We look up the league's draft; for an in-progress draft we derive the round
+    // from the number of picks made so far and the team count.
+    const out = [];
+    for (const lg of leagues) {
+      let draftId = lg.draft_id || null, draftStatus = null, round = null, totalRounds = null, madePicks = null;
+      try {
+        const drafts = (await getLeagueDrafts(lg.league_id)) || [];
+        const d = drafts[0];
+        if (d) {
+          draftId = d.draft_id;
+          draftStatus = d.status || null; // 'pre_draft' | 'drafting' | 'paused' | 'complete'
+          totalRounds = (d.settings && d.settings.rounds) || null;
+          const teams = (d.settings && d.settings.teams) || lg.total_rosters || 12;
+          if (draftStatus === 'drafting' || draftStatus === 'paused') {
+            try {
+              const picks = (await getDraftPicks(d.draft_id)) || [];
+              madePicks = picks.length;
+              round = Math.floor(picks.length / teams) + 1;
+            } catch { /* ignore */ }
+          }
+        }
+      } catch { /* ignore — league still listed, just without draft detail */ }
+      out.push({
+        league_id: lg.league_id, name: lg.name, total_rosters: lg.total_rosters,
+        season: lg.season, draft_id: draftId, draft_status: draftStatus,
+        round, total_rounds: totalRounds, made_picks: madePicks,
+      });
+    }
     res.json({ sleeperUserId: sid, leagues: out });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
