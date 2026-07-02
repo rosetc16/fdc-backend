@@ -68,17 +68,18 @@ export async function getSeasonProjections(season, { positions } = {}) {
   return res.json();
 }
 
-// Weekly projections — the per-matchup version of the above. Same host + shape, plus `week`,
-// `opponent`, `game_id`, and per-week `injury_status` on each row. This is what the in-season hub uses
-// so points reflect THIS week's matchup rather than a season total divided by games.
-export async function getWeeklyProjections(season, week, { positions } = {}) {
-  const posQ = (positions || ['QB', 'RB', 'WR', 'TE', 'K', 'DEF']).map((p) => `position[]=${p}`).join('&');
+// Weekly ACTUALS — real points scored each week (same host/shape as projections, but `/stats/` and real
+// results). Used to compute season-to-date defense-vs-position difficulty the way the major sites do:
+// actual points allowed by each defense, by position, across completed weeks.
+export async function getWeeklyStats(season, week, { positions } = {}) {
+  const posQ = (positions || ['QB', 'RB', 'WR', 'TE']).map((p) => `position[]=${p}`).join('&');
   await pace();
-  const url = `${STATS_BASE}/projections/nfl/${season}/${week}?season_type=regular&${posQ}`;
+  const url = `${STATS_BASE}/stats/nfl/${season}/${week}?season_type=regular&${posQ}`;
   const res = await fetch(url, { headers: { accept: 'application/json' } });
-  if (!res.ok) { if (res.status === 404) return []; throw new Error(`Sleeper weekly projections ${res.status}`); }
+  if (!res.ok) { if (res.status === 404) return []; throw new Error(`Sleeper weekly stats ${res.status}`); }
   return res.json();
 }
+
 
 
 // ---- Drafts ----

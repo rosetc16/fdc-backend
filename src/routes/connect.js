@@ -11,6 +11,7 @@ import {
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
   getWeeklyProjections,
 } from '../lib/sleeper.js';
+import { getDefVsPos } from '../lib/defVsPos.js';
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
@@ -208,10 +209,7 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     // we already use. Build a per-player map: weekly points (in the league's scoring), opponent, game date,
     // and this week's injury status. Fails soft — if the weekly call is unavailable the hub still renders
     // (the frontend falls back to its season-based estimate).
-    // In the SAME pass we aggregate defense-vs-position difficulty (Slice D): for each defense, sum the
-    // projected points of the opposing players they face this week, by position. No extra data source.
     let weekly = {};
-    const allowByDef = {}; // defTeam -> { QB, RB, WR, TE } summed opposing projected pts (default scoring)
     try {
       const wp = (await getWeeklyProjections(season, week)) || [];
       for (const row of wp) {
@@ -233,35 +231,13 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
           date: row.date || null,
           inj: (row.player && row.player.injury_status) || null,
         };
-        // Defense aggregation: this player's opponent is the defense he faces. Use PPR points as a neutral,
-        // league-independent yardstick for how much a defense gives up at each position.
-        const def = row.opponent;
-        if (def && position && ['QB', 'RB', 'WR', 'TE'].includes(position)) {
-          const ppr = st.pts_ppr != null ? Number(st.pts_ppr) : (pts || 0);
-          if (!allowByDef[def]) allowByDef[def] = { QB: 0, RB: 0, WR: 0, TE: 0 };
-          allowByDef[def][position] += ppr;
-        }
       }
     } catch { weekly = {}; }
 
-    // Rank defenses 1..N per position (1 = TOUGHEST, i.e. fewest projected points allowed). Attach a simple
-    // tier (tough / neutral / soft) the frontend can badge onto each starter's matchup.
+    // Defense-vs-position difficulty — season-to-date ACTUAL points allowed by each defense per position
+    // (the method the major sites use), cached in def_vs_pos. Empty early in the season (no completed weeks).
     let matchupDifficulty = {};
-    try {
-      const defs = Object.keys(allowByDef);
-      const n = defs.length;
-      if (n >= 8) { // only meaningful with a full slate
-        ['QB', 'RB', 'WR', 'TE'].forEach((pos) => {
-          const ranked = defs.slice().sort((a, b) => allowByDef[a][pos] - allowByDef[b][pos]); // ascending = tough first
-          ranked.forEach((def, i) => {
-            const rank = i + 1;
-            if (!matchupDifficulty[def]) matchupDifficulty[def] = {};
-            const tier = rank <= Math.ceil(n / 3) ? 'tough' : rank <= Math.ceil((2 * n) / 3) ? 'neutral' : 'soft';
-            matchupDifficulty[def][pos] = { rank, of: n, tier, allowed: Math.round(allowByDef[def][pos] * 10) / 10 };
-          });
-        });
-      }
-    } catch { matchupDifficulty = {}; }
+    try { matchupDifficulty = (await getDefVsPos(season, week)) || {}; } catch { matchupDifficulty = {}; }
 
     // Owner lookup: Sleeper user_id -> display info. Prefer a custom team_name over the display_name.
     const ownerById = new Map();

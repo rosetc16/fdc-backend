@@ -99,6 +99,18 @@ CREATE TABLE IF NOT EXISTS projections (
 );
 CREATE INDEX IF NOT EXISTS idx_proj_season ON projections (season);
 
+-- ============================================================ DEFENSE VS POSITION (matchup difficulty)
+-- Season-to-date actual fantasy points ALLOWED by each NFL defense to each position, computed from weekly
+-- actuals. Cached per (season, through_week) so we don't refetch every completed week on each hub load.
+-- `table_json` holds the full computed structure: { [defTeam]: { QB:{rank,of,tier,allowed,pg}, RB:{...} } }.
+CREATE TABLE IF NOT EXISTS def_vs_pos (
+  season       INT NOT NULL,
+  through_week INT NOT NULL,                    -- highest completed week included
+  table_json   JSONB NOT NULL,
+  updated_at   TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (season, through_week)
+);
+
 -- ============================================================ DISCOVERED USERS (harvest crawl frontier)
 -- Persistent memory of every Sleeper user we've discovered while crawling the league graph. Lets the
 -- nightly harvest keep reaching NEW leagues each run (breadth-first) instead of re-walking the same
