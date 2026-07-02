@@ -401,6 +401,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
     const slotToRoster = (draft && draft.slot_to_roster_id) || {}; // slot -> roster_id
     // Build slot (1-based) -> team name, and figure out which slot is the connecting user.
     const slotName = {}; // slot -> name
+    const slotOwner = {}; // slot -> Sleeper username (display_name), for showing "(username)" next to team names
     let yourSlot = null, yourUserId = null;
     // resolve the connecting user's id from username (via leagueUsers display_name match)
     if (username) {
@@ -411,7 +412,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       // prefer explicit draft_order; else fall back to slot_to_roster -> owner
       let uid = Object.keys(draftOrder).find((k) => draftOrder[k] === slot);
       if (!uid) { const rid = slotToRoster[slot]; if (rid != null) uid = rosterOwner[rid]; }
-      if (uid && userById[uid]) slotName[slot] = userById[uid].name;
+      if (uid && userById[uid]) { slotName[slot] = userById[uid].name; slotOwner[slot] = userById[uid].display_name || null; }
       if (uid && yourUserId && uid === yourUserId) yourSlot = slot;
     }
     // last resort: match your slot via draft_order directly
@@ -424,7 +425,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       const slot = pk.draft_slot;
       if (!slot || slotName[slot]) return;
       const uid = pk.picked_by;
-      if (uid && userById[uid]) slotName[slot] = userById[uid].name;
+      if (uid && userById[uid]) { slotName[slot] = userById[uid].name; slotOwner[slot] = userById[uid].display_name || null; }
     });
 
     // ----- picks (mapped to names) -----
@@ -506,6 +507,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       reversalRound: reversalRound || null,
       yourSlot,                 // 1-based slot of the connecting user (null if not resolved)
       slotNames: slotName,      // { slot: teamName } for all teams
+      slotOwners: slotOwner,    // { slot: sleeperUsername } — shown as "(username)" next to team names
       tradedPicks,              // resolved to slots
       keepers,                  // [{ slot, player_id, name, pos }]
       existingRosters,          // { slot: [{ player_id, name, pos }] } — current holdings (rookie/dynasty)
