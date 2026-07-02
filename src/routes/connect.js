@@ -227,6 +227,10 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
           ptsStd: st.pts_std != null ? Math.round(st.pts_std * 10) / 10 : null,
           opp: row.opponent || null,
           team: row.team || (row.player && row.player.team) || null,
+          // Home/away if Sleeper provides it on the row (varies by season readiness). We check the common
+          // field names; when absent the frontend shows a neutral "vs". Also expose game_id, which Sleeper's
+          // schedule encodes, so we can resolve home/away later if needed.
+          home: (row.home != null ? !!row.home : (row.is_home != null ? !!row.is_home : (row.game && row.game.home ? row.game.home === (row.team) : null))),
           gameId: row.game_id || null,
           date: row.date || null,
           inj: (row.player && row.player.injury_status) || null,
