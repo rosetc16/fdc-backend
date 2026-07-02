@@ -173,9 +173,36 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     week = Math.max(1, week);
     const season = (nfl && nfl.season) || String(config.activeSeason);
 
-    // Which scoring field to use for this league (PPR / half / standard), from the league's rec setting.
+    // Which scoring field to use as a FALLBACK only (if a player has no raw stats to score).
     const recPts = (league.scoring_settings && Number(league.scoring_settings.rec)) || 0;
     const ptsField = recPts >= 1 ? 'pts_ppr' : recPts >= 0.5 ? 'pts_half_ppr' : 'pts_std';
+
+    // The league's actual scoring rules (pass_td, pass_yd, rec, bonus_rec_te, etc.). Sleeper's pre-summed
+    // pts_ppr/pts_std fields assume DEFAULT scoring (6-pt pass TDs, no TE premium), so they're wrong for
+    // leagues with custom rules. We instead recompute each player's points from the RAW stat projections
+    // times this league's per-stat values — which correctly handles 4-pt pass TDs, TE premium, and anything
+    // else the commissioner set. Same stat vocabulary is used by both the projections and the scoring map.
+    const scoring = league.scoring_settings || {};
+    // Keys that are metadata/points fields in the stats object, not scorable stats — never multiply these.
+    const NON_STAT = new Set(['gp', 'gms_active', 'pts_ppr', 'pts_half_ppr', 'pts_std', 'adp_dd_ppr', 'pos_adp_dd_ppr', 'rank_ppr', 'rank_std']);
+    const scoreFromSleeper = (stats, position) => {
+      if (!stats) return null;
+      let pts = 0, matched = 0;
+      for (const key in scoring) {
+        const perPt = Number(scoring[key]);
+        if (!perPt) continue;
+        if (key === 'bonus_rec_te') {
+          // TE-premium: extra points per reception, TE only.
+          if (position === 'TE' && stats.rec != null) { pts += Number(stats.rec) * perPt; matched++; }
+          continue;
+        }
+        if (NON_STAT.has(key)) continue;
+        const statVal = stats[key];
+        if (statVal != null && !Number.isNaN(Number(statVal))) { pts += Number(statVal) * perPt; matched++; }
+      }
+      // If we couldn't match ANY scoring stats (unexpected key mismatch), signal null so we fall back.
+      return matched > 0 ? Math.round(pts * 100) / 100 : null;
+    };
 
     // Pull THIS WEEK's projections so points are matchup-specific (not season/17). Same Sleeper stats host
     // we already use. Build a per-player map: weekly points (in the league's scoring), opponent, game date,
@@ -187,7 +214,11 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       for (const row of wp) {
         const pid = row.player_id; if (!pid) continue;
         const st = row.stats || {};
-        const pts = st[ptsField] != null ? st[ptsField] : (st.pts_ppr != null ? st.pts_ppr : null);
+        const position = (row.player && row.player.position) || null;
+        // Recompute with the league's real scoring; fall back to Sleeper's pre-summed field only if the
+        // raw-stat scoring couldn't run.
+        const custom = scoreFromSleeper(st, position);
+        const pts = custom != null ? custom : (st[ptsField] != null ? st[ptsField] : (st.pts_ppr != null ? st.pts_ppr : null));
         weekly[pid] = {
           pts: pts != null ? Math.round(pts * 10) / 10 : null,
           ptsPpr: st.pts_ppr != null ? Math.round(st.pts_ppr * 10) / 10 : null,
