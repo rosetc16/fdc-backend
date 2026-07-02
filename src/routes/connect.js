@@ -9,6 +9,7 @@ import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
+  getWeeklyProjections,
 } from '../lib/sleeper.js';
 
 export const connectRouter = Router();
@@ -170,6 +171,36 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     let week = Number(req.query.week || 0);
     if (!week || Number.isNaN(week)) week = (nfl && (nfl.week || nfl.display_week)) || 1;
     week = Math.max(1, week);
+    const season = (nfl && nfl.season) || String(config.activeSeason);
+
+    // Which scoring field to use for this league (PPR / half / standard), from the league's rec setting.
+    const recPts = (league.scoring_settings && Number(league.scoring_settings.rec)) || 0;
+    const ptsField = recPts >= 1 ? 'pts_ppr' : recPts >= 0.5 ? 'pts_half_ppr' : 'pts_std';
+
+    // Pull THIS WEEK's projections so points are matchup-specific (not season/17). Same Sleeper stats host
+    // we already use. Build a per-player map: weekly points (in the league's scoring), opponent, game date,
+    // and this week's injury status. Fails soft — if the weekly call is unavailable the hub still renders
+    // (the frontend falls back to its season-based estimate).
+    let weekly = {};
+    try {
+      const wp = (await getWeeklyProjections(season, week)) || [];
+      for (const row of wp) {
+        const pid = row.player_id; if (!pid) continue;
+        const st = row.stats || {};
+        const pts = st[ptsField] != null ? st[ptsField] : (st.pts_ppr != null ? st.pts_ppr : null);
+        weekly[pid] = {
+          pts: pts != null ? Math.round(pts * 10) / 10 : null,
+          ptsPpr: st.pts_ppr != null ? Math.round(st.pts_ppr * 10) / 10 : null,
+          ptsHalf: st.pts_half_ppr != null ? Math.round(st.pts_half_ppr * 10) / 10 : null,
+          ptsStd: st.pts_std != null ? Math.round(st.pts_std * 10) / 10 : null,
+          opp: row.opponent || null,
+          team: row.team || (row.player && row.player.team) || null,
+          gameId: row.game_id || null,
+          date: row.date || null,
+          inj: (row.player && row.player.injury_status) || null,
+        };
+      }
+    } catch { weekly = {}; }
 
     // Owner lookup: Sleeper user_id -> display info. Prefer a custom team_name over the display_name.
     const ownerById = new Map();
@@ -244,6 +275,8 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       leagueName: league.name,
       cfg,
       week,
+      season,
+      scoringField: ptsField,
       seasonType: nfl ? nfl.season_type : null,
       myRosterId,
       linked: !!sid,
@@ -251,6 +284,7 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       teams,
       matchup,
       standings,
+      weekly,        // { [player_id]: { pts, opp, team, date, gameId, inj, ... } } for THIS week
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });

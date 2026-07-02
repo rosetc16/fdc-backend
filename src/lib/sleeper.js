@@ -68,6 +68,19 @@ export async function getSeasonProjections(season, { positions } = {}) {
   return res.json();
 }
 
+// Weekly projections — the per-matchup version of the above. Same host + shape, plus `week`,
+// `opponent`, `game_id`, and per-week `injury_status` on each row. This is what the in-season hub uses
+// so points reflect THIS week's matchup rather than a season total divided by games.
+export async function getWeeklyProjections(season, week, { positions } = {}) {
+  const posQ = (positions || ['QB', 'RB', 'WR', 'TE', 'K', 'DEF']).map((p) => `position[]=${p}`).join('&');
+  await pace();
+  const url = `${STATS_BASE}/projections/nfl/${season}/${week}?season_type=regular&${posQ}`;
+  const res = await fetch(url, { headers: { accept: 'application/json' } });
+  if (!res.ok) { if (res.status === 404) return []; throw new Error(`Sleeper weekly projections ${res.status}`); }
+  return res.json();
+}
+
+
 // ---- Drafts ----
 export const getDraft = (draftId) => getJson(`/draft/${draftId}`);
 export const getDraftPicks = (draftId) => getJson(`/draft/${draftId}/picks`);
