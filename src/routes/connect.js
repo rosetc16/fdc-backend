@@ -322,7 +322,7 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       matchup,
       standings,
       weekly,        // { [player_id]: { pts, opp, team, date, gameId, inj, ... } } for THIS week
-      matchupDifficulty,  // { [defTeam]: { QB/RB/WR/TE: { rank, of, tier, allowed } } }
+      matchupDifficulty,  // { [defTeam]: { QB/RB/WR/TE: { rank, of, tier, pg } } } season-to-date pts allowed/game
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
