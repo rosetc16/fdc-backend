@@ -81,8 +81,10 @@ async function compute(season, throughWeek) {
   return table;
 }
 
-// Public: get the season-to-date table through the last COMPLETED week (currentWeek - 1). Returns {} when
-// there's no completed week yet (e.g. very start of the season) — callers treat {} as "no data".
+// Public: get the season-to-date table through the last COMPLETED week — CACHE-ONLY and fast. Never triggers
+// the expensive multi-week fetch inline, so it can't slow down a hub load. Returns the cached table if we
+// have it, otherwise {} (and kicks off a background warm so it's ready next time). Callers treat {} as
+// "no data yet".
 export async function getDefVsPos(season, currentWeek) {
   const throughWeek = Math.max(0, Number(currentWeek || 1) - 1);
   if (throughWeek < 1) return {}; // no games played yet this season
@@ -100,23 +102,45 @@ export async function getDefVsPos(season, currentWeek) {
       memo = { key, table: rows[0].table_json, at: Date.now() };
       return rows[0].table_json;
     }
-  } catch { /* fall through to compute */ }
+  } catch { /* fall through */ }
 
-  // 3) compute + persist
-  let table = {};
+  // 3) Not cached yet — DON'T compute inline (that's the slow path that blocked the hub). Kick off a
+  //    background warm and return empty for now; the next hub load picks up the cached result.
+  warmDefVsPos(season, currentWeek).catch(() => {});
+  return {};
+}
+
+// Background builder: computes the table (expensive — one Sleeper call per completed week) and caches it.
+// Guarded so we never run two builds for the same key at once. Safe to call fire-and-forget.
+const warming = new Set();
+export async function warmDefVsPos(season, currentWeek) {
+  const throughWeek = Math.max(0, Number(currentWeek || 1) - 1);
+  if (throughWeek < 1) return {};
+  const key = `${season}:${throughWeek}`;
+  if (warming.has(key)) return {}; // a build is already in flight
+  warming.add(key);
   try {
-    table = (await compute(season, throughWeek)) || {};
-  } catch { table = {}; }
-  try {
-    if (table && Object.keys(table).length) {
-      await q(
-        `INSERT INTO def_vs_pos (season, through_week, table_json, updated_at)
-         VALUES ($1,$2,$3,now())
-         ON CONFLICT (season, through_week) DO UPDATE SET table_json=EXCLUDED.table_json, updated_at=now()`,
-        [season, throughWeek, JSON.stringify(table)]
-      );
-    }
-  } catch { /* cache write is best-effort */ }
-  memo = { key, table, at: Date.now() };
-  return table;
+    await ensureTable();
+    // Re-check the cache in case it got filled while we were queued.
+    try {
+      const { rows } = await q('SELECT table_json FROM def_vs_pos WHERE season=$1 AND through_week=$2', [season, throughWeek]);
+      if (rows[0] && rows[0].table_json) { memo = { key, table: rows[0].table_json, at: Date.now() }; return rows[0].table_json; }
+    } catch { /* proceed to compute */ }
+    let table = {};
+    try { table = (await compute(season, throughWeek)) || {}; } catch { table = {}; }
+    try {
+      if (table && Object.keys(table).length) {
+        await q(
+          `INSERT INTO def_vs_pos (season, through_week, table_json, updated_at)
+           VALUES ($1,$2,$3,now())
+           ON CONFLICT (season, through_week) DO UPDATE SET table_json=EXCLUDED.table_json, updated_at=now()`,
+          [season, throughWeek, JSON.stringify(table)]
+        );
+      }
+    } catch { /* best-effort */ }
+    memo = { key, table, at: Date.now() };
+    return table;
+  } finally {
+    warming.delete(key);
+  }
 }
