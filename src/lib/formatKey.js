@@ -64,8 +64,16 @@ export function cfgFromSleeperDraft(draft) {
   const meta = draft.metadata || {};
   const scoringType = (meta.scoring_type || s.scoring_type || 'ppr').toLowerCase();
   const rec = scoringType.includes('ppr') ? 1 : scoringType.includes('half') ? 0.5 : 0;
-  const type = (draft.type === 'dynasty' || meta.dynasty) ? 'dynasty'
-    : (draft.metadata && draft.metadata.best_ball === 'on') ? 'bestball' : 'redraft';
+  // Draft TYPE detection — MUST match connect.js's cfgFromLeague so the harvested format_key lines up with
+  // what the live app queries. A rookie draft (rookies-only pool, tiny board) is the single most common
+  // draft happening right now, so mis-tagging it as REDRAFT floods the redraft bucket with rookies. Sleeper
+  // marks rookie drafts with draft.type === 'rookie' (or metadata.type containing 'rookie').
+  const draftType = ((draft.type || meta.type || '') + '').toLowerCase();
+  const isRookie = draftType === 'rookie' || draftType.includes('rookie');
+  const type = isRookie ? 'rookie'
+    : (draft.type === 'dynasty' || meta.dynasty) ? 'dynasty'
+    : (meta.best_ball === 'on' || s.best_ball === 1) ? 'bestball'
+    : 'redraft';
   return {
     teams: s.teams || 12,
     type,

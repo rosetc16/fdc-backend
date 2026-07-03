@@ -232,3 +232,14 @@ CREATE TABLE IF NOT EXISTS user_state (
   state       JSONB NOT NULL DEFAULT '{}'::jsonb,
   updated_at  TIMESTAMPTZ DEFAULT now()
 );
+
+-- ============================================================ APP META / MIGRATION FLAGS
+-- Tiny key/value store for one-time server-side migrations that must run exactly once (e.g. purging a
+-- pool of data that was written with a since-fixed tagging bug so it re-harvests correctly). The server
+-- checks/sets these on boot; no admin action required.
+CREATE TABLE IF NOT EXISTS app_meta (
+  key         TEXT PRIMARY KEY,
+  value       TEXT,
+  updated_at  TIMESTAMPTZ DEFAULT now()
+);
+

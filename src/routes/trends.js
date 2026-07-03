@@ -45,7 +45,11 @@ trendsRouter.get('/board', async (req, res) => {
   try {
     const chosen = await pickFormat(season, format, minDrafts);
     if (!chosen.draftCount) {
-      return res.json({ format, usedFormat: chosen.fkey, fallback: false, thin: true, season, draftCount: 0, players: [], note: 'No harvested drafts for this format yet — the harvester needs to run.' });
+      const [, , , poolClass] = chosen.fkey.split('|');
+      const seasonal = poolClass === 'REDRAFT'
+        ? 'Few redraft drafts happen in the offseason — most drafts right now are rookie and dynasty. This fills up as redraft season approaches.'
+        : 'No harvested drafts for this format yet — the pool fills automatically as more of these drafts happen.';
+      return res.json({ format, usedFormat: chosen.fkey, fallback: false, thin: true, season, draftCount: 0, players: [], note: seasonal });
     }
     // Aggregate the raw pick observations into a per-player distribution. percentile_cont for the median,
     // stddev_samp for spread. We compute everything in SQL so it scales to large pools.

@@ -21,6 +21,16 @@ adminRouter.post('/run-job', async (req, res) => {
     } else if (job === 'published') {
       const { syncPublishedAdp } = await import('../jobs/syncPublishedAdp.js');
       detail = await syncPublishedAdp();
+    } else if (job === 'harvest') {
+      const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
+      detail = await harvestSleeperDrafts();
+    } else if (job === 'rebuild-trends') {
+      // Purge the harvested-drafts pool and re-harvest from scratch — use if the pool ever needs a clean
+      // rebuild (e.g. after a tagging fix). Safe: only touches harvested observations, not published ADP.
+      await q(`DELETE FROM adp_observations WHERE source='sleeper_harvest'`);
+      await q(`DELETE FROM harvested_drafts`);
+      const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
+      detail = { purged: true, ...(await harvestSleeperDrafts()) };
     } else {
       const { refreshAdpOnly } = await import('../jobs/refreshAdpOnly.js');
       detail = await refreshAdpOnly();

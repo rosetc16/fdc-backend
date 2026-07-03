@@ -158,6 +158,20 @@ server = app.listen(config.port, () => {
     setTimeout(async () => {
       try {
         const { q } = await import('./lib/db.js');
+        // One-time migration: earlier harvests mis-tagged rookie drafts as REDRAFT (the harvester's format
+        // detection didn't recognize rookie drafts), which flooded the redraft bucket with rookies and left
+        // the rookie/dynasty buckets empty. Purge that pool ONCE so it re-harvests with the corrected tags.
+        // Guarded by an app_meta flag so it runs exactly once, automatically — no admin action.
+        await q(`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        const flag = 'harvest_rookie_retag_v1';
+        const done = await q(`SELECT value FROM app_meta WHERE key=$1`, [flag]).catch(() => ({ rows: [] }));
+        if (!done.rows.length) {
+          log.info('startup migration: purging mis-tagged harvested drafts so they re-harvest with correct format keys');
+          await q(`DELETE FROM adp_observations WHERE source='sleeper_harvest'`).catch((e) => log.error(e, 'purge adp_observations'));
+          await q(`DELETE FROM harvested_drafts`).catch((e) => log.error(e, 'purge harvested_drafts'));
+          await q(`INSERT INTO app_meta (key, value) VALUES ($1, now()::text) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, [flag]).catch(() => {});
+          log.info('startup migration: purge complete — harvest will repopulate below');
+        }
         const r = await q(`SELECT count(*)::int n FROM harvested_drafts`).catch(() => ({ rows: [{ n: 0 }] }));
         if (!r.rows[0] || r.rows[0].n === 0) {
           log.info('startup: no harvested drafts found — running one-time draft harvest for Trends');
