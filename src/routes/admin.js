@@ -25,12 +25,16 @@ adminRouter.post('/run-job', async (req, res) => {
       const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
       detail = await harvestSleeperDrafts();
     } else if (job === 'rebuild-trends') {
-      // Purge the harvested-drafts pool and re-harvest from scratch — use if the pool ever needs a clean
-      // rebuild (e.g. after a tagging fix). Safe: only touches harvested observations, not published ADP.
+      // Purge the harvested-drafts pool and reset the crawl frontier, then re-harvest. The re-harvest can
+      // take several minutes (rate-limited Sleeper calls across the league graph), so we kick it off in the
+      // BACKGROUND and return immediately — otherwise the HTTP request would time out. Watch progress via
+      // the pool stats (Refresh stats) which update as drafts land.
       await q(`DELETE FROM adp_observations WHERE source='sleeper_harvest'`);
       await q(`DELETE FROM harvested_drafts`);
+      await q(`UPDATE discovered_users SET crawled_at = NULL`).catch(() => {});
       const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
-      detail = { purged: true, ...(await harvestSleeperDrafts()) };
+      harvestSleeperDrafts().then((r) => log.info(r, 'rebuild-trends harvest complete')).catch((e) => log.error(e, 'rebuild-trends harvest failed'));
+      detail = { purged: true, crawlReset: true, started: true, note: 'Rebuild started in the background — re-harvesting the full league graph. Hit "Refresh stats" in a minute or two to watch the pool fill.' };
     } else {
       const { refreshAdpOnly } = await import('../jobs/refreshAdpOnly.js');
       detail = await refreshAdpOnly();

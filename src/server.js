@@ -169,6 +169,9 @@ server = app.listen(config.port, () => {
           log.info('startup migration: purging mis-tagged harvested drafts so they re-harvest with correct format keys');
           await q(`DELETE FROM adp_observations WHERE source='sleeper_harvest'`).catch((e) => log.error(e, 'purge adp_observations'));
           await q(`DELETE FROM harvested_drafts`).catch((e) => log.error(e, 'purge harvested_drafts'));
+          // Reset the crawl frontier so the FULL league graph is re-walked — a purge alone would leave every
+          // user marked 'crawled', so the re-harvest would only pick up a handful of newly-found users.
+          await q(`UPDATE discovered_users SET crawled_at = NULL`).catch((e) => log.error(e, 'reset crawl frontier'));
           await q(`INSERT INTO app_meta (key, value) VALUES ($1, now()::text) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, [flag]).catch(() => {});
           log.info('startup migration: purge complete — harvest will repopulate below');
         }
