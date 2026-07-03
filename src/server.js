@@ -163,7 +163,7 @@ server = app.listen(config.port, () => {
         // the rookie/dynasty buckets empty. Purge that pool ONCE so it re-harvests with the corrected tags.
         // Guarded by an app_meta flag so it runs exactly once, automatically — no admin action.
         await q(`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT now())`).catch(() => {});
-        const flag = 'harvest_rookie_retag_v1';
+        const flag = 'harvest_league_retag_v2';
         const done = await q(`SELECT value FROM app_meta WHERE key=$1`, [flag]).catch(() => ({ rows: [] }));
         if (!done.rows.length) {
           log.info('startup migration: purging mis-tagged harvested drafts so they re-harvest with correct format keys');

@@ -21,7 +21,24 @@ const HARVEST_SOURCE = 'sleeper_harvest';
 // one we saw (so we always return *something*, flagged as thin).
 async function pickFormat(season, format, minDrafts) {
   let best = null;
-  for (const fkey of formatFallbacks(format)) {
+  // Trends-specific fallback: KEEP the pool (REDRAFT/DYNASTY/ROOKIE/BESTBALL) fixed — never mix rookie
+  // picks into redraft, etc. — but relax scoring, TE-premium, and team-size aggressively so a thin exact
+  // format still finds its nearest neighbor within the same pool.
+  const [scoring, qb, te, pool, teams] = format.split('|');
+  const cands = [];
+  for (const sc of [scoring, 'PPR', 'HALF', 'STD']) {
+    for (const t of [te, 'STD', 'TEP']) {
+      for (const tm of [teams, '12', '8-10', '14+']) {
+        cands.push([sc, qb, t, pool, tm].join('|'));
+      }
+    }
+  }
+  // also allow a QB relax (SF<->1QB) only as a last resort, still within the same pool
+  for (const qx of [qb, qb === 'SF' ? '1QB' : 'SF']) {
+    cands.push(['PPR', qx, 'STD', pool, '12'].join('|'));
+  }
+  const ordered = [...new Set(cands)];
+  for (const fkey of ordered) {
     let n = 0;
     try {
       const r = await q(`SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key=$2`, [season, fkey]);
@@ -53,6 +70,15 @@ trendsRouter.get('/board', async (req, res) => {
     }
     // Aggregate the raw pick observations into a per-player distribution. percentile_cont for the median,
     // stddev_samp for spread. We compute everything in SQL so it scales to large pools.
+    // Match ALL format keys in the same POOL + QB type (e.g. every SF ROOKIE draft, regardless of scoring/TE
+    // nuance/team-size) so the distribution uses the full harvested depth — while never mixing pools
+    // (rookie never blends with redraft). Keys are SCORING|QB|TE|POOL|TEAMS.
+    const [, qbC, , poolC] = chosen.fkey.split('|');
+    const poolPattern = `%|${qbC}|%|${poolC}|%`;
+    const draftCountPool = (await q(
+      `SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key LIKE $2`,
+      [season, poolPattern]
+    ).catch(() => ({ rows: [{ n: chosen.draftCount }] }))).rows[0]?.n || chosen.draftCount;
     const { rows } = await q(
       `SELECT o.player_id,
               p.full_name, p.position, p.team, p.bye_week,
@@ -65,17 +91,17 @@ trendsRouter.get('/board', async (req, res) => {
               array_agg(o.pick ORDER BY o.pick)              AS picks
          FROM adp_observations o
          JOIN players p ON p.player_id = o.player_id
-        WHERE o.season = $1 AND o.source = $2 AND o.format_key = $3
+        WHERE o.season = $1 AND o.source = $2 AND o.format_key LIKE $3
         GROUP BY o.player_id, p.full_name, p.position, p.team, p.bye_week
        HAVING count(*) >= $4
         ORDER BY avg(o.pick) ASC
         LIMIT $5`,
-      [season, HARVEST_SOURCE, chosen.fkey, minPicks, limit]
+      [season, HARVEST_SOURCE, poolPattern, minPicks, limit]
     );
-    const players = rows.map((r) => shapePlayer(r, chosen.draftCount));
+    const players = rows.map((r) => shapePlayer(r, draftCountPool));
     res.json({
       format, usedFormat: chosen.fkey, fallback: chosen.fkey !== format, thin: chosen.thin,
-      season, draftCount: chosen.draftCount, count: players.length, players,
+      season, draftCount: draftCountPool, count: players.length, players,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

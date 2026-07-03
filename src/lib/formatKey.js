@@ -57,37 +57,51 @@ export function formatKey(cfg) {
   ].join('|');
 }
 
-// Derive a cfg-like object from a Sleeper draft's settings so we can format-key its picks.
-// Sleeper draft settings expose slots_qb, slots_super_flex, slots_te, scoring_type, teams, etc.
-export function cfgFromSleeperDraft(draft) {
+// Derive a cfg-like object from a Sleeper draft's settings so we can format-key its picks. Optionally pass
+// the LEAGUE object too — it's the only reliable place to tell dynasty from redraft (league.settings.type:
+// 0/1 = redraft/keeper, 2 = dynasty). Without it, everything looks like redraft (which is the bug that made
+// the pool show only REDRAFT keys). Rookie drafts are detected from the draft itself.
+export function cfgFromSleeperDraft(draft, league = null) {
   const s = draft.settings || {};
   const meta = draft.metadata || {};
+  // Scoring: prefer the LEAGUE's actual rec value (authoritative) over the draft's scoring_type label, which
+  // is often missing/generic. rec >= 0.75 = PPR, >= 0.25 = half, else standard.
+  const leagueRec = (league && league.scoring_settings && league.scoring_settings.rec != null) ? Number(league.scoring_settings.rec) : null;
   const scoringType = (meta.scoring_type || s.scoring_type || 'ppr').toLowerCase();
-  const rec = scoringType.includes('ppr') ? 1 : scoringType.includes('half') ? 0.5 : 0;
-  // Draft TYPE detection — MUST match connect.js's cfgFromLeague so the harvested format_key lines up with
-  // what the live app queries. A rookie draft (rookies-only pool, tiny board) is the single most common
-  // draft happening right now, so mis-tagging it as REDRAFT floods the redraft bucket with rookies. Sleeper
-  // marks rookie drafts with draft.type === 'rookie' (or metadata.type containing 'rookie').
-  const draftType = ((draft.type || meta.type || '') + '').toLowerCase();
-  const isRookie = draftType === 'rookie' || draftType.includes('rookie');
+  const rec = leagueRec != null ? leagueRec : (scoringType.includes('ppr') ? 1 : scoringType.includes('half') ? 0.5 : 0);
+  // ROOKIE detection: a rookie draft has few rounds and its own pool. Sleeper signals it a few ways —
+  // draft.type is usually the ORDER ('snake'/'linear'), so we can't rely on it alone. The strongest signals:
+  //   • metadata.scoring_type or metadata.name mentioning 'rookie'
+  //   • the league is a dynasty AND the draft is short (<= 6 rounds) and it's not the league's startup
+  //   • draft.metadata.type === 'rookie'
+  const dtype = ((draft.type || meta.type || '') + '').toLowerCase();
+  const metaBlob = ((meta.scoring_type || '') + ' ' + (meta.name || '') + ' ' + (draft.name || '')).toLowerCase();
+  const rounds = Number(s.rounds || 0);
+  const leagueIsDynasty = !!(league && league.settings && Number(league.settings.type) === 2);
+  const leagueIsKeeper = !!(league && league.settings && Number(league.settings.type) === 1);
+  const explicitRookie = dtype.includes('rookie') || metaBlob.includes('rookie');
+  // A short draft inside a dynasty league is a rookie draft (startups are full-length, ~15+ rounds).
+  const shortDynastyDraft = leagueIsDynasty && rounds > 0 && rounds <= 6;
+  const isRookie = explicitRookie || shortDynastyDraft;
+  const bestBall = meta.best_ball === 'on' || s.best_ball === 1 || (league && league.settings && league.settings.best_ball === 1);
   const type = isRookie ? 'rookie'
-    : (draft.type === 'dynasty' || meta.dynasty) ? 'dynasty'
-    : (meta.best_ball === 'on' || s.best_ball === 1) ? 'bestball'
+    : bestBall ? 'bestball'
+    : leagueIsDynasty ? 'dynasty'
+    : leagueIsKeeper ? 'keeper'
     : 'redraft';
+  // TE premium: rec bonus for TE greater than base rec (from league scoring settings when we have them).
+  const sc = (league && league.scoring_settings) || {};
+  const recTE = sc.rec_te != null ? Number(sc.rec_te) : rec;
   return {
-    teams: s.teams || 12,
+    teams: (league && league.total_rosters) || s.teams || 12,
     type,
+    tePremMult: recTE > rec ? recTE - rec : 0,
     start: {
-      QB: s.slots_qb || 1,
-      SUPER: s.slots_super_flex || 0,
+      QB: s.slots_qb != null ? s.slots_qb : ((league && league.roster_positions) ? league.roster_positions.filter((p) => p === 'QB').length : 1),
+      SUPER: s.slots_super_flex != null ? s.slots_super_flex : ((league && league.roster_positions) ? league.roster_positions.filter((p) => p === 'SUPER_FLEX').length : 0),
       TE: s.slots_te || 1,
     },
-    scoring: {
-      rec,
-      // Sleeper carries per-position rec bonuses in league scoring_settings; te premium is
-      // detected upstream from the league object when available. Default standard here.
-      recTE: rec,
-    },
+    scoring: { rec, recTE },
   };
 }
 

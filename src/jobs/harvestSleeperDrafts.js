@@ -9,7 +9,7 @@
 // In production you grow the seed set from: (a) every user who connects their Sleeper account,
 // (b) league members discovered via those leagues, (c) optional public mock-draft lobby crawling.
 import { config } from '../lib/config.js';
-import { getUserDrafts, getDraft, getDraftPicks, getUser, getUserLeagues, getLeagueUsers, getLeagueDrafts } from '../lib/sleeper.js';
+import { getUserDrafts, getDraft, getDraftPicks, getUser, getUserLeagues, getLeagueUsers, getLeagueDrafts, getLeague } from '../lib/sleeper.js';
 import { cfgFromSleeperDraft, formatKey } from '../lib/formatKey.js';
 import { q } from '../lib/db.js';
 import { log } from '../lib/log.js';
@@ -164,10 +164,19 @@ export async function harvestSleeperDrafts({ season = config.activeSeason, maxDr
 
   let drafted = 0, observations = 0;
   const byFormat = {};
+  const leagueCache = new Map(); // league_id -> league object (avoid refetching within a run)
   for (const draftId of todo) {
     const draft = await getDraft(draftId);
     if (!draft || draft.sport !== 'nfl') continue;
-    const cfg = cfgFromSleeperDraft(draft);
+    // Fetch the LEAGUE too — it's the only reliable source for dynasty vs redraft (league.settings.type)
+    // and for TE-premium / superflex roster settings. Without it every draft looks like redraft, which is
+    // why the pool was all-REDRAFT. Cached per run so we don't refetch a shared league.
+    let league = null;
+    if (draft.league_id) {
+      if (leagueCache.has(draft.league_id)) league = leagueCache.get(draft.league_id);
+      else { try { league = await getLeague(draft.league_id); } catch { league = null; } leagueCache.set(draft.league_id, league); }
+    }
+    const cfg = cfgFromSleeperDraft(draft, league);
     const fkey = formatKey(cfg);
     const picks = await getDraftPicks(draftId);
     if (!picks || picks.length === 0) continue;
