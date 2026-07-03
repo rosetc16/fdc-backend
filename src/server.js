@@ -20,6 +20,7 @@ import { paymentsRouter, stripeWebhookHandler } from './routes/payments.js';
 import { adminRouter } from './routes/admin.js';
 import { connectRouter } from './routes/connect.js';
 import { feedbackRouter } from './routes/feedback.js';
+import { trendsRouter } from './routes/trends.js';
 import { refreshAll } from './jobs/refreshAll.js';
 
 const app = express();
@@ -84,6 +85,7 @@ app.use('/api/payments', paymentsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/connect', connectRouter);
 app.use('/api/feedback', feedbackRouter);
+app.use('/api/trends', trendsRouter);
 
 // fallback 404 for unknown api routes
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
@@ -149,6 +151,22 @@ server = app.listen(config.port, () => {
         }
       } catch (e) { log.error(e, 'startup ADP catch-up failed'); }
     }, 8000);
+    // Startup catch-up for the DRAFT TRENDS pool: if no drafts have been harvested yet (fresh DB, or the
+    // trends feature just shipped), kick off a harvest a little after boot so the "How the field drafts"
+    // data self-populates automatically — no admin shell command required. Staggered after the ADP pull so
+    // the two don't hammer Sleeper at once. The daily 4 AM refresh keeps it growing from there.
+    setTimeout(async () => {
+      try {
+        const { q } = await import('./lib/db.js');
+        const r = await q(`SELECT count(*)::int n FROM harvested_drafts`).catch(() => ({ rows: [{ n: 0 }] }));
+        if (!r.rows[0] || r.rows[0].n === 0) {
+          log.info('startup: no harvested drafts found — running one-time draft harvest for Trends');
+          const { harvestSleeperDrafts } = await import('./jobs/harvestSleeperDrafts.js');
+          await harvestSleeperDrafts();
+          log.info('startup: draft harvest complete');
+        }
+      } catch (e) { log.error(e, 'startup harvest catch-up failed'); }
+    }, 20000);
   }
 
   // ALWAYS-ON RECOVERY (runs regardless of DISABLE_INPROCESS_CRON): if the players or projections tables
