@@ -133,12 +133,19 @@ function cfgFromLeague(league, draft) {
     QB: count('QB') || 1, RB: count('RB') || 2, WR: count('WR') || 2, TE: count('TE') || 1,
     FLEX: count('FLEX') || 1, SUPER: superflex ? 1 : 0, DST: count('DEF') || 0, K: count('K') || 0,
   };
+  // Draft TYPE: Sleeper marks a rookie draft with draft.type === 'rookie' (or metadata.scoring_type /
+  // the draft's own type field). A rookie draft uses a rookies-only pool, so it must be tagged 'rookie'
+  // and NOT mixed with startup dynasty/redraft ADP. Otherwise fall back to dynasty (league type 2) or redraft.
+  const draftType = ((draft && (draft.type || (draft.metadata && draft.metadata.type))) || '').toLowerCase();
+  const isRookie = draftType === 'rookie' || draftType.includes('rookie');
+  const leagueType = (league && league.settings && league.settings.type === 2) ? 'dynasty' : 'redraft';
   return {
     teams, rounds: (draft && draft.settings && draft.settings.rounds) || 15,
     sf: superflex, qbType: superflex ? 'SF' : qb >= 2 ? '2QB' : '1QB',
     scoringType: rec >= 1 ? 'ppr' : rec >= 0.5 ? 'half' : 'std',
     tePrem: tep, tePremMult: Math.round(tePremMult * 100) / 100,
-    type: (league && league.settings && league.settings.type === 2) ? 'dynasty' : 'redraft',
+    type: isRookie ? 'rookie' : leagueType,
+    scoring: { rec },
     start,
   };
 }
