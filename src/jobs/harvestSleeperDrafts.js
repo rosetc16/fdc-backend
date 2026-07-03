@@ -15,6 +15,28 @@ import { q } from '../lib/db.js';
 import { log } from '../lib/log.js';
 import { recordJob } from '../lib/jobs.js';
 
+// Idempotently create the tables the harvest depends on, so the job works even on a DB that hasn't had the
+// latest schema migration applied. Mirrors db/schema.sql exactly (IF NOT EXISTS — a no-op when they exist).
+async function ensureHarvestTables() {
+  await q(`CREATE TABLE IF NOT EXISTS discovered_users (
+    user_id      TEXT PRIMARY KEY,
+    display_name TEXT,
+    source       TEXT,
+    found_via    TEXT,
+    crawled_at   TIMESTAMPTZ,
+    drafts_found INT DEFAULT 0,
+    created_at   TIMESTAMPTZ DEFAULT now()
+  )`).catch((e) => log.error(e, 'ensure discovered_users'));
+  await q(`CREATE INDEX IF NOT EXISTS idx_discovered_uncrawled ON discovered_users (crawled_at NULLS FIRST, created_at)`).catch(() => {});
+  await q(`CREATE TABLE IF NOT EXISTS harvested_drafts (
+    draft_id     TEXT PRIMARY KEY,
+    format_key   TEXT,
+    season       INT,
+    pick_count   INT,
+    harvested_at TIMESTAMPTZ DEFAULT now()
+  )`).catch((e) => log.error(e, 'ensure harvested_drafts'));
+}
+
 // Seed usernames to bootstrap discovery before you have connected users. Replace/expand freely.
 const SEED_USERNAMES = (process.env.HARVEST_SEED_USERS || '').split(',').map((s) => s.trim()).filter(Boolean);
 // Breadth-first crawl of the Sleeper league graph. Each run pulls a batch of not-yet-crawled users
@@ -27,12 +49,23 @@ const MAX_SEED_USERS = Number(process.env.HARVEST_MAX_USERS || 600);      // cap
 
 // Seed the discovered_users table from connected accounts + env seed usernames (idempotent).
 async function seedFrontier(season) {
-  const { rows } = await q(
-    `SELECT DISTINCT connect->>'external_user_id' AS uid
-       FROM leagues WHERE connect->>'platform' = 'sleeper' AND connect ? 'external_user_id'`
-  );
-  const connected = rows.map((r) => r.uid).filter(Boolean);
-  for (const uid of connected) {
+  // Connected Sleeper accounts. These live on the USERS table (users.sleeper_user_id) once someone links
+  // their Sleeper account — that's the real seed for a fresh install. (We also check the older leagues.connect
+  // location for backward compatibility.) Without at least one connected user or an env seed, there's nothing
+  // to crawl and the harvest yields 0 — so this query matters.
+  const seedUids = new Set();
+  try {
+    const { rows } = await q(`SELECT DISTINCT sleeper_user_id AS uid FROM users WHERE sleeper_user_id IS NOT NULL AND sleeper_user_id <> ''`);
+    rows.forEach((r) => r.uid && seedUids.add(r.uid));
+  } catch (e) { log.error(e, 'seed from users.sleeper_user_id'); }
+  try {
+    const { rows } = await q(
+      `SELECT DISTINCT connect->>'external_user_id' AS uid
+         FROM leagues WHERE connect->>'platform' = 'sleeper' AND connect ? 'external_user_id'`
+    );
+    rows.forEach((r) => r.uid && seedUids.add(r.uid));
+  } catch { /* leagues.connect may not carry it — fine */ }
+  for (const uid of seedUids) {
     await q(
       `INSERT INTO discovered_users (user_id, source, found_via) VALUES ($1,'connected','connect')
        ON CONFLICT (user_id) DO NOTHING`, [uid]
@@ -50,6 +83,7 @@ async function seedFrontier(season) {
       }
     } catch { /* skip bad usernames */ }
   }
+  log.info({ seeds: seedUids.size, envSeeds: SEED_USERNAMES.length }, 'harvest frontier seeded');
 }
 
 // Pull the next frontier batch (never-crawled users first), expand each user's leagues into NEW
@@ -94,6 +128,10 @@ async function crawlFrontier(season, cap) {
 
 export async function harvestSleeperDrafts({ season = config.activeSeason, maxDrafts = config.harvest.batch } = {}) {
   const started = Date.now();
+  // 0) Ensure the tables this job depends on exist. Normally `npm run migrate` creates them, but if a deploy
+  //    added a table to the schema without a migrate run, the job would crash with "relation does not exist".
+  //    Creating them defensively here (IF NOT EXISTS) makes the harvest self-healing — no shell command needed.
+  await ensureHarvestTables();
   // 1) make sure connected + seed users are on the frontier, then 2) crawl a fresh batch.
   await seedFrontier(season);
   const userIds = await crawlFrontier(season, MAX_SEED_USERS);

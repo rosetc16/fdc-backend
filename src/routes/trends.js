@@ -22,11 +22,11 @@ const HARVEST_SOURCE = 'sleeper_harvest';
 async function pickFormat(season, format, minDrafts) {
   let best = null;
   for (const fkey of formatFallbacks(format)) {
-    const r = await q(
-      `SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key=$2`,
-      [season, fkey]
-    );
-    const n = r.rows[0]?.n || 0;
+    let n = 0;
+    try {
+      const r = await q(`SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key=$2`, [season, fkey]);
+      n = r.rows[0]?.n || 0;
+    } catch { n = 0; } // table not migrated yet — treat as empty
     if (best == null || n > best.draftCount) best = { fkey, draftCount: n };
     if (n >= minDrafts) return { fkey, draftCount: n, thin: false, exact: fkey === format };
   }
@@ -122,18 +122,20 @@ trendsRouter.get('/player/:playerId', async (req, res) => {
 trendsRouter.get('/diag', async (req, res) => {
   const season = Number(req.query.season || config.activeSeason);
   try {
-    const totalDrafts = (await q(`SELECT count(*)::int n FROM harvested_drafts WHERE season=$1`, [season])).rows[0];
-    const byFormat = (await q(
+    // Resilient to a not-yet-migrated DB: if a table is missing, report 0 rather than 500ing.
+    const safe = async (sql, params, fallback) => { try { return (await q(sql, params)).rows; } catch { return fallback; } };
+    const totalDrafts = (await safe(`SELECT count(*)::int n FROM harvested_drafts WHERE season=$1`, [season], [{ n: 0 }]))[0];
+    const byFormat = await safe(
       `SELECT format_key, count(*)::int drafts, sum(pick_count)::int picks
          FROM harvested_drafts WHERE season=$1 GROUP BY format_key ORDER BY drafts DESC LIMIT 30`,
-      [season]
-    )).rows;
-    const obs = (await q(
+      [season], []
+    );
+    const obs = (await safe(
       `SELECT count(*)::int n, count(DISTINCT player_id)::int players, count(DISTINCT format_key)::int formats
          FROM adp_observations WHERE season=$1 AND source=$2`,
-      [season, HARVEST_SOURCE]
-    )).rows[0];
-    const lastHarvest = (await q(`SELECT max(harvested_at) t FROM harvested_drafts WHERE season=$1`, [season])).rows[0];
+      [season, HARVEST_SOURCE], [{ n: 0, players: 0, formats: 0 }]
+    ))[0];
+    const lastHarvest = (await safe(`SELECT max(harvested_at) t FROM harvested_drafts WHERE season=$1`, [season], [{ t: null }]))[0];
     res.json({
       season,
       harvestedDrafts: totalDrafts?.n || 0,
