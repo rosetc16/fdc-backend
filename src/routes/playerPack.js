@@ -37,6 +37,7 @@ function mapStats(s) {
 playerPackRouter.get('/', async (req, res) => {
   const season = Number(req.query.season || config.activeSeason);
   const format = String(req.query.format || 'PPR|1QB|STD|REDRAFT|12');
+  const isRookieFormat = format.split('|')[3] === 'ROOKIE'; // rookie-only draft: format-specific harvested ADP wins
 
   // ---- ADP: published Sleeper ADP is the PRIMARY source ------------------------------------------
   // This early in the year, harvested-draft ADP is thin and rookie-contaminated, so it badly distorts the
@@ -45,11 +46,17 @@ playerPackRouter.get('/', async (req, res) => {
   // only fall back to harvested consensus where no published number exists for the format.
   //
   // Published ADP is stored as observations keyed by format. We resolve the best matching format with a
-  // fallback chain that also degrades SF->1QB and ROOKIE/KEEPER->DYNASTY (so an SF-rookie league still
-  // finds the closest real market number instead of falling through to junk).
+  // fallback chain that also degrades SF->1QB and KEEPER->DYNASTY (so an SF league still finds the closest
+  // real market number instead of falling through to junk).
+  //
+  // ROOKIE is deliberately NOT degraded to DYNASTY/REDRAFT: a rookie draft's pool is ONLY incoming rookies,
+  // and their draft position must come from actual rookie drafts. Degrading to a dynasty/redraft pool would
+  // price a rookie among veterans (e.g. a rookie QB inherits his dynasty-STARTUP ADP of ~2 overall), which
+  // is exactly wrong for a rookie-only draft. So ROOKIE stays within ROOKIE format variants only; a rookie
+  // with no rookie-ADP yet gets no published number and the engine ranks him by rookie value instead.
   const pubFallbacks = (key) => {
     const [scoring, qb, te, pool, teams] = key.split('|');
-    const pools = pool === 'ROOKIE' || pool === 'KEEPER' ? [pool, 'DYNASTY', 'REDRAFT'] : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
+    const pools = pool === 'ROOKIE' ? ['ROOKIE'] : pool === 'KEEPER' ? [pool, 'DYNASTY'] : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
     const qbs = qb === 'SF' ? ['SF', '1QB'] : ['1QB'];
     const scorings = [scoring, 'PPR'];
     const out = [];
@@ -172,7 +179,13 @@ playerPackRouter.get('/', async (req, res) => {
     // what makes the app's ADP match Sleeper — e.g. Tua/Chris Brazzell show their real Sleeper ADP.
     const pubPick = publishedAdp.get(pl.player_id);
     let adpVal = null, adpLo = null, adpHi = null, trend = null, sampleN = 0;
-    if (pubPick != null && pubPick > 0) {
+    // ROOKIE drafts: prefer the FORMAT-SPECIFIC harvested consensus (real 1QB/SF/TEP rookie drafts on Sleeper)
+    // over the single generic published rookie field — the harvested number reflects the actual format (e.g.
+    // SF rookie drafts push rookie QBs up; the lone published rookie ADP is 1QB-flavored and can't). Only when
+    // there's no healthy harvested sample do we fall back to the published rookie number.
+    if (isRookieFormat && adp) {
+      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n;
+    } else if (pubPick != null && pubPick > 0) {
       adpVal = pubPick; sampleN = 999; // published = high confidence
       if (adp) { adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); }
     } else if (adp) {
