@@ -175,6 +175,39 @@ trendsRouter.get('/diag', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/trends/probe?format=PPR|1QB|STD|ROOKIE|12&season=2026 — debugging aid. Shows exactly how a
+// requested format resolves: the chosen format, the pool pattern, how many drafts/players/observations
+// match, and a few sample players. Open in a browser to see WHY a format is or isn't returning data.
+trendsRouter.get('/probe', async (req, res) => {
+  const season = Number(req.query.season || config.activeSeason);
+  const format = String(req.query.format || 'PPR|1QB|STD|ROOKIE|12');
+  const minDrafts = Math.max(1, Number(req.query.minDrafts || 5));
+  try {
+    const chosen = await pickFormat(season, format, minDrafts);
+    const [, qbC, , poolC] = chosen.fkey.split('|');
+    const poolPattern = `%|${qbC}|%|${poolC}|%`;
+    const safe = async (sql, params, fb) => { try { return (await q(sql, params)).rows; } catch (e) { return fb; } };
+    const draftsExact = (await safe(`SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key=$2`, [season, chosen.fkey], [{ n: 0 }]))[0];
+    const draftsPool = (await safe(`SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key LIKE $2`, [season, poolPattern], [{ n: 0 }]))[0];
+    const obsPool = (await safe(`SELECT count(*)::int n, count(DISTINCT player_id)::int players FROM adp_observations WHERE season=$1 AND source=$2 AND format_key LIKE $3`, [season, HARVEST_SOURCE, poolPattern], [{ n: 0, players: 0 }]))[0];
+    const allKeys = await safe(`SELECT DISTINCT format_key FROM adp_observations WHERE season=$1 AND source=$2 ORDER BY format_key`, [season, HARVEST_SOURCE], []);
+    const sample = await safe(
+      `SELECT p.full_name, p.position, count(*)::int n, round(avg(o.pick)::numeric,1) avg_pick
+         FROM adp_observations o JOIN players p ON p.player_id=o.player_id
+        WHERE o.season=$1 AND o.source=$2 AND o.format_key LIKE $3
+        GROUP BY p.full_name, p.position ORDER BY avg(o.pick) ASC LIMIT 8`,
+      [season, HARVEST_SOURCE, poolPattern], []
+    );
+    res.json({
+      requestedFormat: format, chosenFormat: chosen.fkey, poolPattern,
+      draftsAtExactFormat: draftsExact.n, draftsInPool: draftsPool.n,
+      observationsInPool: obsPool.n, playersInPool: obsPool.players,
+      distinctHarvestKeys: allKeys.map((r) => r.format_key),
+      samplePlayers: sample,
+    });
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
 // Shape a raw aggregate row into the API's player object. `poolDrafts` = number of drafts in this format,
 // used to compute how often he's drafted (drafted-in rate) — a proxy for how universally rostered he is.
 function shapePlayer(r, poolDrafts) {

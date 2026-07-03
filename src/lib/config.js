@@ -36,7 +36,7 @@ export const config = {
 
   harvest: {
     maxCallsPerMin: Number(process.env.SLEEPER_MAX_CALLS_PER_MIN || 800),
-    batch: Number(process.env.HARVEST_BATCH || 200),
+    batch: Number(process.env.HARVEST_BATCH || 500),
   },
 };
 
