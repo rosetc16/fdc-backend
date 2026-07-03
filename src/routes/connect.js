@@ -105,6 +105,7 @@ connectRouter.get('/sleeper/my-leagues', async (req, res) => {
         league_id: lg.league_id, name: lg.name, total_rosters: lg.total_rosters,
         season: lg.season, draft_id: draftId, draft_status: draftStatus,
         round, total_rounds: totalRounds, made_picks: madePicks,
+        best_ball: !!(lg.settings && lg.settings.best_ball === 1),
       });
     }
     res.json({ sleeperUserId: sid, leagues: out });
@@ -135,16 +136,20 @@ function cfgFromLeague(league, draft) {
   };
   // Draft TYPE: Sleeper marks a rookie draft with draft.type === 'rookie' (or metadata.scoring_type /
   // the draft's own type field). A rookie draft uses a rookies-only pool, so it must be tagged 'rookie'
-  // and NOT mixed with startup dynasty/redraft ADP. Otherwise fall back to dynasty (league type 2) or redraft.
+  // and NOT mixed with startup dynasty/redraft ADP. Best ball is its own draft profile (ceiling + depth,
+  // no in-season management) and takes precedence when the league is flagged best_ball. Otherwise fall back
+  // to dynasty (league type 2) or redraft.
   const draftType = ((draft && (draft.type || (draft.metadata && draft.metadata.type))) || '').toLowerCase();
   const isRookie = draftType === 'rookie' || draftType.includes('rookie');
+  const isBestBall = !!(league && league.settings && league.settings.best_ball === 1);
   const leagueType = (league && league.settings && league.settings.type === 2) ? 'dynasty' : 'redraft';
   return {
     teams, rounds: (draft && draft.settings && draft.settings.rounds) || 15,
     sf: superflex, qbType: superflex ? 'SF' : qb >= 2 ? '2QB' : '1QB',
     scoringType: rec >= 1 ? 'ppr' : rec >= 0.5 ? 'half' : 'std',
     tePrem: tep, tePremMult: Math.round(tePremMult * 100) / 100,
-    type: isRookie ? 'rookie' : leagueType,
+    type: isRookie ? 'rookie' : isBestBall ? 'bestball' : leagueType,
+    bestBall: isBestBall,
     scoring: { rec },
     start,
   };
