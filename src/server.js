@@ -137,6 +137,13 @@ server = app.listen(config.port, () => {
       try { const { refreshAdpOnly } = await import('./jobs/refreshAdpOnly.js'); log.info('cron: midday ADP refresh'); await refreshAdpOnly(); }
       catch (e) { log.error(e, 'cron midday ADP failed'); }
     });
+    // Draft-trends pool growth: harvest a fresh batch several times a day (in addition to the 4 AM full
+    // refresh) so the "How the field drafts" pool broadens across the league graph steadily rather than
+    // once a night. Each pass crawls the next slice of not-yet-visited users.
+    cron.schedule('30 */4 * * *', async () => {
+      try { const { harvestSleeperDrafts } = await import('./jobs/harvestSleeperDrafts.js'); log.info('cron: periodic harvest pass'); const r = await harvestSleeperDrafts(); log.info(r, 'cron: harvest pass done'); }
+      catch (e) { log.error(e, 'cron periodic harvest failed'); }
+    });
     log.info('in-process daily + midday cron scheduled');
     // Startup catch-up: ensure published ADP exists shortly after boot (non-blocking).
     setTimeout(async () => {

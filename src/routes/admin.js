@@ -25,16 +25,21 @@ adminRouter.post('/run-job', async (req, res) => {
       const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
       detail = await harvestSleeperDrafts();
     } else if (job === 'rebuild-trends') {
-      // Purge the harvested-drafts pool and reset the crawl frontier, then re-harvest. The re-harvest can
-      // take several minutes (rate-limited Sleeper calls across the league graph), so we kick it off in the
-      // BACKGROUND and return immediately — otherwise the HTTP request would time out. Watch progress via
-      // the pool stats (Refresh stats) which update as drafts land.
+      // Purge the harvested pool + reset the crawl frontier, then re-harvest. We run it SYNCHRONOUSLY with a
+      // bounded batch that fits inside the HTTP timeout — a background promise on a web dyno is unreliable
+      // (the instance can recycle and kill it mid-run, which is how a rebuild ended up with only 8 drafts).
+      // The nightly cron continues growing the pool from here.
       await q(`DELETE FROM adp_observations WHERE source='sleeper_harvest'`);
       await q(`DELETE FROM harvested_drafts`);
       await q(`UPDATE discovered_users SET crawled_at = NULL`).catch(() => {});
       const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
-      harvestSleeperDrafts().then((r) => log.info(r, 'rebuild-trends harvest complete')).catch((e) => log.error(e, 'rebuild-trends harvest failed'));
-      detail = { purged: true, crawlReset: true, started: true, note: 'Rebuild started in the background — re-harvesting the full league graph. Hit "Refresh stats" in a minute or two to watch the pool fill.' };
+      const r = await harvestSleeperDrafts({ maxDrafts: 120 }); // bounded so it finishes within the request
+      detail = { purged: true, crawlReset: true, ...r };
+    } else if (job === 'harvest-more') {
+      // Run another bounded harvest pass WITHOUT purging — accumulates more drafts onto the existing pool.
+      // Click this repeatedly to grow the pool in safe increments.
+      const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
+      detail = await harvestSleeperDrafts({ maxDrafts: 120 });
     } else {
       const { refreshAdpOnly } = await import('../jobs/refreshAdpOnly.js');
       detail = await refreshAdpOnly();

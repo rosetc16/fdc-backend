@@ -144,12 +144,25 @@ export async function harvestSleeperDrafts({ season = config.activeSeason, maxDr
   const seedCount = userIds.length;
 
   // collect candidate draft ids from each user — both their personal drafts AND their leagues'
-  // drafts (league drafts catch redraft/keeper drafts that user-drafts sometimes miss).
+  // drafts (league drafts catch redraft/keeper/rookie drafts that user-drafts sometimes miss). This is
+  // the difference between a handful of drafts and a rich pool: most completed drafts live on the LEAGUE.
   const candidateDraftIds = new Set();
   for (const uid of userIds) {
     try {
       const drafts = await getUserDrafts(uid, season);
       (drafts || []).forEach((d) => { if (d.draft_id && d.status === 'complete') candidateDraftIds.add(d.draft_id); });
+    } catch { /* skip */ }
+    // also pull each of the user's leagues' drafts (a league can have multiple: startup + rookie drafts)
+    try {
+      const leagues = (await getUserLeagues(uid, season)) || [];
+      for (const lg of leagues) {
+        if (!lg.league_id) continue;
+        try {
+          const ld = (await getLeagueDrafts(lg.league_id)) || [];
+          ld.forEach((d) => { if (d.draft_id && d.status === 'complete') candidateDraftIds.add(d.draft_id); });
+        } catch { /* skip this league */ }
+        if (candidateDraftIds.size >= maxDrafts) break;
+      }
     } catch { /* skip */ }
     if (candidateDraftIds.size >= maxDrafts) break;
   }
