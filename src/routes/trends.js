@@ -21,9 +21,10 @@ const HARVEST_SOURCE = 'sleeper_harvest';
 // one we saw (so we always return *something*, flagged as thin).
 async function pickFormat(season, format, minDrafts) {
   let best = null;
-  // Trends-specific fallback: KEEP the pool (REDRAFT/DYNASTY/ROOKIE/BESTBALL) fixed — never mix rookie
-  // picks into redraft, etc. — but relax scoring, TE-premium, and team-size aggressively so a thin exact
-  // format still finds its nearest neighbor within the same pool.
+  // Trends-specific fallback: KEEP the pool (REDRAFT/DYNASTY/ROOKIE/BESTBALL) AND the QB type (1QB vs SF)
+  // fixed — never cross either. QB type is the one axis we must never relax: superflex drafts take QBs far
+  // earlier, so blending SF drafts into a 1QB view produces plainly wrong ADP (QBs at 1.01/1.02). We only
+  // relax scoring, TE-premium, and team-size, which don't reshape the draft the way QB count does.
   const [scoring, qb, te, pool, teams] = format.split('|');
   const cands = [];
   for (const sc of [scoring, 'PPR', 'HALF', 'STD']) {
@@ -32,10 +33,6 @@ async function pickFormat(season, format, minDrafts) {
         cands.push([sc, qb, t, pool, tm].join('|'));
       }
     }
-  }
-  // also allow a QB relax (SF<->1QB) only as a last resort, still within the same pool
-  for (const qx of [qb, qb === 'SF' ? '1QB' : 'SF']) {
-    cands.push(['PPR', qx, 'STD', pool, '12'].join('|'));
   }
   const ordered = [...new Set(cands)];
   for (const fkey of ordered) {
