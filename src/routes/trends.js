@@ -75,10 +75,6 @@ trendsRouter.get('/board', async (req, res) => {
     // (rookie never blends with redraft). Keys are SCORING|QB|TE|POOL|TEAMS.
     const [, qbC, , poolC] = chosen.fkey.split('|');
     const poolPattern = `%|${qbC}|%|${poolC}|%`;
-    const draftCountPool = (await q(
-      `SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key LIKE $2`,
-      [season, poolPattern]
-    ).catch(() => ({ rows: [{ n: chosen.draftCount }] }))).rows[0]?.n || chosen.draftCount;
     const { rows } = await q(
       `SELECT o.player_id,
               p.full_name, p.position, p.team, p.bye_week,
@@ -92,12 +88,23 @@ trendsRouter.get('/board', async (req, res) => {
          FROM adp_observations o
          JOIN players p ON p.player_id = o.player_id
         WHERE o.season = $1 AND o.source = $2 AND o.format_key LIKE $3
+          AND p.position IN ('QB','RB','WR','TE','K','DEF','DST')
         GROUP BY o.player_id, p.full_name, p.position, p.team, p.bye_week
        HAVING count(*) >= $4
         ORDER BY avg(o.pick) ASC
         LIMIT $5`,
       [season, HARVEST_SOURCE, poolPattern, minPicks, limit]
     );
+    // Effective pool size for the "drafted %" denominator. The harvested_drafts count can drift from the
+    // observation count (re-tagging, partial writes), which produced impossible >100% rates. The most-drafted
+    // player is taken in ~every draft, so his appearance count is the truest floor for the pool size — use
+    // the max of that and the harvested_drafts count, and the per-player rate is capped at 100% regardless.
+    const draftsRow = (await q(
+      `SELECT count(*)::int n FROM harvested_drafts WHERE season=$1 AND format_key LIKE $2`,
+      [season, poolPattern]
+    ).catch(() => ({ rows: [{ n: 0 }] }))).rows[0]?.n || 0;
+    const maxAppear = rows.reduce((m, r) => Math.max(m, r.n), 0);
+    const draftCountPool = Math.max(draftsRow, maxAppear, chosen.draftCount);
     const players = rows.map((r) => shapePlayer(r, draftCountPool));
     res.json({
       format, usedFormat: chosen.fkey, fallback: chosen.fkey !== format, thin: chosen.thin,
@@ -198,10 +205,22 @@ trendsRouter.get('/probe', async (req, res) => {
         GROUP BY p.full_name, p.position ORDER BY avg(o.pick) ASC LIMIT 8`,
       [season, HARVEST_SOURCE, poolPattern], []
     );
+    // How many observations match the pattern BEFORE the players-join (to detect unjoined rookie ids), and
+    // the position breakdown of what does join.
+    const obsRaw = (await safe(`SELECT count(*)::int n FROM adp_observations WHERE season=$1 AND source=$2 AND format_key LIKE $3`, [season, HARVEST_SOURCE, poolPattern], [{ n: 0 }]))[0];
+    const posBreak = await safe(
+      `SELECT coalesce(p.position,'(unjoined)') pos, count(*)::int n
+         FROM adp_observations o LEFT JOIN players p ON p.player_id=o.player_id
+        WHERE o.season=$1 AND o.source=$2 AND o.format_key LIKE $3
+        GROUP BY p.position ORDER BY n DESC`,
+      [season, HARVEST_SOURCE, poolPattern], []
+    );
     res.json({
       requestedFormat: format, chosenFormat: chosen.fkey, poolPattern,
       draftsAtExactFormat: draftsExact.n, draftsInPool: draftsPool.n,
       observationsInPool: obsPool.n, playersInPool: obsPool.players,
+      rawObservationsMatchingPattern: obsRaw.n,
+      positionBreakdown: posBreak,
       distinctHarvestKeys: allKeys.map((r) => r.format_key),
       samplePlayers: sample,
     });
@@ -223,7 +242,7 @@ function shapePlayer(r, poolDrafts) {
     team: r.team,
     bye: r.bye_week,
     n,                                        // number of drafts he appears in
-    draftedRate: poolDrafts ? Math.round((n / poolDrafts) * 100) : null, // % of drafts he was taken in
+    draftedRate: poolDrafts ? Math.min(100, Math.round((n / poolDrafts) * 100)) : null, // % of drafts he was taken in (capped)
     avg: Number(r.avg_pick),
     median: Number(r.median_pick),
     min: Number(r.min_pick),
