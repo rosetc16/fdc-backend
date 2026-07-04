@@ -110,9 +110,16 @@ export function cfgFromSleeperDraft(draft, league = null) {
 export function formatFallbacks(key) {
   const [scoring, qb, te, pool, teams] = key.split('|');
   const out = [key];
-  if (te === 'TEP') out.push([scoring, qb, 'STD', pool, teams].join('|'));
-  out.push([scoring, qb, te, pool, '12'].join('|'));
-  out.push([scoring, qb, 'STD', pool, '12'].join('|'));
+  // Try to PRESERVE the two settings that most change ADP — TE premium and superflex — before relaxing them.
+  // Order: keep te+qb, vary team count; then vary scoring (HALF<->PPR are close, both far from STD); only
+  // AFTER exhausting those do we drop TE premium. This keeps a TEP league on TEP data whenever any exists.
+  const scoringAlts = scoring === 'HALF' ? ['HALF', 'PPR'] : scoring === 'PPR' ? ['PPR', 'HALF'] : ['STD', 'HALF', 'PPR'];
+  const teamAlts = [teams, '12', '8-10', '14+'];
+  // 1) same te, same qb — vary scoring then team count
+  for (const sc of scoringAlts) for (const tm of teamAlts) out.push([sc, qb, te, pool, tm].join('|'));
+  // 2) drop TE premium (te -> STD), same qb — vary scoring then team count
+  if (te === 'TEP') for (const sc of scoringAlts) for (const tm of teamAlts) out.push([sc, qb, 'STD', pool, tm].join('|'));
+  // 3) last resort broad default
   out.push(['PPR', qb, 'STD', pool, '12'].join('|'));
   return [...new Set(out)];
 }

@@ -58,9 +58,14 @@ playerPackRouter.get('/', async (req, res) => {
     const [scoring, qb, te, pool, teams] = key.split('|');
     const pools = pool === 'ROOKIE' ? ['ROOKIE'] : pool === 'KEEPER' ? [pool, 'DYNASTY'] : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
     const qbs = qb === 'SF' ? ['SF', '1QB'] : ['1QB'];
-    const scorings = [scoring, 'PPR'];
+    // HALF and PPR are close; both are far from STD. Try the league's own scoring first, then its neighbor,
+    // before STD. Crucially we EXHAUST TE-premium-preserving variants (all scorings, all team counts) BEFORE
+    // dropping TEP->STD, because TE premium materially changes TE ADP — a TEP league should stay on TEP data.
+    const scorings = scoring === 'HALF' ? ['HALF', 'PPR', 'STD'] : scoring === 'PPR' ? ['PPR', 'HALF', 'STD'] : ['STD', 'HALF', 'PPR'];
+    const teamAlts = [teams, '12', '8-10', '14+'];
+    const teVariants = te === 'TEP' ? ['TEP', 'STD'] : ['STD'];
     const out = [];
-    for (const pl of pools) for (const qx of qbs) for (const sc of scorings) for (const tx of [te, 'STD']) for (const tm of [teams, '12'])
+    for (const pl of pools) for (const tx of teVariants) for (const qx of qbs) for (const sc of scorings) for (const tm of teamAlts)
       out.push([sc, qx, tx, pl, tm].join('|'));
     return [...new Set(out)];
   };
