@@ -130,6 +130,38 @@ function cfgFromLeague(league, draft) {
   const teBonus = Number(scoring.bonus_rec_te || 0);
   const tePremMult = teBonus > 0 ? teBonus : (scoring.rec_te && scoring.rec_te > rec ? Number(scoring.rec_te) - rec : 0);
   const tep = tePremMult > 0;
+  // Build the FULL scoring map from Sleeper, not just `rec`. Sleeper stores per-stat point values in
+  // scoring_settings with keys like pass_td, pass_yd, pass_int, rush_td, rush_yd, rec, rec_yd, rec_td,
+  // fum_lost, bonus_rec_te, etc. Our engine's scoreFromStats expects a different vocabulary (passTD, passYd,
+  // INT, rushTD, …), so we translate. CRUCIAL: Sleeper's default passing TD is 6 pts (many leagues use 4),
+  // and if we don't read it the app scores QBs with our 4-pt default and understates them by ~40-50 pts.
+  // Only include a field when Sleeper actually specifies it, so unspecified fields fall to our defaults.
+  const num = (k) => (scoring[k] != null && !Number.isNaN(Number(scoring[k])) ? Number(scoring[k]) : undefined);
+  const fullScoring = { rec };
+  const setIf = (dest, val) => { if (val !== undefined) fullScoring[dest] = val; };
+  setIf('passYd', num('pass_yd'));
+  setIf('passTD', num('pass_td'));
+  setIf('INT', num('pass_int'));
+  setIf('pass2pt', num('pass_2pt'));
+  setIf('rushYd', num('rush_yd'));
+  setIf('rushTD', num('rush_td'));
+  setIf('rushAtt', num('rush_att'));
+  setIf('rush2pt', num('rush_2pt'));
+  setIf('recYd', num('rec_yd'));
+  setIf('recTD', num('rec_td'));
+  setIf('rec2pt', num('rec_2pt'));
+  // TE-premium: Sleeper's rec_te is the TOTAL per-reception for TEs (base + bonus). bonus_rec_te is the
+  // extra on top. Our recTE field is the TOTAL, so prefer rec_te; else base rec + bonus.
+  const recTeTotal = num('rec_te');
+  setIf('recTE', recTeTotal != null ? recTeTotal : (rec + (num('bonus_rec_te') || 0)));
+  // fumbles: Sleeper's fum_lost is the common one (lost fumbles); fall back to fum.
+  setIf('fum', num('fum_lost') != null ? num('fum_lost') : num('fum'));
+  // common yardage bonuses
+  setIf('bonus300pass', num('bonus_pass_yd_300'));
+  // kicker
+  setIf('fg', num('fgm')); setIf('pat', num('xpm')); setIf('fgMiss', num('fgmiss'));
+  // DST
+  setIf('sack', num('sack')); setIf('dint', num('int')); setIf('dfr', num('fum_rec')); setIf('dtd', num('def_td'));
   const start = {
     QB: count('QB') || 1, RB: count('RB') || 2, WR: count('WR') || 2, TE: count('TE') || 1,
     FLEX: count('FLEX') || 1, SUPER: superflex ? 1 : 0, DST: count('DEF') || 0, K: count('K') || 0,
@@ -150,7 +182,7 @@ function cfgFromLeague(league, draft) {
     tePrem: tep, tePremMult: Math.round(tePremMult * 100) / 100,
     type: isRookie ? 'rookie' : isBestBall ? 'bestball' : leagueType,
     bestBall: isBestBall,
-    scoring: { rec },
+    scoring: fullScoring,
     start,
   };
 }
