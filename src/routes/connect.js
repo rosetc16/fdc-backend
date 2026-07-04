@@ -539,3 +539,50 @@ function rosterToSlot(slotToRoster, rosterId) {
   const slot = Object.keys(slotToRoster).find((s) => slotToRoster[s] === rosterId);
   return slot ? Number(slot) : null;
 }
+
+// FAST live-sync endpoint. During an active draft the only things that change pick-to-pick are the PICKS and
+// the CLOCK — team names, rosters, traded picks, and keepers are stable. The full /draft endpoint refetches
+// all of those every poll (6 Sleeper round-trips), which is why live sync lagged ~10-15s behind Sleeper.
+// This endpoint fetches only the draft meta + picks (players list is cached in-process), so it returns in a
+// fraction of the time and can be polled aggressively. The client uses /draft once on entry for the heavy
+// context, then polls THIS for near-instant pick updates.
+//   GET /api/connect/sleeper/picks?league_id=...&draft_id=...(optional)
+connectRouter.get('/sleeper/picks', async (req, res) => {
+  const leagueId = String(req.query.league_id || '').trim();
+  let draftId = String(req.query.draft_id || '').trim();
+  if (!leagueId && !draftId) return res.status(400).json({ error: 'league_id or draft_id required' });
+  try {
+    // Resolve the draft id if the client didn't pass it (first call). Subsequent calls pass draft_id to skip
+    // the league→drafts lookup entirely — the fastest possible path.
+    if (!draftId) {
+      const drafts = (await getLeagueDrafts(leagueId)) || [];
+      if (!drafts[0]) return res.json({ status: 'no_draft', picks: [] });
+      draftId = drafts[0].draft_id;
+    }
+    const [draft, picksRaw, players] = await Promise.all([
+      getDraft(draftId),
+      getDraftPicks(draftId),
+      getAllPlayers(), // cached in-process for a day; effectively free
+    ]);
+    const picks = (picksRaw || [])
+      .filter((pk) => pk.player_id && pk.pick_no)
+      .sort((a, b) => a.pick_no - b.pick_no)
+      .map((pk) => {
+        const p = players[pk.player_id] || {};
+        const name = p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || (p.position === 'DEF' ? `${pk.player_id} DST` : pk.player_id);
+        return { pick_no: pk.pick_no, round: pk.round, draft_slot: pk.draft_slot, player_id: pk.player_id, name, pos: p.position || null, team: p.team || null, picked_by: pk.picked_by || null };
+      });
+    const pickTimerSec = draft && draft.settings ? Number(draft.settings.pick_timer || 0) : 0;
+    const lastPickedMs = draft ? Number(draft.last_picked || draft.start_time || 0) : 0;
+    let pickDeadlineMs = null;
+    if ((draft?.status === 'drafting') && pickTimerSec > 0 && lastPickedMs > 0) pickDeadlineMs = lastPickedMs + pickTimerSec * 1000;
+    res.json({
+      draft_id: draftId,
+      status: draft?.status || 'unknown',
+      picks,
+      pickTimerSec, lastPickedMs, pickDeadlineMs, serverNowMs: Date.now(),
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
