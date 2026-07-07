@@ -162,6 +162,15 @@ function cfgFromLeague(league, draft) {
   setIf('fg', num('fgm')); setIf('pat', num('xpm')); setIf('fgMiss', num('fgmiss'));
   // DST
   setIf('sack', num('sack')); setIf('dint', num('int')); setIf('dfr', num('fum_rec')); setIf('dtd', num('def_td'));
+  // Positional MAXIMUMS: some Sleeper leagues cap how many of a position you can roster. Sleeper stores these
+  // (when set) as `position_limit_QB`, `position_limit_RB`, etc. in league.settings. Pass any that exist through
+  // as caps so the engine never recommends a player past a position you've maxed out.
+  const ls = (league && league.settings) || {};
+  const caps = {};
+  ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'].forEach((pos) => {
+    const v = ls['position_limit_' + pos];
+    if (v != null && v !== '' && Number(v) > 0) caps[pos === 'DEF' ? 'DST' : pos] = Number(v);
+  });
   const start = {
     QB: count('QB') || 1, RB: count('RB') || 2, WR: count('WR') || 2, TE: count('TE') || 1,
     FLEX: count('FLEX') || 1, SUPER: superflex ? 1 : 0, DST: count('DEF') || 0, K: count('K') || 0,
@@ -184,6 +193,7 @@ function cfgFromLeague(league, draft) {
     bestBall: isBestBall,
     scoring: fullScoring,
     start,
+    caps: Object.keys(caps).length ? caps : undefined,
   };
 }
 
