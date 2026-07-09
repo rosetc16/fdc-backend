@@ -194,7 +194,7 @@ playerPackRouter.get('/', async (req, res) => {
     const MIN_HARVEST_BEATS_PUB = 6;
     const harvestIsStrong = adp && Number(adp.sample_n) >= MIN_HARVEST_BEATS_PUB;
 
-    let adpVal = null, adpLo = null, adpHi = null, trend = null, sampleN = 0, adpSrc = null;
+    let adpVal = null, adpLo = null, adpHi = null, trend = null, sampleN = 0, adpSrc = null, adpDegraded = false;
     // SOURCE PRIORITY.
     //
     // Historically published ADP won outright, on the reasoning that harvested drafts were "thin and
@@ -213,7 +213,16 @@ playerPackRouter.get('/', async (req, res) => {
       // real drafts in THIS format beat a generic/degraded published number
       adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n; adpSrc = 'harvest';
     } else if (pubPick != null && pubPick > 0) {
-      adpVal = pubPick; sampleN = 999; adpSrc = 'published'; // published = high confidence
+      adpVal = pubPick;
+      adpSrc = 'published';
+      // CONFIDENCE depends on whether this number is actually FOR this format. The fallback chain will answer
+      // a superflex request with a 1QB number when the exact format has no entry for that player — correct as
+      // a last resort, but it is NOT the market for this league (a QB the SF market drafts ~13th shows up
+      // around 40 on a 1QB board). Marking that 999 ("absolute confidence") makes the board trust a number it
+      // should be treating as a rough stand-in, and there is no way for the client to tell the difference.
+      // Exact-format published stays high-confidence; a degraded number is flagged as provisional.
+      sampleN = pubIsExactFormat ? 999 : 1;
+      adpDegraded = !pubIsExactFormat;
       if (adp) { adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); }
     } else if (adp) {
       adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n; adpSrc = 'harvest';
@@ -228,6 +237,7 @@ playerPackRouter.get('/', async (req, res) => {
       adp: adpVal,
       adpLo, adpHi, trend, sampleN,
       adpSrc,                                    // 'published' | 'harvest' | null — which market supplied the number
+      adpDegraded,                               // true = this number came from a DIFFERENT format than requested
       pubFmt: pubPick != null ? (publishedFmtById.get(pl.player_id) || null) : null, // which format gave this ADP
       inj: pl.injury_status || null,
       rookie: pl.years_exp != null && pl.years_exp === 0,
