@@ -183,18 +183,40 @@ playerPackRouter.get('/', async (req, res) => {
     // for this player do we fall back to harvested consensus (and only with a healthy sample). This is
     // what makes the app's ADP match Sleeper — e.g. Tua/Chris Brazzell show their real Sleeper ADP.
     const pubPick = publishedAdp.get(pl.player_id);
-    let adpVal = null, adpLo = null, adpHi = null, trend = null, sampleN = 0;
-    // ROOKIE drafts: prefer the FORMAT-SPECIFIC harvested consensus (real 1QB/SF/TEP rookie drafts on Sleeper)
-    // over the single generic published rookie field — the harvested number reflects the actual format (e.g.
-    // SF rookie drafts push rookie QBs up; the lone published rookie ADP is 1QB-flavored and can't). Only when
-    // there's no healthy harvested sample do we fall back to the published rookie number.
+    const pubFmtForPlayer = pubPick != null ? (publishedFmtById.get(pl.player_id) || null) : null;
+    // Did the published number actually come from the format we asked for, or from a DEGRADED fallback?
+    // The fallback chain will happily answer an SF request with a 1QB number, or a TE-premium request with a
+    // standard-TE number. Those are the wrong market for this league.
+    const pubIsExactFormat = pubFmtForPlayer === format;
+    // A format-correct harvested consensus with a healthy sample is the REAL market for this exact league —
+    // superflex-aware, TE-premium-aware, dynasty-aware. Require a slightly larger sample than the bare
+    // minimum before we let it outrank a published number, so a couple of odd drafts can't move a star.
+    const MIN_HARVEST_BEATS_PUB = 6;
+    const harvestIsStrong = adp && Number(adp.sample_n) >= MIN_HARVEST_BEATS_PUB;
+
+    let adpVal = null, adpLo = null, adpHi = null, trend = null, sampleN = 0, adpSrc = null;
+    // SOURCE PRIORITY.
+    //
+    // Historically published ADP won outright, on the reasoning that harvested drafts were "thin and
+    // rookie-contaminated." That is no longer true (the blender was silently collapsing every harvested draft
+    // into a single observation; with that fixed, sample counts are real). And a published number carries a
+    // hidden defect: it is a SINGLE GENERIC number that is not superflex-aware, not TE-premium-aware, and not
+    // dynasty-aware. Serving it for an SF/TEP/dynasty league prices the whole board as 1QB redraft — which is
+    // how a QB the market actually drafts ~13th in superflex shows up around 40th.
+    //
+    // So: a format-correct harvested consensus (enough real drafts, in THIS exact format) beats a published
+    // number that had to be degraded to answer this format. Published still wins when it exactly matches the
+    // requested format, and still backstops any player the harvest hasn't seen enough of.
     if (isRookieFormat && adp) {
-      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n;
+      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n; adpSrc = 'harvest';
+    } else if (harvestIsStrong && !pubIsExactFormat) {
+      // real drafts in THIS format beat a generic/degraded published number
+      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n; adpSrc = 'harvest';
     } else if (pubPick != null && pubPick > 0) {
-      adpVal = pubPick; sampleN = 999; // published = high confidence
+      adpVal = pubPick; sampleN = 999; adpSrc = 'published'; // published = high confidence
       if (adp) { adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); }
     } else if (adp) {
-      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n;
+      adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n; adpSrc = 'harvest';
     }
     pack.push({
       id: pl.player_id,
@@ -205,6 +227,7 @@ playerPackRouter.get('/', async (req, res) => {
       bye: pl.bye_week || null,
       adp: adpVal,
       adpLo, adpHi, trend, sampleN,
+      adpSrc,                                    // 'published' | 'harvest' | null — which market supplied the number
       pubFmt: pubPick != null ? (publishedFmtById.get(pl.player_id) || null) : null, // which format gave this ADP
       inj: pl.injury_status || null,
       rookie: pl.years_exp != null && pl.years_exp === 0,
@@ -222,5 +245,8 @@ playerPackRouter.get('/', async (req, res) => {
     return a.adp - b.adp;
   });
 
-  res.json({ format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, players: pack });
+  const adpSources = pack.reduce((acc, p) => {
+    const k = p.adpSrc || 'none'; acc[k] = (acc[k] || 0) + 1; return acc;
+  }, {});
+  res.json({ format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, players: pack });
 });
