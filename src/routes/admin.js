@@ -169,3 +169,104 @@ adminRouter.get('/health', async (_req, res) => {
   ]);
   res.json({ players: pl[0].n, adpConsensus: adp[0].n, projections: proj[0].n, harvestedDrafts: hv[0].n });
 });
+
+// ---------------------------------------------------------------------------------------------------
+// PLAYER EVENTS
+//
+// A dated, value-changing event for one player (season-ending injury, lost his job, suspension, trade,
+// retirement). Drafts that happened BEFORE the date were made under information that is now obsolete, so at
+// consensus time we DOWN-WEIGHT those pre-event observations for that player. Drafts after the date already
+// price the news in and are untouched. See lib/adpConsensus.js for the weighting and the redraft/dynasty split.
+//
+// We never invent an ADP — we only reweight real drafts — so a bad entry degrades gracefully and washes out as
+// post-event drafts accumulate. Deleting an event fully restores the original number on the next refresh.
+
+async function ensureEventsTable() {
+  await q(`CREATE TABLE IF NOT EXISTS player_events (
+    id          SERIAL PRIMARY KEY,
+    player_id   TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    event_date  TIMESTAMPTZ NOT NULL,
+    note        TEXT,
+    created_by  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  // One active event per player per date+type; re-submitting is idempotent rather than duplicating.
+  await q(`CREATE UNIQUE INDEX IF NOT EXISTS player_events_uniq
+           ON player_events (player_id, event_type, event_date)`);
+  await q(`CREATE INDEX IF NOT EXISTS player_events_player ON player_events (player_id)`);
+}
+
+// The event types the blender understands, for populating the admin dropdown.
+adminRouter.get('/event-types', async (_req, res) => {
+  const { EVENT_PROFILES } = await import('../lib/adpConsensus.js');
+  res.json(Object.entries(EVENT_PROFILES).map(([key, p]) => ({
+    key, label: p.label, redraft: p.redraft, dynasty: p.dynasty,
+  })));
+});
+
+// Player typeahead for the admin picker — never hardcode a player, always look them up.
+//   GET /api/admin/player-search?q=mahomes
+adminRouter.get('/player-search', async (req, res) => {
+  const term = String(req.query.q || '').trim();
+  if (term.length < 2) return res.json([]);
+  const { rows } = await q(
+    `SELECT player_id, full_name, position, team
+       FROM players
+      WHERE full_name ILIKE $1 AND position = ANY($2)
+      ORDER BY full_name LIMIT 20`,
+    [`%${term}%`, ['QB', 'RB', 'WR', 'TE']]
+  );
+  res.json(rows);
+});
+
+// List events (most recent first), joined to player names for display.
+adminRouter.get('/events', async (_req, res) => {
+  await ensureEventsTable();
+  const { rows } = await q(
+    `SELECT e.id, e.player_id, e.event_type, e.event_date, e.note, e.created_by, e.created_at,
+            p.full_name, p.position, p.team
+       FROM player_events e
+       LEFT JOIN players p ON p.player_id = e.player_id
+      ORDER BY e.event_date DESC, e.id DESC
+      LIMIT 200`
+  );
+  res.json(rows);
+});
+
+// Create an event.  POST /api/admin/events { player_id, event_type, event_date, note? }
+adminRouter.post('/events', async (req, res) => {
+  await ensureEventsTable();
+  const { player_id, event_type, event_date, note } = req.body || {};
+  if (!player_id || !event_type || !event_date) {
+    return res.status(400).json({ error: 'player_id, event_type and event_date are required' });
+  }
+  const { EVENT_PROFILES } = await import('../lib/adpConsensus.js');
+  if (!EVENT_PROFILES[event_type]) {
+    return res.status(400).json({ error: `unknown event_type: ${event_type}` });
+  }
+  const when = new Date(event_date);
+  if (Number.isNaN(when.getTime())) return res.status(400).json({ error: 'event_date is not a valid date' });
+  if (when.getTime() > Date.now() + 864e5) return res.status(400).json({ error: 'event_date cannot be in the future' });
+
+  const { rows: known } = await q(`SELECT 1 FROM players WHERE player_id=$1`, [player_id]);
+  if (!known.length) return res.status(400).json({ error: 'unknown player_id' });
+
+  const { rows } = await q(
+    `INSERT INTO player_events (player_id, event_type, event_date, note, created_by)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (player_id, event_type, event_date) DO UPDATE SET note = EXCLUDED.note
+     RETURNING *`,
+    [player_id, event_type, when.toISOString(), note || null, req.user?.email || 'admin']
+  );
+  res.json({ ok: true, event: rows[0], note: 'Run the ADP refresh job to apply this to consensus.' });
+});
+
+// Delete an event — removing it fully restores the untouched consensus on the next refresh.
+adminRouter.delete('/events/:id', async (req, res) => {
+  await ensureEventsTable();
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' });
+  await q(`DELETE FROM player_events WHERE id=$1`, [id]);
+  res.json({ ok: true, note: 'Run the ADP refresh job to restore the original consensus.' });
+});

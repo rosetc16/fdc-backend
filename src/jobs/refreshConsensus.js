@@ -14,7 +14,24 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
     [season]
   );
 
-  let written = 0;
+  // Load admin-entered player events once. An event marks the date a player's value changed, so drafts BEFORE
+  // it were made under obsolete information and get down-weighted at blend time. Where a player has more than
+  // one event we apply only the MOST RECENT — it supersedes anything earlier (the latest news is what the
+  // market is pricing). The table may not exist yet on a fresh DB, so this is best-effort.
+  const eventByPlayer = new Map();
+  try {
+    const { rows: evs } = await q(
+      `SELECT DISTINCT ON (player_id) player_id, event_type, event_date
+         FROM player_events
+        ORDER BY player_id, event_date DESC`
+    );
+    for (const e of evs) eventByPlayer.set(e.player_id, e);
+    if (evs.length) log.info(`refreshConsensus: applying ${evs.length} player event(s)`);
+  } catch (err) {
+    log.info('refreshConsensus: no player_events table yet — skipping event adjustment');
+  }
+
+  let written = 0, eventAdjusted = 0;
   for (const { player_id, format_key } of combos) {
     // pull a trailing window of observations (twice the trend window so trend has a prior period)
     const { rows: obs } = await q(
@@ -26,8 +43,12 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
       [player_id, format_key, season]
     );
     if (!obs.length) continue;
-    const rec = buildConsensusRecord(obs);
+    // The event (if any) and the format both matter: the same injury down-weights pre-event drafts hard for
+    // redraft but only mildly for dynasty, and format_key is what tells us which we're computing.
+    const event = eventByPlayer.get(player_id) || null;
+    const rec = buildConsensusRecord(obs, new Date(), { event, formatKey: format_key });
     if (rec.consensus == null) continue;
+    if (rec.eventApplied) eventAdjusted++;
     await q(
       `INSERT INTO adp_consensus (player_id, format_key, season, consensus, lo, hi, stdev, sample_n, trend, sources, computed_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
@@ -43,7 +64,7 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
   // staleness cleanup: delete observations older than the prior season once a new season is active
   await q(`DELETE FROM adp_observations WHERE season < $1 - 1`, [season]);
 
-  const detail = { combos: combos.length, written, ms: Date.now() - started };
+  const detail = { combos: combos.length, written, eventAdjusted, events: eventByPlayer.size, ms: Date.now() - started };
   log.info(detail, 'refreshConsensus done');
   await recordJob('refreshConsensus', true, detail);
   return detail;
