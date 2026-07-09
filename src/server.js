@@ -212,3 +212,13 @@ server = app.listen(config.port, () => {
     } catch (e) { log.error(e, 'startup recovery failed'); }
   }, 10000);
 });
+
+// Long-running admin jobs (full refresh, harvest) run SYNCHRONOUSLY inside a request and can take minutes.
+// Node's defaults would cut the socket well before they finish, which the browser then reports as a generic
+// network failure. Raise the server-side ceilings so a job that is genuinely working is allowed to complete.
+// (headersTimeout must exceed requestTimeout, or Node closes the connection while the handler is still busy.)
+server.requestTimeout = 10 * 60 * 1000;  // 10 min: allow a full re-crawl to finish
+server.headersTimeout = 11 * 60 * 1000;  // must be > requestTimeout
+server.keepAliveTimeout = 75 * 1000;     // > typical proxy idle timeout, avoids races on keep-alive reuse
+server.setTimeout(0);                    // no blanket socket timeout; the two above govern instead
+
