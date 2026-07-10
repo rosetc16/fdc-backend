@@ -270,3 +270,63 @@ adminRouter.delete('/events/:id', async (req, res) => {
   await q(`DELETE FROM player_events WHERE id=$1`, [id]);
   res.json({ ok: true, note: 'Run the ADP refresh job to restore the original consensus.' });
 });
+
+// ---------------------------------------------------------------------------------------------------
+// DATABASE SIZE — diagnose what's using disk (Render warns at 90% of the Postgres storage limit).
+// With a handful of users, any storage pressure is almost always the harvested-draft ADP pool
+// (adp_observations), which grows every harvest pass. This reports total DB size + the biggest tables
+// and the harvest row count, so you can decide between a cleanup (usually enough) and an upgrade.
+adminRouter.get('/db-size', async (_req, res) => {
+  try {
+    const total = (await q(`SELECT pg_size_pretty(pg_database_size(current_database())) AS size,
+                                   pg_database_size(current_database()) AS bytes`)).rows[0];
+    const tables = (await q(`
+      SELECT relname AS table,
+             pg_size_pretty(pg_total_relation_size(c.oid)) AS size,
+             pg_total_relation_size(c.oid) AS bytes,
+             (SELECT reltuples::bigint FROM pg_class WHERE oid = c.oid) AS approx_rows
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relkind = 'r'
+       ORDER BY pg_total_relation_size(c.oid) DESC
+       LIMIT 12`)).rows;
+    let harvest = null;
+    try {
+      harvest = (await q(`
+        SELECT count(*)::bigint AS rows,
+               count(*) FILTER (WHERE source = 'sleeper_harvest')::bigint AS harvest_rows,
+               count(*) FILTER (WHERE source = 'sleeper_published')::bigint AS published_rows,
+               count(DISTINCT season)::int AS seasons
+          FROM adp_observations`)).rows[0];
+    } catch { /* table may not exist */ }
+    res.json({ total, tables, adp_observations: harvest });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CLEANUP — reclaim space from the harvest pool without losing the market signal you actually use.
+// The consensus is already computed and stored separately (adp_consensus), so the RAW per-pick harvest
+// rows are only needed to RECOMPUTE it. We keep recent rows (default 45 days) and delete older ones, then
+// VACUUM to return the freed pages to the OS. This is safe: the next refresh recomputes consensus from
+// what remains, and old picks were already aged out of the trailing window anyway.
+adminRouter.post('/db-cleanup', async (req, res) => {
+  const days = Math.max(7, Math.min(180, Number(req.body?.keepDays) || 45));
+  try {
+    const before = (await q(`SELECT count(*)::bigint AS n FROM adp_observations WHERE source='sleeper_harvest'`)).rows[0].n;
+    const del = await q(
+      `DELETE FROM adp_observations
+        WHERE source='sleeper_harvest' AND observed_at < now() - ($1 || ' days')::interval`,
+      [String(days)]
+    );
+    // Drop harvested_drafts rows we no longer have observations for, so re-harvest can re-pull if wanted.
+    await q(`DELETE FROM harvested_drafts hd
+              WHERE NOT EXISTS (SELECT 1 FROM adp_observations o
+                                 WHERE o.source='sleeper_harvest' AND o.format_key = hd.format_key)`);
+    // VACUUM cannot run inside the implicit transaction; best-effort in its own statement.
+    try { await q('VACUUM (ANALYZE) adp_observations'); } catch (e) { /* non-fatal */ }
+    const after = (await q(`SELECT count(*)::bigint AS n FROM adp_observations WHERE source='sleeper_harvest'`)).rows[0].n;
+    res.json({ ok: true, keepDays: days, harvestRowsBefore: before, harvestRowsAfter: after, deleted: Number(before) - Number(after) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});

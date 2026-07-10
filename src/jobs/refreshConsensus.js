@@ -64,6 +64,26 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
   // staleness cleanup: delete observations older than the prior season once a new season is active
   await q(`DELETE FROM adp_observations WHERE season < $1 - 1`, [season]);
 
+  // HARVEST RETENTION. The per-pick harvest rows exist only to RECOMPUTE consensus (which we just did and
+  // stored in adp_consensus). Within a season they otherwise accumulate forever — every harvest pass appends
+  // more — which is what pushes a tiny-user database toward its storage limit. The consensus blender only
+  // looks back a couple of trend-windows anyway, so raw picks past that window carry no remaining signal.
+  // Keep a comfortable buffer beyond the window, delete the rest, and reclaim the pages. Published rows are
+  // untouched (they're re-synced wholesale, not accumulated). Best-effort; never fail the refresh over it.
+  try {
+    const keepDays = Math.max(45, BLEND.trendWindowDays * 3);
+    const pruned = await q(
+      `DELETE FROM adp_observations
+        WHERE source = 'sleeper_harvest' AND observed_at < now() - ($1 || ' days')::interval`,
+      [String(keepDays)]
+    );
+    if (pruned.rowCount) {
+      log.info({ pruned: pruned.rowCount, keepDays }, 'refreshConsensus: pruned old harvest rows');
+      // return freed pages to the OS so the DB size actually shrinks (VACUUM can't run in a txn block)
+      await q('VACUUM adp_observations').catch(() => {});
+    }
+  } catch (e) { log.error(e, 'harvest retention prune failed (non-fatal)'); }
+
   const detail = { combos: combos.length, written, eventAdjusted, events: eventByPlayer.size, ms: Date.now() - started };
   log.info(detail, 'refreshConsensus done');
   await recordJob('refreshConsensus', true, detail);
