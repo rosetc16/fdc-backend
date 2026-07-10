@@ -313,7 +313,7 @@ adminRouter.post('/db-cleanup', async (req, res) => {
   const days = Math.max(7, Math.min(180, Number(req.body?.keepDays) || 45));
   try {
     const before = (await q(`SELECT count(*)::bigint AS n FROM adp_observations WHERE source='sleeper_harvest'`)).rows[0].n;
-    const del = await q(
+    await q(
       `DELETE FROM adp_observations
         WHERE source='sleeper_harvest' AND observed_at < now() - ($1 || ' days')::interval`,
       [String(days)]
@@ -322,10 +322,19 @@ adminRouter.post('/db-cleanup', async (req, res) => {
     await q(`DELETE FROM harvested_drafts hd
               WHERE NOT EXISTS (SELECT 1 FROM adp_observations o
                                  WHERE o.source='sleeper_harvest' AND o.format_key = hd.format_key)`);
-    // VACUUM cannot run inside the implicit transaction; best-effort in its own statement.
+    // CONSENSUS BLOAT: historically each consensus row stored a fat JSON `sources` blob, duplicated across the
+    // ~44 format keys per player — the single biggest space consumer after the raw pool. The board never reads
+    // it, so blank it out on every existing row. New rows already write '[]'.
+    let consensusTrimmed = 0;
+    try { const r = await q(`UPDATE adp_consensus SET sources='[]' WHERE sources IS NOT NULL AND sources::text <> '[]'`); consensusTrimmed = r.rowCount || 0; } catch (e) { /* column may differ */ }
+    // Drop consensus rows for the PRIOR seasons (kept only current + last), which otherwise linger.
+    const season = config.activeSeason;
+    await q(`DELETE FROM adp_consensus WHERE season < $1 - 1`, [season]).catch(() => {});
+    // VACUUM cannot run inside a transaction; best-effort in its own statements to return pages to the OS.
     try { await q('VACUUM (ANALYZE) adp_observations'); } catch (e) { /* non-fatal */ }
+    try { await q('VACUUM (ANALYZE) adp_consensus'); } catch (e) { /* non-fatal */ }
     const after = (await q(`SELECT count(*)::bigint AS n FROM adp_observations WHERE source='sleeper_harvest'`)).rows[0].n;
-    res.json({ ok: true, keepDays: days, harvestRowsBefore: before, harvestRowsAfter: after, deleted: Number(before) - Number(after) });
+    res.json({ ok: true, keepDays: days, harvestRowsBefore: before, harvestRowsAfter: after, deleted: Number(before) - Number(after), consensusSourcesTrimmed: consensusTrimmed });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

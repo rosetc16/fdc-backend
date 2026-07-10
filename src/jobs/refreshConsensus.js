@@ -55,8 +55,13 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
        ON CONFLICT (player_id, format_key, season) DO UPDATE SET
          consensus=EXCLUDED.consensus, lo=EXCLUDED.lo, hi=EXCLUDED.hi, stdev=EXCLUDED.stdev,
          sample_n=EXCLUDED.sample_n, trend=EXCLUDED.trend, sources=EXCLUDED.sources, computed_at=now()`,
+      // NOTE: we intentionally DON'T persist the full per-source observation list here. It was stored as a JSON
+      // blob on EVERY (player × format × season) row — and with ~44 format keys per player it ballooned the
+      // consensus table to hundreds of MB, most of it data the board never reads back (it only needs the
+      // number, range, trend, and sample count). Storing an empty array keeps the column/shape intact while
+      // eliminating the bloat. The raw observations still live in adp_observations if a recompute is needed.
       [player_id, format_key, season, rec.consensus, rec.lo, rec.hi, rec.stdev,
-       rec.sampleN, rec.trend, JSON.stringify(rec.sources)]
+       rec.sampleN, rec.trend, '[]']
     );
     written++;
   }
@@ -83,6 +88,10 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
       await q('VACUUM adp_observations').catch(() => {});
     }
   } catch (e) { log.error(e, 'harvest retention prune failed (non-fatal)'); }
+
+  // Keep the consensus `sources` blob empty going forward (new rows already write '[]'; this catches any that
+  // slipped in). Cheap, and prevents the consensus table from ever re-bloating.
+  try { await q(`UPDATE adp_consensus SET sources='[]' WHERE sources IS NOT NULL AND sources::text <> '[]'`); } catch (e) { /* non-fatal */ }
 
   const detail = { combos: combos.length, written, eventAdjusted, events: eventByPlayer.size, ms: Date.now() - started };
   log.info(detail, 'refreshConsensus done');
