@@ -106,10 +106,18 @@ playerPackRouter.get('/', async (req, res) => {
   for (const [fk, n] of Object.entries(fmtUsageCount)) { if (n > _bestN) { _bestN = n; usedPubFormat = fk; } }
   const publishedIds = new Set(publishedAdp.keys());
 
-  // Harvested consensus (fallback only — used to fill players with no published number, and for lo/hi/trend)
+  // Harvested consensus (fallback only — used to fill players with no published number, and for lo/hi/trend).
+  //
+  // We do NOT take the first fallback format that has ANY rows. That greedy rule is a trap: if the exact
+  // requested format (e.g. SF|TEP|DYNASTY) has a handful of stray consensus rows from some earlier partial
+  // harvest, the loop would stop there with near-zero coverage and never reach the hundreds of real
+  // SF|STD|DYNASTY drafts one step down the chain — leaving almost every player with no harvested ADP and
+  // forcing the board onto degraded 1QB published numbers. Instead we scan the chain and pick the format with
+  // the MOST coverage, so the board rides the biggest real market sample available (your 621 SF-dynasty drafts).
   let adpRows = [];
   let usedFormat = format;
   const harvestChainTried = [];
+  let best = { rows: [], fmt: null, n: 0 };
   for (const fkey of formatFallbacks(format)) {
     const r = await q(
       `SELECT player_id, consensus, lo, hi, trend, sample_n
@@ -117,8 +125,11 @@ playerPackRouter.get('/', async (req, res) => {
       [fkey, season]
     );
     harvestChainTried.push({ format: fkey, rows: r.rows.length });
-    if (r.rows.length) { adpRows = r.rows; usedFormat = fkey; break; }
+    if (r.rows.length > best.n) best = { rows: r.rows, fmt: fkey, n: r.rows.length };
+    // Early exit: the exact requested format with solid coverage is unbeatable — take it and stop.
+    if (fkey === format && r.rows.length >= 50) { best = { rows: r.rows, fmt: fkey, n: r.rows.length }; break; }
   }
+  if (best.n > 0) { adpRows = best.rows; usedFormat = best.fmt; }
   const adpById = new Map(adpRows.map((a) => [a.player_id, a]));
 
   // 2) projections for the season
