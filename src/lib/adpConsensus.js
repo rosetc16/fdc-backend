@@ -70,6 +70,17 @@ export function preEventWeightFactor(event, formatKey) {
 // collapsing them would throw away the entire harvest and leave a single draft standing in for hundreds.
 const SAMPLE_TYPES = new Set(['aggregated_drafts']);
 
+// MANUAL RANKINGS. Admin-uploaded expert/consensus rankings for a specific format (e.g. a FantasyPros export).
+// These exist to supply market signal that Sleeper's harvest structurally CAN'T — most notably TE-premium,
+// which almost nobody mocks on Sleeper, so the harvest has zero TEP drafts no matter how much it grows. A
+// manual ranking is a single authoritative source per format: it is deduped to the latest upload (re-uploading
+// the same format replaces the prior one), carries heavy weight so it dominates a thin board, and is trusted
+// for a longer window (rankings stay relevant longer than a single day's drafts).
+const MANUAL_TYPE = 'manual_ranking';
+const MANUAL_STALE_DAYS = 30;   // matches the admin UI promise: only rankings within 30 days count
+const MANUAL_WEIGHT = 40;       // heavy — a fresh manual ranking should anchor the board when drafts are thin
+export const MANUAL_RANKING = { type: MANUAL_TYPE, staleDays: MANUAL_STALE_DAYS, weight: MANUAL_WEIGHT };
+
 // Group observations by source, taking each source's most recent observation as its current read.
 //
 // IMPORTANT: this dedup exists for FEED-style sources (e.g. `sleeper_published`), which get re-synced on a
@@ -106,9 +117,14 @@ export function blendConsensus(observations, now = new Date(), opts = {}) {
   const tagged = latest.map((o) => {
     const obsAt = new Date(o.observed_at);
     const ageDays = Math.max(0, (now - obsAt) / DAY_MS);
-    const stale = ageDays > BLEND.staleDays;
+    const isManual = o.source_type === MANUAL_TYPE;
+    // Manual rankings live longer (30d) than harvested drafts (BLEND.staleDays), and decay gently so a fresh
+    // upload stays authoritative across the window instead of fading within two weeks like a single draft.
+    const stale = isManual ? ageDays > MANUAL_STALE_DAYS : ageDays > BLEND.staleDays;
     const preEvent = !!(eventAt && obsAt < eventAt);
-    const base = Math.max(0, (Number(o.weight) || 1) * (1 - ageDays * BLEND.decayPerDay));
+    const base = isManual
+      ? Math.max(MANUAL_WEIGHT * 0.4, (Number(o.weight) || MANUAL_WEIGHT) * (1 - ageDays * 0.012)) // slow decay, high floor
+      : Math.max(0, (Number(o.weight) || 1) * (1 - ageDays * BLEND.decayPerDay));
     const effWeight = preEvent ? base * preFactor : base;
     return {
       source: o.source, sourceType: o.source_type, value: Number(o.pick),

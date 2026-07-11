@@ -109,12 +109,14 @@ playerPackRouter.get('/', async (req, res) => {
   // Harvested consensus (fallback only — used to fill players with no published number, and for lo/hi/trend)
   let adpRows = [];
   let usedFormat = format;
+  const harvestChainTried = [];
   for (const fkey of formatFallbacks(format)) {
     const r = await q(
       `SELECT player_id, consensus, lo, hi, trend, sample_n
          FROM adp_consensus WHERE format_key=$1 AND season=$2`,
       [fkey, season]
     );
+    harvestChainTried.push({ format: fkey, rows: r.rows.length });
     if (r.rows.length) { adpRows = r.rows; usedFormat = fkey; break; }
   }
   const adpById = new Map(adpRows.map((a) => [a.player_id, a]));
@@ -258,5 +260,5 @@ playerPackRouter.get('/', async (req, res) => {
   const adpSources = pack.reduce((acc, p) => {
     const k = p.adpSrc || 'none'; acc[k] = (acc[k] || 0) + 1; return acc;
   }, {});
-  res.json({ format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, players: pack });
+  res.json({ format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, harvestChainTried, harvestFormatUsed: adpRows.length ? usedFormat : null, players: pack });
 });
