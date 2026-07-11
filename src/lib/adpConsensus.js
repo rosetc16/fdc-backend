@@ -77,8 +77,13 @@ const SAMPLE_TYPES = new Set(['aggregated_drafts']);
 // the same format replaces the prior one), carries heavy weight so it dominates a thin board, and is trusted
 // for a longer window (rankings stay relevant longer than a single day's drafts).
 const MANUAL_TYPE = 'manual_ranking';
-const MANUAL_STALE_DAYS = 30;   // matches the admin UI promise: only rankings within 30 days count
-const MANUAL_WEIGHT = 40;       // heavy — a fresh manual ranking should anchor the board when drafts are thin
+const MANUAL_STALE_DAYS = 30;   // only rankings within 30 days count (matches the admin UI promise)
+// LIGHT weight by design. When a player already has real market ADP (hundreds of harvested drafts, weight ~0.34
+// each → tens of points of total weight), a manual ranking should be barely a nudge — roughly a 10% pull toward
+// the ranking. So the manual weight is small in absolute terms. BUT when a player has NO market ADP at all, the
+// ranking is the ONLY observation, so it naturally becomes that player's number (gap-fill) with no special
+// casing. One knob, both behaviors.
+const MANUAL_WEIGHT = 4;        // ~10% of a well-covered player's total market weight; sole signal when ADP is absent
 export const MANUAL_RANKING = { type: MANUAL_TYPE, staleDays: MANUAL_STALE_DAYS, weight: MANUAL_WEIGHT };
 
 // Group observations by source, taking each source's most recent observation as its current read.

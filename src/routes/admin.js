@@ -4,6 +4,7 @@ import { Router } from 'express';
 import { q } from '../lib/db.js';
 import { config } from '../lib/config.js';
 import { requireAdmin } from '../lib/auth.js';
+import { formatKey as buildFormatKey } from '../lib/formatKey.js';
 
 export const adminRouter = Router();
 adminRouter.use(requireAdmin);
@@ -360,4 +361,139 @@ adminRouter.post('/db-cleanup', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ---------------------------------------------------------------------------------------------------
+// MANUAL RANKINGS (uploaded expert/consensus rankings, e.g. a FantasyPros CSV export)
+//
+// The frontend parses the CSV in the browser, resolves each row to a player_id (name + position, team as a
+// soft tiebreaker), and POSTs a compact list of { player_id, pos, rank } plus the target format selections.
+// We convert each rank into an ADP-like observation tagged 'manual_ranking' and let the SAME consensus pipeline
+// fold it in — LIGHTLY (see MANUAL_WEIGHT): ~10% nudge where real ADP exists, and the sole signal (gap-fill)
+// where it doesn't. Re-uploading the same format replaces the prior ranking. Only rankings within 30 days count.
+//
+// SCORING TRANSFORM: sources like FantasyPros publish superflex-dynasty rankings in ONE flavor (PPR, standard
+// TE). To let those rankings serve a TE-premium / 0.5 / 0 PPR league, we gently adjust the rank of affected
+// positions to reflect the target scoring before storing (a subtle TE lift for TEP, light PPR shifts for
+// pass-catchers). This is the legitimate inverse of the board's own transform: the source genuinely lacks the
+// variant, so we adapt it rather than pretending it matches.
+
+function cfgFromSelections({ type, ppr, tep, qb, teams }) {
+  const rec = ppr === 1 || ppr === '1' ? 1 : ppr === 0.5 || ppr === '0.5' ? 0.5 : 0;
+  const start = {};
+  if (qb === 'SF' || qb === 'superflex') start.SUPER = 1;
+  else if (qb === '2QB') start.QB = 2;
+  else start.QB = 1;
+  return {
+    type: type || 'redraft',
+    scoring: { rec, recTE: tep ? rec + 0.5 : rec },
+    tePremMult: tep ? 0.5 : 0,
+    start,
+    teams: Number(teams) || 12,
+  };
+}
+
+// Adjust a PPR-standard-TE source ranking to a target scoring. Ranks are "lower = better", so to move a player
+// UP we SUBTRACT from their rank. Subtle by design.
+function transformRanks(rows, { tep, ppr }) {
+  // Build positional order so we can nudge within a position without scrambling everything.
+  const out = rows.map((r) => ({ ...r }));
+  // TE-premium: lift the top TEs a little (they gain most from premium), fading down the position.
+  if (tep) {
+    const tes = out.filter((r) => r.pos === 'TE').sort((a, b) => a.rank - b.rank);
+    tes.forEach((r, i) => {
+      const lift = Math.max(0, 6 - i * 0.8);   // TE1 ~6 spots, fading, ~0 by TE8 — SUBTLE
+      r.rank = Math.max(1, r.rank - lift);
+    });
+  }
+  // PPR level: pass-catchers (WR/TE) gain value with more PPR; RBs relatively lose a touch. Source is PPR(1.0),
+  // so for 0.5 and 0 we GENTLY push pass-catchers down and nudge RBs up. Small effects.
+  const rec = ppr === 1 || ppr === '1' ? 1 : ppr === 0.5 || ppr === '0.5' ? 0.5 : 0;
+  if (rec < 1) {
+    const drop = rec === 0 ? 1.0 : 0.5;        // 0 PPR moves more than 0.5 PPR
+    for (const r of out) {
+      if (r.pos === 'WR') r.rank += 3 * drop;   // WRs slide back a little without full PPR
+      else if (r.pos === 'TE') r.rank += 2 * drop;
+      else if (r.pos === 'RB') r.rank = Math.max(1, r.rank - 2 * drop); // RBs gain
+    }
+  }
+  return out;
+}
+
+async function ensureManualTable() {
+  await q(`CREATE TABLE IF NOT EXISTS manual_rankings (
+    id           SERIAL PRIMARY KEY,
+    format_key   TEXT NOT NULL,
+    season       INTEGER NOT NULL,
+    label        TEXT,
+    source_name  TEXT,
+    player_count INTEGER,
+    created_by   TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (format_key, season)
+  )`);
+}
+
+// List uploaded rankings (most recent first).
+adminRouter.get('/manual-rankings', async (_req, res) => {
+  await ensureManualTable();
+  const { rows } = await q(
+    `SELECT id, format_key, season, label, source_name, player_count, created_by, created_at
+       FROM manual_rankings ORDER BY created_at DESC LIMIT 100`
+  );
+  res.json(rows);
+});
+
+// Upload a ranking. Body: { players: [{player_id, pos, rank}], type, ppr, tep, qb, teams, label, sourceName, date }
+adminRouter.post('/manual-rankings', async (req, res) => {
+  await ensureManualTable();
+  const b = req.body || {};
+  const players = Array.isArray(b.players) ? b.players : [];
+  if (!players.length) return res.status(400).json({ error: 'no players in ranking' });
+
+  const cfg = cfgFromSelections(b);
+  const fkey = buildFormatKey(cfg);
+  const season = Number(b.season) || config.activeSeason;
+  const when = b.date ? new Date(b.date) : new Date();
+  if (Number.isNaN(when.getTime())) return res.status(400).json({ error: 'invalid date' });
+
+  // Apply the subtle scoring transform for the target format.
+  const transformed = transformRanks(
+    players.filter((p) => p.player_id && p.rank != null).map((p) => ({ player_id: p.player_id, pos: p.pos, rank: Number(p.rank) })),
+    { tep: !!b.tep, ppr: b.ppr }
+  );
+
+  // Replace any prior ranking for this exact format: delete its observations, then re-insert.
+  await q(`DELETE FROM adp_observations WHERE format_key=$1 AND season=$2 AND source_type='manual_ranking'`, [fkey, season]);
+  await q(`DELETE FROM manual_rankings WHERE format_key=$1 AND season=$2`, [fkey, season]);
+
+  const MANUAL_WEIGHT = 4;
+  let written = 0;
+  for (const p of transformed) {
+    await q(
+      `INSERT INTO adp_observations (player_id, format_key, season, source, source_type, pick, weight, observed_at)
+       VALUES ($1,$2,$3,$4,'manual_ranking',$5,$6,$7)`,
+      [p.player_id, fkey, season, `manual:${b.sourceName || 'upload'}`, p.rank, MANUAL_WEIGHT, when.toISOString()]
+    );
+    written++;
+  }
+  await q(
+    `INSERT INTO manual_rankings (format_key, season, label, source_name, player_count, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [fkey, season, b.label || null, b.sourceName || 'upload', written, req.user?.email || 'admin']
+  );
+  res.json({ ok: true, formatKey: fkey, season, playersWritten: written, note: 'Run Update Sleeper ADP (or wait for the nightly refresh) to fold this into the board.' });
+});
+
+// Delete a ranking (and its observations).
+adminRouter.delete('/manual-rankings/:id', async (req, res) => {
+  await ensureManualTable();
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' });
+  const { rows } = await q(`SELECT format_key, season FROM manual_rankings WHERE id=$1`, [id]);
+  if (rows[0]) {
+    await q(`DELETE FROM adp_observations WHERE format_key=$1 AND season=$2 AND source_type='manual_ranking'`, [rows[0].format_key, rows[0].season]);
+    await q(`DELETE FROM manual_rankings WHERE id=$1`, [id]);
+  }
+  res.json({ ok: true, note: 'Ranking removed. Run a refresh to update the board.' });
 });
