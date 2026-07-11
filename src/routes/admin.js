@@ -312,29 +312,51 @@ adminRouter.get('/db-size', async (_req, res) => {
 adminRouter.post('/db-cleanup', async (req, res) => {
   const days = Math.max(7, Math.min(180, Number(req.body?.keepDays) || 45));
   try {
+    const sizeOf = async () => {
+      const r = await q(`SELECT pg_size_pretty(pg_database_size(current_database())) AS total,
+                                pg_size_pretty(pg_total_relation_size('adp_consensus')) AS consensus,
+                                pg_size_pretty(pg_total_relation_size('adp_observations')) AS observations`);
+      return r.rows[0];
+    };
+    const sizeBefore = await sizeOf();
     const before = (await q(`SELECT count(*)::bigint AS n FROM adp_observations WHERE source='sleeper_harvest'`)).rows[0].n;
-    await q(
-      `DELETE FROM adp_observations
-        WHERE source='sleeper_harvest' AND observed_at < now() - ($1 || ' days')::interval`,
-      [String(days)]
-    );
-    // Drop harvested_drafts rows we no longer have observations for, so re-harvest can re-pull if wanted.
+
+    // 1) Trim the raw harvest pool to the retention window.
+    await q(`DELETE FROM adp_observations
+              WHERE source='sleeper_harvest' AND observed_at < now() - ($1 || ' days')::interval`, [String(days)]);
     await q(`DELETE FROM harvested_drafts hd
               WHERE NOT EXISTS (SELECT 1 FROM adp_observations o
                                  WHERE o.source='sleeper_harvest' AND o.format_key = hd.format_key)`);
-    // CONSENSUS BLOAT: historically each consensus row stored a fat JSON `sources` blob, duplicated across the
-    // ~44 format keys per player — the single biggest space consumer after the raw pool. The board never reads
-    // it, so blank it out on every existing row. New rows already write '[]'.
+
+    // 2) Blank the fat consensus `sources` blob (the board never reads it). This is where most of the
+    //    consensus bloat lives — historically ~570 bytes/row of JSON duplicated across ~44 formats per player.
     let consensusTrimmed = 0;
     try { const r = await q(`UPDATE adp_consensus SET sources='[]' WHERE sources IS NOT NULL AND sources::text <> '[]'`); consensusTrimmed = r.rowCount || 0; } catch (e) { /* column may differ */ }
-    // Drop consensus rows for the PRIOR seasons (kept only current + last), which otherwise linger.
     const season = config.activeSeason;
     await q(`DELETE FROM adp_consensus WHERE season < $1 - 1`, [season]).catch(() => {});
-    // VACUUM cannot run inside a transaction; best-effort in its own statements to return pages to the OS.
-    try { await q('VACUUM (ANALYZE) adp_observations'); } catch (e) { /* non-fatal */ }
-    try { await q('VACUUM (ANALYZE) adp_consensus'); } catch (e) { /* non-fatal */ }
+
+    // 3) RECLAIM DISK. A plain VACUUM only marks space reusable internally — it does NOT return pages to the OS,
+    //    so Render's reported size doesn't drop (which is exactly what happened the first time). VACUUM FULL
+    //    rewrites the table compactly and returns the freed disk, at the cost of a brief exclusive lock.
+    //    IMPORTANT: VACUUM FULL needs free disk ~= the table's size to rewrite. Near a full disk that can fail
+    //    for the big table. So we FULL-vacuum adp_consensus FIRST — it's where most reclaimable bloat is (the
+    //    sources blob we just blanked), and freeing it creates headroom. Then we attempt the observations
+    //    table; if there isn't room it falls back to a plain VACUUM (still frees internally for reuse).
+    const vacuumed = [];
+    try { await q('VACUUM FULL adp_consensus'); vacuumed.push('adp_consensus (full)'); }
+    catch (e) { try { await q('VACUUM adp_consensus'); vacuumed.push('adp_consensus (plain)'); } catch (e2) {} }
+    try { await q('VACUUM FULL adp_observations'); vacuumed.push('adp_observations (full)'); }
+    catch (e) { try { await q('VACUUM adp_observations'); vacuumed.push('adp_observations (plain)'); } catch (e2) {} }
+    try { await q('ANALYZE'); } catch (e) { /* non-fatal */ }
+
     const after = (await q(`SELECT count(*)::bigint AS n FROM adp_observations WHERE source='sleeper_harvest'`)).rows[0].n;
-    res.json({ ok: true, keepDays: days, harvestRowsBefore: before, harvestRowsAfter: after, deleted: Number(before) - Number(after), consensusSourcesTrimmed: consensusTrimmed });
+    const sizeAfter = await sizeOf();
+    res.json({
+      ok: true, keepDays: days,
+      harvestRowsBefore: before, harvestRowsAfter: after, deleted: Number(before) - Number(after),
+      consensusSourcesTrimmed: consensusTrimmed, vacuumed,
+      sizeBefore, sizeAfter,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
