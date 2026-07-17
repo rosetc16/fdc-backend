@@ -4,6 +4,7 @@ import { config } from '../lib/config.js';
 import { q } from '../lib/db.js';
 import { buildConsensusRecord, BLEND } from '../lib/adpConsensus.js';
 import { log } from '../lib/log.js';
+import { clearPlayerPackCache } from '../lib/packCache.js';
 import { recordJob } from '../lib/jobs.js';
 
 export async function refreshConsensus({ season = config.activeSeason } = {}) {
@@ -94,6 +95,9 @@ export async function refreshConsensus({ season = config.activeSeason } = {}) {
   try { await q(`UPDATE adp_consensus SET sources='[]' WHERE sources IS NOT NULL AND sources::text <> '[]'`); } catch (e) { /* non-fatal */ }
 
   const detail = { combos: combos.length, written, eventAdjusted, events: eventByPlayer.size, ms: Date.now() - started };
+  // New ADP has landed — drop the cached packs so the next request rebuilds from fresh data
+  // instead of serving a stale pack until the TTL expires.
+  try { clearPlayerPackCache(); } catch (e) { /* cache is best-effort; never fail the job for it */ }
   log.info(detail, 'refreshConsensus done');
   await recordJob('refreshConsensus', true, detail);
   return detail;

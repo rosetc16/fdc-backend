@@ -7,6 +7,7 @@ import { Router } from 'express';
 import { config } from '../lib/config.js';
 import { q } from '../lib/db.js';
 import { formatFallbacks } from '../lib/formatKey.js';
+import { packCacheGet, packCacheSet } from '../lib/packCache.js';
 
 export const playerPackRouter = Router();
 
@@ -38,6 +39,20 @@ playerPackRouter.get('/', async (req, res) => {
   const season = Number(req.query.season || config.activeSeason);
   const format = String(req.query.format || 'PPR|1QB|STD|REDRAFT|12');
   const isRookieFormat = format.split('|')[3] === 'ROOKIE'; // rookie-only draft: format-specific harvested ADP wins
+
+  // Every input that can change the response. Nothing else varies it — no auth, no per-user data — so this is
+  // a complete cache key. Check it BEFORE touching the database: a hit skips all 5 queries and the payload build.
+  const cacheKey = [season, format,
+    String(req.query.k || '') === '1' ? 'k1' : 'k0',
+    String(req.query.dst || '') === '1' ? 'd1' : 'd0',
+    String(req.query.idp || '') === '1' ? 'i1' : 'i0'].join('~');
+  const cached = packCacheGet(cacheKey);
+  if (cached) {
+    // Let the browser/CDN reuse it too, so a repeat open doesn't even reach us.
+    res.set('Cache-Control', 'public, max-age=300');
+    res.set('X-Pack-Cache', 'HIT');
+    return res.json(cached);
+  }
 
   // ---- ADP: published Sleeper ADP is the PRIMARY source ------------------------------------------
   // This early in the year, harvested-draft ADP is thin and rookie-contaminated, so it badly distorts the
@@ -271,5 +286,9 @@ playerPackRouter.get('/', async (req, res) => {
   const adpSources = pack.reduce((acc, p) => {
     const k = p.adpSrc || 'none'; acc[k] = (acc[k] || 0) + 1; return acc;
   }, {});
-  res.json({ format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, harvestChainTried, harvestFormatUsed: adpRows.length ? usedFormat : null, players: pack });
+  const body = { format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, harvestChainTried, harvestFormatUsed: adpRows.length ? usedFormat : null, players: pack };
+  packCacheSet(cacheKey, body);
+  res.set('Cache-Control', 'public, max-age=300');
+  res.set('X-Pack-Cache', 'MISS');
+  res.json(body);
 });

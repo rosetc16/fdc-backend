@@ -12,6 +12,7 @@ import { config } from '../lib/config.js';
 import { getSeasonProjections } from '../lib/sleeper.js';
 import { q } from '../lib/db.js';
 import { log } from '../lib/log.js';
+import { clearPlayerPackCache } from '../lib/packCache.js';
 import { recordJob } from '../lib/jobs.js';
 
 // Team-size buckets we publish ADP into. Sleeper's published ADP is not team-size specific, so we apply
@@ -112,6 +113,9 @@ export async function syncPublishedAdp({ season = config.activeSeason } = {}) {
   }
 
   const detail = { season, projectionRowsSeen: (rows || []).length, players, fieldsFound, observationsWritten: written, byField, sampleObjectKeys: sampleKeys, sampleAdpKeysInStats: sampleStatsKeys, ms: Date.now() - started };
+  // New ADP has landed — drop the cached packs so the next request rebuilds from fresh data
+  // instead of serving a stale pack until the TTL expires.
+  try { clearPlayerPackCache(); } catch (e) { /* cache is best-effort; never fail the job for it */ }
   log.info(detail, 'syncPublishedAdp done');
   await recordJob('syncPublishedAdp', true, detail);
   return detail;
