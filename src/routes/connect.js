@@ -585,6 +585,83 @@ function rosterToSlot(slotToRoster, rosterId) {
 // FAST live-sync endpoint. During an active draft the only things that change pick-to-pick are the PICKS and
 // the CLOCK — team names, rosters, traded picks, and keepers are stable. The full /draft endpoint refetches
 // all of those every poll (6 Sleeper round-trips), which is why live sync lagged ~10-15s behind Sleeper.
+// ---- Dynasty draft history --------------------------------------------------------------------
+// A dynasty league on Sleeper is a CHAIN of one league per season, linked by previous_league_id, and
+// each season-league can carry its own draft (the startup draft in year one, a rookie draft each year
+// after). This walks the whole chain and returns every draft, newest first, labeled startup/rookie/vet
+// from Sleeper's player_type setting (1 = rookies only, 2 = vets only, else all players).
+//   GET /api/connect/sleeper/draft-history?league_id=...
+connectRouter.get('/sleeper/draft-history', async (req, res) => {
+  const leagueId = String(req.query.league_id || '').trim();
+  if (!leagueId) return res.status(400).json({ error: 'league_id required' });
+  try {
+    const out = [];
+    let lid = leagueId;
+    for (let hop = 0; hop < 12 && lid; hop++) {   // 12 seasons is plenty; the cap guards a cyclic chain
+      const lg = await getLeague(lid).catch(() => null);
+      if (!lg) break;
+      const drafts = (await getLeagueDrafts(lid).catch(() => [])) || [];
+      for (const d of drafts) {
+        const pt = d.settings && d.settings.player_type;
+        out.push({
+          draft_id: d.draft_id,
+          league_id: lid,
+          season: d.season || lg.season || null,
+          status: d.status || null,
+          rounds: (d.settings && d.settings.rounds) || null,
+          teams: (d.settings && d.settings.teams) || lg.total_rosters || null,
+          kind: pt === 1 ? 'rookie' : pt === 2 ? 'vets' : 'all',
+          start_time: d.start_time || null,
+          current: lid === leagueId,
+        });
+      }
+      lid = lg.previous_league_id || null;
+    }
+    out.sort((a, b) => String(b.season || '').localeCompare(String(a.season || '')) || ((b.start_time || 0) - (a.start_time || 0)));
+    res.json({ drafts: out });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not load draft history from Sleeper' });
+  }
+});
+
+// The finished board of ANY Sleeper draft — including prior-season dynasty drafts. Player names come
+// straight from each pick's metadata (no player-table join needed), so archived rookie classes render
+// correctly no matter how old the draft is.
+//   GET /api/connect/sleeper/draft-board?draft_id=...
+connectRouter.get('/sleeper/draft-board', async (req, res) => {
+  const draftId = String(req.query.draft_id || '').trim();
+  if (!draftId) return res.status(400).json({ error: 'draft_id required' });
+  try {
+    const [draft, picksRaw] = await Promise.all([getDraft(draftId), getDraftPicks(draftId)]);
+    if (!draft) return res.status(404).json({ error: 'Draft not found' });
+    const leagueUsers = draft.league_id ? await getLeagueUsers(draft.league_id).catch(() => []) : [];
+    const nameByUser = {};
+    (leagueUsers || []).forEach((u) => { nameByUser[u.user_id] = (u.metadata && u.metadata.team_name) || u.display_name || null; });
+    const picks = (picksRaw || []).map((p) => ({
+      round: p.round,
+      pick_no: p.pick_no,
+      slot: p.draft_slot,
+      name: p.metadata ? `${p.metadata.first_name || ''} ${p.metadata.last_name || ''}`.trim() : null,
+      pos: p.metadata ? p.metadata.position : null,
+      team: p.metadata ? p.metadata.team : null,
+      by: p.picked_by ? (nameByUser[p.picked_by] || null) : null,
+    }));
+    const pt = draft.settings && draft.settings.player_type;
+    res.json({
+      draft_id: draftId,
+      season: draft.season || null,
+      status: draft.status || null,
+      type: draft.type || null,
+      rounds: (draft.settings && draft.settings.rounds) || null,
+      teams: (draft.settings && draft.settings.teams) || null,
+      kind: pt === 1 ? 'rookie' : pt === 2 ? 'vets' : 'all',
+      picks,
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not load that draft from Sleeper' });
+  }
+});
+
 // This endpoint fetches only the draft meta + picks (players list is cached in-process), so it returns in a
 // fraction of the time and can be polled aggressively. The client uses /draft once on entry for the heavy
 // context, then polls THIS for near-instant pick updates.
