@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* App fonts (the design uses Barlow Condensed for display + DM Mono for numbers). Loaded from
+   Google Fonts so they're available without bundling font files. */
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap');
+
+html, body, #root { height: 100%; margin: 0; background: #000; }
+body { font-family: Inter, system-ui, -apple-system, sans-serif; }

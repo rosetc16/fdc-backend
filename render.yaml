@@ -1,0 +1,25 @@
+# Render configuration for the static site (optional convenience — you can also set these in the
+# Render dashboard). The rewrite makes the single-page app handle its own routing.
+services:
+  - type: web
+    name: fdc-web
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      # index.html and version.json must never be cached, or a browser can keep serving the OLD app
+      # shell after a new deploy — which loads stale/mismatched JS chunks and can blank the screen.
+      # Hashed assets (JS/CSS with content hashes in the filename) are safe to cache forever.
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache, no-store, must-revalidate
+      - path: /version.json
+        name: Cache-Control
+        value: no-cache, no-store, must-revalidate
+    envVars:
+      - key: VITE_API_URL
+        sync: false
