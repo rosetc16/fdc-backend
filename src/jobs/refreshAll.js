@@ -5,6 +5,7 @@ import { syncProjections } from './syncProjections.js';
 import { syncPublishedAdp } from './syncPublishedAdp.js';
 import { harvestSleeperDrafts } from './harvestSleeperDrafts.js';
 import { refreshConsensus } from './refreshConsensus.js';
+import { pruneObservations } from './pruneObservations.js';
 import { log } from '../lib/log.js';
 
 export async function refreshAll() {
@@ -16,6 +17,10 @@ export async function refreshAll() {
   try { out.publishedAdp = await syncPublishedAdp(); } catch (e) { out.publishedAdp = { error: e.message }; log.error(e); }
   try { out.harvest = await harvestSleeperDrafts(); } catch (e) { out.harvest = { error: e.message }; log.error(e); }
   try { out.consensus = await refreshConsensus(); } catch (e) { out.consensus = { error: e.message }; log.error(e); }
+  // Prune AFTER consensus is recomputed from the full pool, so trimming never starves the numbers the board
+  // uses. This keeps adp_observations from growing without bound (the cause of the storage outage) — it self-
+  // caps every refresh instead of relying on someone remembering to click the manual cleanup button.
+  try { out.prune = await pruneObservations(); } catch (e) { out.prune = { error: e.message }; log.error(e); }
   log.info(out, 'refreshAll complete');
   return out;
 }
