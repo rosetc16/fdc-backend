@@ -483,14 +483,26 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
     });
 
     // ----- picks (mapped to names) -----
+    // Resolve each pick's ACTUAL drafting team: for a traded pick, the player was selected at `draft_slot` but
+    // the pick belonged to whoever `picked_by` is. Map picked_by (user_id) → that user's own slot so the board
+    // attributes the player to the team that really made the pick, not the seat it was made from.
+    const userIdToSlot = {};
+    for (let slot = 1; slot <= teamsN; slot++) {
+      let uid = Object.keys(draftOrder).find((k) => draftOrder[k] === slot);
+      if (!uid) { const rid = slotToRoster[slot]; if (rid != null) uid = rosterOwner[rid]; }
+      if (uid) userIdToSlot[uid] = slot;
+    }
     const picks = (picksRaw || [])
       .filter((pk) => pk.player_id && pk.pick_no)
       .sort((a, b) => a.pick_no - b.pick_no)
       .map((pk) => {
         const p = players[pk.player_id] || {};
         const name = p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || (p.position === 'DEF' ? `${pk.player_id} DST` : pk.player_id);
+        // team_slot = the slot of the team that OWNED the pick (picked_by), falling back to the physical
+        // draft_slot when picked_by can't be resolved. This is the trade-accurate team attribution.
+        const ownerSlot = (pk.picked_by && userIdToSlot[pk.picked_by]) ? userIdToSlot[pk.picked_by] : pk.draft_slot;
         return {
-          pick_no: pk.pick_no, round: pk.round, draft_slot: pk.draft_slot,
+          pick_no: pk.pick_no, round: pk.round, draft_slot: pk.draft_slot, team_slot: ownerSlot,
           player_id: pk.player_id, name, pos: p.position || null, team: p.team || null,
           picked_by: pk.picked_by || null,
         };
