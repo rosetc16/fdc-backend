@@ -498,11 +498,17 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
       .map((pk) => {
         const p = players[pk.player_id] || {};
         const name = p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || (p.position === 'DEF' ? `${pk.player_id} DST` : pk.player_id);
-        // team_slot = the slot of the team that OWNED the pick (picked_by), falling back to the physical
-        // draft_slot when picked_by can't be resolved. This is the trade-accurate team attribution.
-        const ownerSlot = (pk.picked_by && userIdToSlot[pk.picked_by]) ? userIdToSlot[pk.picked_by] : pk.draft_slot;
+        // picked_by_slot = the slot of the team that ACTUALLY made this selection (via picked_by). For a pick
+        // that changed hands, this differs from the physical draft_slot. We DON'T move the player off draft_slot
+        // (the board keeps every pick in its true board position, like Sleeper); instead the frontend compares
+        // picked_by_slot vs the slot's natural owner to flag a traded pick and name who drafted it.
+        const pickedBySlot = (pk.picked_by && userIdToSlot[pk.picked_by]) ? userIdToSlot[pk.picked_by] : null;
         return {
-          pick_no: pk.pick_no, round: pk.round, draft_slot: pk.draft_slot, team_slot: ownerSlot,
+          pick_no: pk.pick_no, round: pk.round, draft_slot: pk.draft_slot,
+          // team_slot stays = draft_slot so the player renders in its real board position (no column-jumping).
+          team_slot: pk.draft_slot,
+          picked_by_slot: pickedBySlot,     // who actually drafted it (slot); differs from draft_slot iff traded
+          pickedByName: (pickedBySlot && slotName[pickedBySlot]) ? slotName[pickedBySlot] : null,
           player_id: pk.player_id, name, pos: p.position || null, team: p.team || null,
           picked_by: pk.picked_by || null,
         };
