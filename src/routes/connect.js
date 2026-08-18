@@ -222,10 +222,22 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     ]);
     if (!league) return res.status(404).json({ error: 'League not found on Sleeper' });
 
-    // Determine the week to show: explicit query, else the current NFL week (min 1).
+    // Determine the week to show: explicit query wins. Otherwise pick the CURRENT/UPCOMING regular-season week.
+    // Sleeper's /state/nfl is fiddly around the season boundary: in the preseason `week` can read 1 OR 2 (the
+    // preseason leg), while `display_week` is what Sleeper itself shows users. So: if we're not in the regular
+    // season yet, always start at regular-season week 1 (the upcoming games). In-season, prefer display_week,
+    // fall back to week. Always clamp to a real regular-season week (1..18) so the hub never opens on a phantom
+    // "week 2" before week 1 has even happened.
     let week = Number(req.query.week || 0);
-    if (!week || Number.isNaN(week)) week = (nfl && (nfl.week || nfl.display_week)) || 1;
-    week = Math.max(1, week);
+    if (!week || Number.isNaN(week)) {
+      const seasonType = nfl && nfl.season_type;
+      if (seasonType && seasonType !== 'regular' && seasonType !== 'post') {
+        week = 1; // preseason / offseason → the upcoming games are regular-season week 1
+      } else {
+        week = (nfl && (nfl.display_week || nfl.week)) || 1;
+      }
+    }
+    week = Math.min(18, Math.max(1, week));
     const season = (nfl && nfl.season) || String(config.activeSeason);
 
     // Which scoring field to use as a FALLBACK only (if a player has no raw stats to score).
@@ -370,6 +382,9 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       leagueName: league.name,
       cfg,
       week,
+      defaultWeek: week,   // the current/upcoming week the hub should open on
+      minWeek: 1,
+      maxWeek: 18,
       season,
       scoringField: ptsField,
       seasonType: nfl ? nfl.season_type : null,
