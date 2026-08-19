@@ -5,28 +5,7 @@ import { normName } from '../lib/names.js';
 import { q, tx } from '../lib/db.js';
 import { log } from '../lib/log.js';
 import { recordJob } from '../lib/jobs.js';
-
-// Official 2026 NFL bye weeks (source: NFL.com schedule release). Sleeper's player feed doesn't reliably carry
-// bye weeks, and byes are a property of the TEAM's schedule, so we resolve each player's bye from his team.
-// Update this map each season when the schedule is released. Keys are Sleeper team abbreviations.
-const BYES_2026 = {
-  CAR: 5, KC: 5,
-  CIN: 6, DET: 6, MIA: 6, MIN: 6,
-  BUF: 7, JAX: 7, LAC: 7, WAS: 7,
-  HOU: 8, NO: 8, NYG: 8, SF: 8,
-  PIT: 9, TEN: 9,
-  CHI: 10, DEN: 10, PHI: 10, TB: 10,
-  ATL: 11, CLE: 11, GB: 11, LAR: 11, NE: 11, SEA: 11,
-  BAL: 13, IND: 13, LV: 13, NYJ: 13,
-  ARI: 14, DAL: 14,
-};
-// Normalize a few team-abbreviation variants Sleeper/imports may use to our map's keys.
-const TEAM_ALIAS = { LA: 'LAR', STL: 'LAR', SD: 'LAC', OAK: 'LV', WSH: 'WAS', JAC: 'JAX', ARZ: 'ARI', LVR: 'LV' };
-const byeForTeam = (team) => {
-  if (!team) return null;
-  const t = String(team).toUpperCase();
-  return BYES_2026[t] != null ? BYES_2026[t] : (TEAM_ALIAS[t] && BYES_2026[TEAM_ALIAS[t]] != null ? BYES_2026[TEAM_ALIAS[t]] : null);
-};
+import { byeForTeam } from '../lib/byeWeeks.js';
 
 export async function syncPlayers() {
   const started = Date.now();

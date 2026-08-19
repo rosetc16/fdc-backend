@@ -19,8 +19,14 @@ adminRouter.post('/run-job', async (req, res) => {
     if (job === 'refresh') {
       const { refreshAll } = await import('../jobs/refreshAll.js');
       detail = await refreshAll();
+    } else if (job === 'byes') {
+      // FAST: set bye_week for every team via ~9 bulk UPDATEs. This is the one to run after a schedule
+      // release — it finishes in well under a second, unlike the full player sync which can overrun the
+      // request timeout.
+      const { syncByeWeeks } = await import('../lib/byeWeeks.js');
+      detail = await syncByeWeeks(q);
     } else if (job === 'players') {
-      // Run just the player identity sync — fast, and the way to populate bye_week after a schedule release.
+      // FULL identity sync (~11k players). Can be slow; prefer the nightly cron or the 'byes' job for byes.
       const { syncPlayers } = await import('../jobs/syncPlayers.js');
       detail = await syncPlayers();
     } else if (job === 'published') {
