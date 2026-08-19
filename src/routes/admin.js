@@ -19,6 +19,10 @@ adminRouter.post('/run-job', async (req, res) => {
     if (job === 'refresh') {
       const { refreshAll } = await import('../jobs/refreshAll.js');
       detail = await refreshAll();
+    } else if (job === 'players') {
+      // Run just the player identity sync — fast, and the way to populate bye_week after a schedule release.
+      const { syncPlayers } = await import('../jobs/syncPlayers.js');
+      detail = await syncPlayers();
     } else if (job === 'published') {
       const { syncPublishedAdp } = await import('../jobs/syncPublishedAdp.js');
       detail = await syncPublishedAdp();
