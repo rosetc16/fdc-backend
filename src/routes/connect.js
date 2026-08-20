@@ -525,6 +525,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
           team_slot: pk.draft_slot,
           picked_by_slot: pickedBySlot,     // who actually drafted it (slot); differs from draft_slot iff traded
           pickedByName: (pickedBySlot && slotName[pickedBySlot]) ? slotName[pickedBySlot] : null,
+          is_keeper: !!(pk.is_keeper || (pk.metadata && (pk.metadata.is_keeper === 'true' || pk.metadata.is_keeper === true))),
           player_id: pk.player_id, name, pos: p.position || null, team: p.team || null,
           picked_by: pk.picked_by || null,
         };
