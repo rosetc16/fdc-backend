@@ -2,10 +2,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { q } from '../lib/db.js';
-import { requireAuth } from '../lib/auth.js';
+import { requireAuth, requirePaid } from '../lib/auth.js';
 
 export const leaguesRouter = Router();
 leaguesRouter.use(requireAuth);
+leaguesRouter.use(requirePaid); // saved leagues & mocks require a pass or comp
 
 // list my leagues
 leaguesRouter.get('/', async (req, res) => {

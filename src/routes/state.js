@@ -12,10 +12,11 @@
 //    migration step before this endpoint works.
 import { Router } from 'express';
 import { q } from '../lib/db.js';
-import { requireAuth } from '../lib/auth.js';
+import { requireAuth, requirePaid } from '../lib/auth.js';
 
 export const stateRouter = Router();
 stateRouter.use(requireAuth);
+stateRouter.use(requirePaid); // cross-device state sync requires a pass or comp
 
 let ensured = false;
 async function ensureTable() {

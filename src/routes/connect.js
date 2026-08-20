@@ -4,7 +4,7 @@
 // "Live" sync is the frontend polling the /draft endpoint every few seconds during a draft.
 import { Router } from 'express';
 import { config } from '../lib/config.js';
-import { requireAuth } from '../lib/auth.js';
+import { requireAuth, requirePaid } from '../lib/auth.js';
 import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
@@ -15,6 +15,7 @@ import { getDefVsPos } from '../lib/defVsPos.js';
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
+connectRouter.use(requirePaid); // full app data (Sleeper connect, team hub, draft) requires a pass or comp
 
 // Lazily make sure the Sleeper-link columns exist, so linking works even if a manual migration
 // hasn't been run yet (the user is non-technical; we don't want to require a shell step).
