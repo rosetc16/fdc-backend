@@ -58,10 +58,11 @@ export function requireAdmin(req, res, next) {
   next();
 }
 
-// Require an active paid (or comped) subscription.
+// Require an active paid (or comped) subscription. Admins always pass (for testing/support).
 export function requirePaid(req, res, next) {
   if (!req.user) return res.status(401).json({ error: 'Sign in required' });
-  const active = req.user.comp || (req.user.paid_until && new Date(req.user.paid_until) > new Date());
+  const isAdmin = req.user.is_admin || isAdminEmail(req.user.email);
+  const active = isAdmin || req.user.comp || (req.user.paid_until && new Date(req.user.paid_until) > new Date());
   if (!active) return res.status(402).json({ error: 'Season pass required' });
   next();
 }
