@@ -436,6 +436,7 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
   const leagueId = String(req.query.league_id || '').trim();
   if (!leagueId) return res.status(400).json({ error: 'league_id required' });
   const username = String(req.query.username || '').trim().toLowerCase();
+  const userIdParam = String(req.query.user_id || '').trim();
   try {
     const league = await getLeague(leagueId);
     if (!league) return res.status(404).json({ error: 'League not found' });
@@ -473,8 +474,14 @@ connectRouter.get('/sleeper/draft', async (req, res) => {
     const slotName = {}; // slot -> name
     const slotOwner = {}; // slot -> Sleeper username (display_name), for showing "(username)" next to team names
     let yourSlot = null, yourUserId = null;
-    // resolve the connecting user's id from username (via leagueUsers display_name match)
-    if (username) {
+    // resolve the connecting user's id: prefer an explicit user_id (exact + reliable), else match by username
+    // against display_name. Matching by display_name alone is fragile (casing, name changes), which left
+    // yourSlot null and the app stuck on a stale/default slot; the user_id path fixes that.
+    if (userIdParam) {
+      const me = (leagueUsers || []).find((u) => String(u.user_id) === userIdParam);
+      if (me) yourUserId = me.user_id;
+    }
+    if (!yourUserId && username) {
       const me = (leagueUsers || []).find((u) => (u.display_name || '').toLowerCase() === username);
       if (me) yourUserId = me.user_id;
     }
