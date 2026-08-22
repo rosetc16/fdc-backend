@@ -243,3 +243,16 @@ CREATE TABLE IF NOT EXISTS app_meta (
   updated_at  TIMESTAMPTZ DEFAULT now()
 );
 
+
+-- ============================================================ PASSWORD RESETS
+-- Single-use, short-lived tokens for the "forgot password" flow. Only the SHA-256 HASH of the token is
+-- stored, so a leaked row cannot be replayed as a working reset link. The auth route creates this table
+-- lazily on first use too, so an existing deploy does not need a manual migration step.
+CREATE TABLE IF NOT EXISTS password_resets (
+  token_hash  TEXT PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  used_at     TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS password_resets_user_idx ON password_resets(user_id);
