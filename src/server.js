@@ -144,7 +144,29 @@ server = app.listen(config.port, () => {
       try { const { harvestSleeperDrafts } = await import('./jobs/harvestSleeperDrafts.js'); log.info('cron: periodic harvest pass'); const r = await harvestSleeperDrafts(); log.info(r, 'cron: harvest pass done'); }
       catch (e) { log.error(e, 'cron periodic harvest failed'); }
     });
-    log.info('in-process daily + midday cron scheduled');
+    // ⚠ DATABASE PRUNE — nightly, right after the full refresh. adp_observations grows with every harvest
+    // pass, and on 2026-08-05 it filled the Postgres plan, suspended the database and took the whole site
+    // down. pruneObservations has existed since then but was never actually scheduled, so nothing has been
+    // trimming it. Keeps a trailing ADP_KEEP_DAYS window and a per-format floor of ADP_MIN_SAMPLE rows.
+    cron.schedule('45 4 * * *', async () => {
+      try {
+        const { pruneObservations } = await import('./jobs/pruneObservations.js');
+        log.info('cron: nightly adp_observations prune');
+        const r = await pruneObservations();
+        log.info(r, 'cron: prune done');
+      } catch (e) { log.error(e, 'cron prune failed'); }
+    });
+    // WEEKLY BRIEF — Tuesday morning, after waivers have run and the new NFL week has rolled over. Emails
+    // each linked user what needs attention in their leagues. No-ops unless RESEND_API_KEY is set.
+    cron.schedule('0 13 * * 2', async () => {
+      try {
+        const { sendWeeklyBriefs } = await import('./jobs/weeklyBrief.js');
+        log.info('cron: weekly brief send');
+        const r = await sendWeeklyBriefs();
+        log.info(r, 'cron: weekly brief done');
+      } catch (e) { log.error(e, 'cron weekly brief failed'); }
+    });
+    log.info('in-process daily + midday + prune + weekly-brief cron scheduled');
     // Startup catch-up: ensure published ADP exists shortly after boot (non-blocking).
     setTimeout(async () => {
       try {

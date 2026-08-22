@@ -11,7 +11,8 @@ adminRouter.use(requireAdmin);
 
 // Trigger a data job from the browser (admin only) — so you don't need the Render Shell. Returns the
 // job's result detail (observationsWritten, etc.) so you can confirm it actually wrote data.
-//   POST /api/admin/run-job  { job: 'adp' | 'published' | 'refresh' }
+//   POST /api/admin/run-job  { job: 'adp' | 'published' | 'refresh' | 'byes' | 'players' | 'harvest'
+//                              | 'rebuild-trends' | 'harvest-more' | 'prune' | 'weekly-brief-dry' | 'weekly-brief' }
 adminRouter.post('/run-job', async (req, res) => {
   const job = String(req.body.job || 'adp');
   try {
@@ -51,6 +52,16 @@ adminRouter.post('/run-job', async (req, res) => {
       // Click this repeatedly to grow the pool in safe increments.
       const { harvestSleeperDrafts } = await import('../jobs/harvestSleeperDrafts.js');
       detail = await harvestSleeperDrafts({ maxDrafts: 120 });
+    } else if (job === 'prune') {
+      // Trim adp_observations by hand. The same job now runs nightly at 4:45; this is here so the table can
+      // be brought back under control immediately without waiting for the cron (which is what was needed
+      // when the DB filled up and suspended on 2026-08-05).
+      const { pruneObservations } = await import('../jobs/pruneObservations.js');
+      detail = await pruneObservations();
+    } else if (job === 'weekly-brief-dry' || job === 'weekly-brief') {
+      // Dry run logs what WOULD be sent, to whom, without sending. Use it before turning mail on.
+      const { sendWeeklyBriefs } = await import('../jobs/weeklyBrief.js');
+      detail = await sendWeeklyBriefs({ dryRun: job === 'weekly-brief-dry' });
     } else {
       const { refreshAdpOnly } = await import('../jobs/refreshAdpOnly.js');
       detail = await refreshAdpOnly();

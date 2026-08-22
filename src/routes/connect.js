@@ -203,6 +203,46 @@ function cfgFromLeague(league, draft) {
 // player_ids (not enriched player objects) so the frontend can join them against the player pack it already
 // loads — same projections/VBD the draft board uses, no duplicated assembly here.
 //
+// ---- REMAINING-SCHEDULE CACHE ---------------------------------------------------------------------
+// Sleeper only exposes matchups one week at a time, so building the rest of a season costs one call per
+// remaining week. A schedule is fixed for the year, so we do that once per league per season and keep it
+// in memory. Without the cache this would be ~10 extra Sleeper calls on EVERY hub open, for every user.
+const _schedCache = new Map(); // `${leagueId}:${season}` -> { at, weeks:{ [week]: [[a,b],...] } }
+const SCHED_TTL_MS = 6 * 3600 * 1000;
+
+async function getRemainingSchedule(leagueId, season, fromWeek, toWeek) {
+  if (!(toWeek >= fromWeek)) return null;
+  const key = `${leagueId}:${season}`;
+  const hit = _schedCache.get(key);
+  const cached = (hit && Date.now() - hit.at < SCHED_TTL_MS) ? hit.weeks : {};
+  const need = [];
+  for (let w = fromWeek; w <= toWeek; w++) if (!cached[w]) need.push(w);
+
+  if (need.length) {
+    const fetched = await Promise.all(need.map((w) =>
+      getMatchups(leagueId, w).then((ms) => [w, ms]).catch(() => [w, null])));
+    for (const [w, ms] of fetched) {
+      if (!Array.isArray(ms) || !ms.length) continue;
+      // Group rosters by matchup_id; each id holds exactly the two teams playing that week.
+      const byMatch = new Map();
+      ms.forEach((m) => {
+        if (m == null || m.matchup_id == null || m.roster_id == null) return;
+        const arr = byMatch.get(m.matchup_id) || [];
+        arr.push(m.roster_id);
+        byMatch.set(m.matchup_id, arr);
+      });
+      const pairs = [];
+      byMatch.forEach((ids) => { if (ids.length === 2) pairs.push([ids[0], ids[1]]); });
+      if (pairs.length) cached[w] = pairs;
+    }
+    _schedCache.set(key, { at: Date.now(), weeks: cached });
+  }
+  // Only hand back the weeks we were asked for, and only if we actually resolved some.
+  const out = {};
+  for (let w = fromWeek; w <= toWeek; w++) if (cached[w]) out[w] = cached[w];
+  return Object.keys(out).length ? out : null;
+}
+
 // GET /api/connect/sleeper/team-hub?league_id=...[&week=N]
 //   -> { league:{cfg,name}, week, myRosterId, rostered:[ids], teams:[{rosterId,ownerName,teamName,players,
 //        starters,record,pointsFor,pointsAgainst}], matchup:{me,opp}|null, standings:[...] }
@@ -347,6 +387,9 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
         record: { wins: Number(s.wins || 0), losses: Number(s.losses || 0), ties: Number(s.ties || 0) },
         pointsFor: Number(s.fpts || 0) + Number(s.fpts_decimal || 0) / 100,
         pointsAgainst: Number(s.fpts_against || 0) + Number(s.fpts_against_decimal || 0) / 100,
+        // FAAB actually remaining for this team. The hub prices waiver bids as a share of what's LEFT, so
+        // without this it can only show a percentage; with it, it shows dollars.
+        faabUsed: s.waiver_budget_used != null ? Number(s.waiver_budget_used) : null,
       };
     });
 
@@ -370,6 +413,28 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       record: t.record, pointsFor: Math.round(t.pointsFor * 10) / 10, pointsAgainst: Math.round(t.pointsAgainst * 10) / 10,
       isMe: t.rosterId === myRosterId,
     }));
+
+    // ---- League SHAPE: playoff structure and FAAB budget -------------------------------------------
+    // The hub's playoff odds need to know how many weeks of regular season are left and how many teams
+    // make it; the waiver bids need the budget. All of it is on the Sleeper league settings.
+    const ls = league.settings || {};
+    const playoffStartWeek = Number(ls.playoff_week_start) || 15;
+    const regularSeasonWeeks = Math.max(1, playoffStartWeek - 1);
+    const playoffTeams = Number(ls.playoff_teams) || null;
+    const faabBudget = Number(ls.waiver_budget) > 0 ? Number(ls.waiver_budget) : null;
+    const faabLeft = {};
+    if (faabBudget != null) {
+      teams.forEach((t) => { faabLeft[t.rosterId] = Math.max(0, faabBudget - (t.faabUsed || 0)); });
+    }
+
+    // ---- REMAINING SCHEDULE ------------------------------------------------------------------------
+    // Playoff odds are only honest if they're simulated against the games each team actually has left.
+    // Sleeper exposes matchups one week at a time, so we fetch the rest of the regular season once and
+    // cache it — a schedule doesn't change, and this runs on every hub load otherwise.
+    let schedule = null;
+    try {
+      schedule = await getRemainingSchedule(leagueId, season, week, regularSeasonWeeks);
+    } catch { schedule = null; }
 
     // Best-effort cfg from the league so the hub knows starting requirements/scoring.
     let cfg = null;
@@ -395,6 +460,12 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       teams,
       matchup,
       standings,
+      playoffStartWeek,
+      regularSeasonWeeks,
+      playoffTeams,
+      faabBudget,
+      faabLeft,      // { [rosterId]: dollars remaining }
+      schedule,      // { [week]: [[rosterIdA, rosterIdB], ...] } for the rest of the regular season
       weekly,        // { [player_id]: { pts, opp, team, date, gameId, inj, ... } } for THIS week
       matchupDifficulty,  // { [defTeam]: { QB/RB/WR/TE: { rank, of, tier, pg } } } season-to-date pts allowed/game
     });

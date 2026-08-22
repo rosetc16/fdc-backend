@@ -3,8 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Fantasy Draft Compass — backend API + data-aggregation layer",
-  "engines": { "node": ">=20" },
+  "description": "Fantasy Draft Compass \u2014 backend API + data-aggregation layer",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
@@ -13,7 +15,11 @@
     "published-adp": "node src/jobs/syncPublishedAdp.js",
     "adp": "node src/jobs/refreshAdpOnly.js",
     "refresh": "node src/jobs/refreshAll.js",
-    "test:smoke": "node scripts/smoke.js"
+    "test:smoke": "node scripts/smoke.js",
+    "test:selftest": "node scripts/selftest.js",
+    "brief": "node src/jobs/weeklyBrief.js",
+    "brief:dry": "node src/jobs/weeklyBrief.js --dry",
+    "prune": "node src/jobs/pruneObservations.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
