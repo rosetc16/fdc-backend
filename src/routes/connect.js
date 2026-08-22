@@ -2,6 +2,9 @@
 //  GET  /api/connect/sleeper/leagues?username=...   -> that user's NFL leagues for the active season
 //  GET  /api/connect/sleeper/draft?league_id=...    -> league's draft config + picks so far (names mapped)
 // "Live" sync is the frontend polling the /draft endpoint every few seconds during a draft.
+//
+//  GET  /api/connect/espn/league?league_id=...     -> settings-only import for a PUBLIC ESPN league.
+//       Settings only, by design: ESPN has no live pick feed, so draft night there stays manual entry.
 import { Router } from 'express';
 import { config } from '../lib/config.js';
 import { requireAuth, requirePaid } from '../lib/auth.js';
@@ -12,6 +15,7 @@ import {
   getWeeklyProjections,
 } from '../lib/sleeper.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
+import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
@@ -816,5 +820,25 @@ connectRouter.get('/sleeper/picks', async (req, res) => {
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
+
+
+// ---- ESPN public-league import -------------------------------------------------------------------
+// One call, settings only. Everything about why this is public-league-only and what it deliberately
+// does not do lives in src/lib/espn.js — read that before changing this.
+//   GET /api/connect/espn/league?league_id=123456&season=2026
+connectRouter.get('/espn/league', async (req, res) => {
+  const leagueId = String(req.query.league_id || '').trim();
+  const season = Number(req.query.season || config.activeSeason);
+  if (!leagueId) return res.status(400).json({ error: 'league_id required' });
+  try {
+    const raw = await fetchEspnLeague(leagueId, season);
+    const mapped = mapEspnLeague(raw, { season });
+    res.json({ league_id: leagueId, ...mapped });
+  } catch (e) {
+    const status = e && e.status ? e.status : 502;
+    // The message on these errors is written for the user, not for a log line — pass it through.
+    res.status(status).json({ error: String((e && e.message) || 'ESPN import failed'), code: (e && e.code) || null });
   }
 });

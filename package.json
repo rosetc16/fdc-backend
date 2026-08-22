@@ -19,7 +19,9 @@
     "test:selftest": "node scripts/selftest.js",
     "brief": "node src/jobs/weeklyBrief.js",
     "brief:dry": "node src/jobs/weeklyBrief.js --dry",
-    "prune": "node src/jobs/pruneObservations.js"
+    "prune": "node src/jobs/pruneObservations.js",
+    "test:espn": "node scripts/espn.test.js",
+    "test": "node scripts/selftest.js && node scripts/espn.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
