@@ -55,11 +55,29 @@ const daysAgo = (d) => new Date(NOW - d * 86400000).toISOString();
 {
   const { injuries, warnings } = mapEspnInjuries({ items: [
     { $ref: 'https://sports.core.api.espn.com/v2/…/injuries/1' },      // never expanded
-    { status: 'Out' },                                                  // no athlete to attach it to
   ] }, { now: NOW });
   assert.strictEqual(injuries.length, 0);
-  assert.deepStrictEqual(warnings.sort(), ['no-athlete-id', 'unexpanded-ref']);
-  ok('4 · ⭐ unreadable rows are COUNTED, so "no injuries" can be told apart from "we could not read them"');
+  assert.ok(warnings.includes('unexpanded-ref'), 'links-instead-of-data should be diagnosed: ' + warnings);
+  ok('4 · ⭐ being handed $ref links instead of data is diagnosed, not read as "nobody is hurt"');
+
+  // ⭐ THE FAILURE THAT SHIPPED: an envelope we do not recognise returned zero injuries and zero warnings,
+  // so the job logged 32 teams read, 0 problems — and nobody could tell it had understood nothing.
+  const un = mapEspnInjuries({ timestamp: 'x', status: 'success', season: {}, somethingNew: [] }, { now: NOW });
+  assert.strictEqual(un.injuries.length, 0);
+  assert.ok(un.warnings.some((w) => w.startsWith('shape-unrecognized')),
+    'an unrecognised shape must warn: ' + JSON.stringify(un.warnings));
+  assert.ok(un.warnings[0].includes('somethingNew'), 'the warning should name the keys it actually saw');
+  ok('4b · ⭐⭐ an unrecognised envelope WARNS and names the keys it saw, instead of reporting success');
+
+  // And the shape that actually broke: records nested inside a per-team group.
+  const nested = mapEspnInjuries({ injuries: [
+    { id: '25', displayName: 'San Francisco 49ers', injuries: [
+      { athlete: { id: '111' }, status: 'Questionable', date: daysAgo(1), details: { type: 'Calf' }, shortComment: 'Limited.' },
+    ] },
+  ] }, { now: NOW });
+  assert.strictEqual(nested.injuries.length, 1, 'nested team groups must be found: ' + JSON.stringify(nested.warnings));
+  assert.strictEqual(nested.injuries[0].part, 'Calf');
+  ok('4c · ⭐ injury records nested inside a per-team group are found — the shape that returned nothing');
 
   for (const junk of [null, undefined, {}, [], 'nonsense', 42, { items: null }]) {
     assert.doesNotThrow(() => mapEspnInjuries(junk, { now: NOW }), `threw on ${JSON.stringify(junk)}`);
@@ -131,4 +149,4 @@ const daysAgo = (d) => new Date(NOW - d * 86400000).toISOString();
   ok('11 · a healthy player produces no injury record at all');
 }
 
-console.log(`\n${pass}/11 injury checks passed`);
+console.log(`\n${pass}/13 injury checks passed`);

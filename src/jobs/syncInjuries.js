@@ -61,20 +61,27 @@ export async function syncInjuries(opts = {}) {
 
   // ---- ESPN, one call per team ----------------------------------------------------------------------
   const byEspnId = new Map();
-  let teamsOk = 0, teamsFailed = 0, unreadable = 0;
+  let teamsOk = 0, teamsFailed = 0, espnInjuriesSeen = 0;
+  const unreadable = [];   // the actual warning strings, so an unrecognised shape names itself
   for (const teamId of ESPN_TEAM_IDS) {
     const j = await getJson(ESPN_TEAM_INJURIES(teamId));
     if (!j) { teamsFailed++; continue; }
     const { injuries, warnings } = mapEspnInjuries(j, { now });
-    unreadable += warnings.length;
+    warnings.forEach((w) => unreadable.push(w));
+    espnInjuriesSeen += injuries.length;
     injuries.forEach((inj) => byEspnId.set(String(inj.espnId), inj));
     teamsOk++;
   }
 
   // ---- merge and write -------------------------------------------------------------------------------
-  let wrote = 0, withDetail = 0;
+  // Count what each SOURCE actually supplied, not just the total written. The first production run reported
+  // "530 flagged, 530 wrote, 32 teams ok" and looked like a success while delivering nothing — because the
+  // only number that mattered (how many players ended up with any detail) was zero and nothing said why.
+  let wrote = 0, withDetail = 0, sleeperHadDetail = 0, espnMatched = 0;
   for (const p of players) {
+    if (p.injury_body_part || p.injury_notes) sleeperHadDetail++;
     const espn = p.espn_id ? byEspnId.get(String(p.espn_id)) || null : null;
+    if (espn) espnMatched++;
     const merged = mergeInjury(p, espn, { now });
     if (!merged) continue;
     if (merged.sourced) withDetail++;
@@ -87,14 +94,30 @@ export async function syncInjuries(opts = {}) {
     wrote++;
   }
 
+  // A run that understood NOTHING must not read as a clean success. These three lines are what turn the
+  // result box from "it worked" into an actual diagnosis.
+  const shapeProblem = unreadable.some((w) => String(w).startsWith('shape-unrecognized'));
+  const hints = [];
+  if (teamsOk > 0 && espnInjuriesSeen === 0) {
+    hints.push(shapeProblem
+      ? `ESPN answered ${teamsOk} teams but the response shape was not recognised (${[...new Set(unreadable)].slice(0, 3).join(' | ')}) — the mapper needs updating.`
+      : `ESPN answered ${teamsOk} teams and reported no injuries at all, which is implausible — treat as a source problem.`);
+  }
+  if (players.length > 0 && sleeperHadDetail === 0) {
+    hints.push('Your platform sent designations but no body part or note for anyone — run "Full refresh" (the player sync) first; that is what fills those fields.');
+  }
   const detail = {
     flagged: players.length, wrote, withDetail,
-    espnTeamsOk: teamsOk, espnTeamsFailed: teamsFailed, espnUnreadableRows: unreadable,
+    sleeperHadDetail, espnMatched, espnInjuriesSeen,
+    espnTeamsOk: teamsOk, espnTeamsFailed: teamsFailed,
+    espnWarnings: [...new Set(unreadable)].slice(0, 6),
+    ...(hints.length ? { hints } : {}),
     ms: Date.now() - started,
   };
   // Worth logging loudly: if ESPN starts failing wholesale, the app quietly degrades to Sleeper-only
   // detail and nobody would otherwise notice.
-  if (teamsFailed > teamsOk) log.error(detail, 'syncInjuries: ESPN mostly unreachable — Sleeper detail only');
+  if (hints.length) log.error(detail, 'syncInjuries: ran, but delivered no detail — see hints');
+  else if (teamsFailed > teamsOk) log.error(detail, 'syncInjuries: ESPN mostly unreachable — Sleeper detail only');
   else log.info(detail, 'syncInjuries done');
   await recordJob('syncInjuries', true, detail);
   return detail;

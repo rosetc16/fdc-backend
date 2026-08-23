@@ -90,5 +90,18 @@ assert.ok(jobs.length >= 2, 'the job did not record its runs');
 assert.ok(jobs.every((j) => j.ok), 'a run recorded itself as failed');
 ok('7 · every run is recorded, so a job that quietly stops is visible');
 
-console.log(`\n${pass}/7 database-backed injury checks passed`);
+// ---- 8. ⭐ THE RUN THAT LOOKED LIKE A SUCCESS -------------------------------------------------------------
+// Production reported: 530 flagged, 530 wrote, 32 ESPN teams ok, 0 unreadable — and withDetail: 0. Every
+// number said "fine" while the feature delivered nothing. A job that can deliver nothing must be able to
+// say WHY, in the result box, without anyone reading server logs.
+{
+  assert.strictEqual(detail.withDetail, 0, 'fixture has no detail available, so this run should report none');
+  assert.ok(Array.isArray(detail.hints) && detail.hints.length, 'a run that delivered nothing gave no hint');
+  assert.ok(detail.hints.some((h) => /Full refresh|player sync/i.test(h)),
+    'it should name the missing player sync: ' + JSON.stringify(detail.hints));
+  assert.strictEqual(detail.sleeperHadDetail, 0, 'it should report how much the platform actually supplied');
+  ok('8 · ⭐⭐ a run that delivers no detail explains itself in the result, instead of reporting success');
+}
+
+console.log(`\n${pass}/8 database-backed injury checks passed`);
 process.exit(0);

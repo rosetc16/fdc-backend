@@ -53,17 +53,70 @@ export function normalizeDesignation(raw) {
 // without following refs, and returns null for anything it cannot read rather than guessing.
 //
 // Accepts either { items: [ ...injury objects ] } or a bare array, because the two ESPN hosts differ.
+// FIND THE INJURY RECORDS WHEREVER THEY ARE.
+//
+// The first version assumed the envelope: { items: [...] } or { injuries: [...] }. Against the real
+// endpoint it matched NOTHING and returned an empty list with no warnings — which the job then reported as
+// a clean success. 32 teams read, 0 injuries, 0 problems. That is the silent-fallback failure this codebase
+// has been bitten by twice before, and it wasted a whole deploy cycle.
+//
+// So it no longer guesses a path. ESPN's team-injuries response nests the real records inside a per-team
+// group, and that nesting has changed before. Instead of encoding one shape, this WALKS the payload and
+// collects every object that looks like an injury — one carrying an athlete with an id. Depth- and
+// node-capped so a hostile or huge payload can't spin.
+function collectInjuryNodes(root, cap = 4000, maxDepth = 8) {
+  const found = [];
+  let refsSeen = 0;      // $ref links we were given instead of data — a distinct, actionable condition
+  const seen = new Set();
+  // A QUEUE, not a stack: popping reverses document order, so the first injury in the payload came out
+  // last and anything downstream that assumes "first" meant "first" was quietly wrong.
+  const queue = [[root, 0]];
+  let head = 0, visited = 0;
+  while (head < queue.length && visited < cap) {
+    const [node, depth] = queue[head++];
+    if (!node || typeof node !== 'object' || depth > maxDepth) continue;
+    if (seen.has(node)) continue;
+    seen.add(node);
+    visited++;
+    if (Array.isArray(node)) {
+      for (const child of node) queue.push([child, depth + 1]);
+      continue;
+    }
+    // An injury record is an object with an athlete (or athleteId) AND some notion of status/type.
+    const hasAthlete = (node.athlete && typeof node.athlete === 'object' && node.athlete.id != null)
+      || node.athleteId != null
+      || (node.player && typeof node.player === 'object' && node.player.id != null);
+    const hasStatus = node.status != null || node.type != null || node.details != null
+      || node.longComment != null || node.shortComment != null;
+    if (hasAthlete && hasStatus) { found.push(node); continue; }   // don't descend into a matched record
+    if (node.$ref && !hasAthlete) refsSeen++;
+    for (const k of Object.keys(node)) queue.push([node[k], depth + 1]);
+  }
+  found.refsSeen = refsSeen;
+  return found;
+}
+
 export function mapEspnInjuries(payload, opts = {}) {
   const now = opts.now != null ? opts.now : Date.now();
-  const items = Array.isArray(payload) ? payload
-    : (payload && Array.isArray(payload.items)) ? payload.items
-    : (payload && Array.isArray(payload.injuries)) ? payload.injuries
-    : [];
   const out = [];
   const warnings = [];
 
+  const items = collectInjuryNodes(payload);
+  if (!items.length) {
+    // Links instead of data is its own diagnosis: the endpoint answered, but with $refs we did not follow.
+    if (items.refsSeen) {
+      for (let i = 0; i < items.refsSeen; i++) warnings.push('unexpanded-ref');
+      return { injuries: out, warnings };
+    }
+    // ⭐ SAY SO. "We read the response and understood none of it" must never look like "nobody is hurt".
+    // The top-level keys are logged so the next run diagnoses the shape instead of another guess.
+    const keys = (payload && typeof payload === 'object' && !Array.isArray(payload))
+      ? Object.keys(payload).slice(0, 12) : (Array.isArray(payload) ? ['<array>'] : [typeof payload]);
+    warnings.push('shape-unrecognized:' + keys.join(','));
+    return { injuries: out, warnings };
+  }
+
   for (const it of items) {
-    if (!it || typeof it !== 'object') continue;
     // An unexpanded $ref carries no data — count it so a caller can tell "no injuries" from "we couldn't
     // read them", which are very different answers to give a user.
     if (it.$ref && !it.athlete && !it.status && !it.type) { warnings.push('unexpanded-ref'); continue; }
@@ -72,15 +125,19 @@ export function mapEspnInjuries(payload, opts = {}) {
     const espnId = ath.id != null ? String(ath.id) : (it.athleteId != null ? String(it.athleteId) : null);
     if (!espnId) { warnings.push('no-athlete-id'); continue; }
 
-    const designation = normalizeDesignation(it.status || it.type?.name || it.type?.description || null);
+    // Status arrives as a bare string on some endpoints and as a {name,description,abbreviation} object
+    // on others. Take whichever is present rather than assuming.
+    const rawStatus = typeof it.status === 'string' ? it.status
+      : (it.status && (it.status.name || it.status.description)) ? (it.status.description || it.status.name)
+      : (it.type && (it.type.description || it.type.name)) || null;
+    const designation = normalizeDesignation(rawStatus);
 
     // The detail block is where the good stuff lives: type (Hamstring), side (Right), returnDate.
     const d = it.details || it.detail || {};
-    const bodyPart = clean(d.type || it.bodyPart || null, 40);
+    const bodyPart = clean(d.type || d.location || it.bodyPart || null, 40);
     const side = clean(d.side || null, 16);
     const part = bodyPart ? (side && !/^n\/?a$/i.test(side) ? `${side} ${bodyPart}` : bodyPart) : null;
 
-    // ESPN gives several prose fields depending on endpoint; take the most specific non-empty one.
     const note = clean(it.longComment || it.shortComment || d.detail || it.comment || null, 300);
 
     const at = it.date || d.returnDate || it.lastModified || null;
