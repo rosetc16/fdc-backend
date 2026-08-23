@@ -31,7 +31,15 @@ export async function syncInjuries(opts = {}) {
 
   // The columns this job writes. Idempotent so a deploy that lands before a migration can't take the
   // whole sync down (the same defence syncPlayers uses for news_updated).
+  //
+  // ⚠ This ensures the columns it READS as well as the ones it writes. The three injury_* fields below come
+  // from syncPlayers (backend 110) — so on a database where the player sync has not run since that deploy,
+  // this job's own SELECT referenced columns that did not exist and it died before doing anything. A job
+  // must not assume another job has already run; that assumption is invisible until the day it isn't true.
   for (const col of [
+    'injury_body_part TEXT',     // read: written by syncPlayers
+    'injury_notes TEXT',         // read: written by syncPlayers
+    'injury_start_date TEXT',    // read: written by syncPlayers
     'injury_detail TEXT',        // the merged, sourced note
     'injury_part TEXT',          // body part incl. side
     'injury_return TEXT',        // only when a source supplies one

@@ -21,7 +21,7 @@
     "brief:dry": "node src/jobs/weeklyBrief.js --dry",
     "prune": "node src/jobs/pruneObservations.js",
     "test:espn": "node scripts/espn.test.js",
-    "test": "node scripts/selftest.js && node scripts/espn.test.js && node scripts/injuries.test.js && node scripts/reset.test.js",
+    "test": "node scripts/selftest.js && node scripts/espn.test.js && node scripts/injuries.test.js && node scripts/injuries.db.test.js && node scripts/reset.test.js",
     "test:reset": "node scripts/reset.test.js"
   },
   "dependencies": {

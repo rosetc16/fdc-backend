@@ -53,6 +53,23 @@ export async function syncPlayerNews() {
   const started = Date.now();
   let wrote = 0;
 
+  // ENSURE THE TABLE EXISTS. `player_news` is declared in db/schema.sql, but schema.sql is only applied by
+  // `npm run migrate`, which is a manual step nobody runs on a deploy — so on a database created before this
+  // table was added, the job died on 'relation "player_news" does not exist'. Every other job in here
+  // defends itself with idempotent ALTERs for the same reason; a table deserves the same treatment.
+  try {
+    await q(`CREATE TABLE IF NOT EXISTS player_news (
+      player_id      TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      headline       TEXT,
+      body           TEXT,
+      news_type      TEXT,
+      source         TEXT,
+      published_at   TIMESTAMPTZ,
+      updated_at     TIMESTAMPTZ DEFAULT now()
+    );`);
+    await q(`CREATE INDEX IF NOT EXISTS idx_player_news_updated ON player_news (updated_at);`);
+  } catch (e) { log.error(e, 'ensure player_news table'); }
+
   // Map espn_id -> player_id for players we care about (have an espn_id).
   const { rows: pls } = await q(
     `SELECT player_id, espn_id FROM players WHERE espn_id IS NOT NULL AND espn_id <> ''`
