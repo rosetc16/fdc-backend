@@ -19,6 +19,12 @@ export async function syncPlayers() {
   // idempotent ALTER guarantees the column is present so that can't happen.
   try { await q('ALTER TABLE players ADD COLUMN IF NOT EXISTS news_updated BIGINT;'); } catch (e) { log.error(e, 'ensure news_updated column'); }
   try { await q('ALTER TABLE players ADD COLUMN IF NOT EXISTS bye_week SMALLINT;'); } catch (e) { log.error(e, 'ensure bye_week column'); }
+  // Sleeper sends the WHOLE injury picture on every player — the body part, a note, and the date it
+  // started — and we were keeping only the one-letter designation and throwing the rest away. That detail
+  // is exactly what people otherwise go and dig for on another site, and it costs nothing to keep.
+  for (const col of ['injury_body_part TEXT', 'injury_notes TEXT', 'injury_start_date TEXT']) {
+    try { await q(`ALTER TABLE players ADD COLUMN IF NOT EXISTS ${col};`); } catch (e) { log.error(e, 'ensure ' + col); }
+  }
 
   await tx(async (client) => {
     for (const sid of ids) {
@@ -34,20 +40,24 @@ export async function syncPlayers() {
       const bye = byeForTeam(teamForBye);
       await client.query(
         `INSERT INTO players (player_id, sleeper_id, espn_id, yahoo_id, rotowire_id, sportradar_id, gsis_id,
-            full_name, norm_name, team, position, age, years_exp, injury_status, news_updated, bye_week, active, updated_at)
-         VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, now())
+            full_name, norm_name, team, position, age, years_exp, injury_status, news_updated, bye_week, active,
+            injury_body_part, injury_notes, injury_start_date, updated_at)
+         VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19, now())
          ON CONFLICT (player_id) DO UPDATE SET
             espn_id=EXCLUDED.espn_id, yahoo_id=EXCLUDED.yahoo_id, rotowire_id=EXCLUDED.rotowire_id,
             sportradar_id=EXCLUDED.sportradar_id, gsis_id=EXCLUDED.gsis_id,
             full_name=EXCLUDED.full_name, norm_name=EXCLUDED.norm_name, team=EXCLUDED.team,
             position=EXCLUDED.position, age=EXCLUDED.age, years_exp=EXCLUDED.years_exp,
             injury_status=EXCLUDED.injury_status, news_updated=EXCLUDED.news_updated,
+            injury_body_part=EXCLUDED.injury_body_part, injury_notes=EXCLUDED.injury_notes,
+            injury_start_date=EXCLUDED.injury_start_date,
             bye_week=COALESCE(EXCLUDED.bye_week, players.bye_week), active=EXCLUDED.active, updated_at=now()`,
         [sid, p.espn_id || null, p.yahoo_id || null, p.rotowire_id || null,
          p.sportradar_id || null, p.gsis_id || null,
          fullName, normName(fullName), p.team || null, pos, p.age || null,
          (p.years_exp != null ? p.years_exp : null),
-         p.injury_status || null, (p.news_updated != null ? Number(p.news_updated) : null), bye, p.active !== false]
+         p.injury_status || null, (p.news_updated != null ? Number(p.news_updated) : null), bye, p.active !== false,
+         p.injury_body_part || null, p.injury_notes || null, p.injury_start_date || null]
       );
       upserts++;
     }

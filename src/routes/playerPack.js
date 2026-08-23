@@ -160,7 +160,8 @@ playerPackRouter.get('/', async (req, res) => {
   let players;
   try {
     players = (await q(
-      `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status, news_updated
+      `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status, news_updated,
+              injury_body_part, injury_notes, injury_start_date
          FROM players
         WHERE position IN ('QB','RB','WR','TE','K','DEF','DL','LB','DB')
           AND active = true`
@@ -268,6 +269,12 @@ playerPackRouter.get('/', async (req, res) => {
       adpDegraded,                               // true = this number came from a DIFFERENT format than requested
       pubFmt: pubPick != null ? (publishedFmtById.get(pl.player_id) || null) : null, // which format gave this ADP
       inj: pl.injury_status || null,
+      // The rest of what the platform already told us about the injury. The board can then say "Hamstring,
+      // limited in practice Wednesday" instead of a bare "Q" that sends the user to another site.
+      injPart: pl.injury_body_part || null,
+      injNote: pl.injury_notes || null,
+      injSince: pl.injury_start_date || null,
+      injAt: pl.news_updated != null ? Number(pl.news_updated) : null,
       rookie: pl.years_exp != null && pl.years_exp === 0,
       stats,
       floor: proj && proj.floor_pts != null ? Number(proj.floor_pts) : null,

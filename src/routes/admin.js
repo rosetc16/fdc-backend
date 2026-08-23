@@ -12,7 +12,8 @@ adminRouter.use(requireAdmin);
 // Trigger a data job from the browser (admin only) — so you don't need the Render Shell. Returns the
 // job's result detail (observationsWritten, etc.) so you can confirm it actually wrote data.
 //   POST /api/admin/run-job  { job: 'adp' | 'published' | 'refresh' | 'byes' | 'players' | 'harvest'
-//                              | 'rebuild-trends' | 'harvest-more' | 'prune' | 'weekly-brief-dry' | 'weekly-brief' }
+//                              | 'rebuild-trends' | 'harvest-more' | 'prune' | 'news'
+//                              | 'weekly-brief-dry' | 'weekly-brief' }
 adminRouter.post('/run-job', async (req, res) => {
   const job = String(req.body.job || 'adp');
   try {
@@ -58,6 +59,12 @@ adminRouter.post('/run-job', async (req, res) => {
       // when the DB filled up and suspended on 2026-08-05).
       const { pruneObservations } = await import('../jobs/pruneObservations.js');
       detail = await pruneObservations();
+    } else if (job === 'news') {
+      // Player news / injury blurbs from ESPN. DELIBERATELY NOT in the nightly refreshAll yet: this job has
+      // never run in production, it makes up to ~120 outbound calls, and draft season is the wrong moment to
+      // find out how ESPN rate-limits us. Run it here by hand, watch the numbers, then promote it.
+      const { syncPlayerNews } = await import('../jobs/syncPlayerNews.js');
+      detail = await syncPlayerNews();
     } else if (job === 'weekly-brief-dry' || job === 'weekly-brief') {
       // Dry run logs what WOULD be sent, to whom, without sending. Use it before turning mail on.
       const { sendWeeklyBriefs } = await import('../jobs/weeklyBrief.js');
