@@ -59,6 +59,11 @@ adminRouter.post('/run-job', async (req, res) => {
       // when the DB filled up and suspended on 2026-08-05).
       const { pruneObservations } = await import('../jobs/pruneObservations.js');
       detail = await pruneObservations();
+    } else if (job === 'injuries') {
+      // Detailed injury reports: 32 ESPN team calls merged over Sleeper's designations. Safe to run any
+      // time — it only ever writes detail columns, never the designation the leagues actually see.
+      const { syncInjuries } = await import('../jobs/syncInjuries.js');
+      detail = await syncInjuries();
     } else if (job === 'news') {
       // Player news / injury blurbs from ESPN. DELIBERATELY NOT in the nightly refreshAll yet: this job has
       // never run in production, it makes up to ~120 outbound calls, and draft season is the wrong moment to

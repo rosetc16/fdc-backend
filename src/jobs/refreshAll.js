@@ -2,6 +2,7 @@
 //   1) players (identity spine)  2) projections  3) published ADP  4) harvest drafts  5) recompute consensus
 import { syncPlayers } from './syncPlayers.js';
 import { syncProjections } from './syncProjections.js';
+import { syncInjuries } from './syncInjuries.js';
 import { syncPublishedAdp } from './syncPublishedAdp.js';
 import { harvestSleeperDrafts } from './harvestSleeperDrafts.js';
 import { refreshConsensus } from './refreshConsensus.js';
@@ -12,6 +13,9 @@ export async function refreshAll() {
   const out = {};
   try { out.players = await syncPlayers(); } catch (e) { out.players = { error: e.message }; log.error(e); }
   try { out.projections = await syncProjections(); } catch (e) { out.projections = { error: e.message }; log.error(e); }
+  // Straight after players, so the detail is merged onto designations that were written moments ago.
+  // Wrapped like everything else: ESPN being down must never fail the nightly refresh.
+  try { out.injuries = await syncInjuries(); } catch (e) { out.injuries = { error: e.message }; log.error(e); }
   // Published ADP gives broad, clean veteran coverage immediately; harvested drafts refine specific
   // buckets. Both are observations the consensus step blends — published must land before consensus.
   try { out.publishedAdp = await syncPublishedAdp(); } catch (e) { out.publishedAdp = { error: e.message }; log.error(e); }

@@ -161,7 +161,8 @@ playerPackRouter.get('/', async (req, res) => {
   try {
     players = (await q(
       `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status, news_updated,
-              injury_body_part, injury_notes, injury_start_date
+              injury_body_part, injury_notes, injury_start_date,
+              injury_detail, injury_part, injury_return, injury_at, injury_sources
          FROM players
         WHERE position IN ('QB','RB','WR','TE','K','DEF','DL','LB','DB')
           AND active = true`
@@ -271,10 +272,14 @@ playerPackRouter.get('/', async (req, res) => {
       inj: pl.injury_status || null,
       // The rest of what the platform already told us about the injury. The board can then say "Hamstring,
       // limited in practice Wednesday" instead of a bare "Q" that sends the user to another site.
-      injPart: pl.injury_body_part || null,
-      injNote: pl.injury_notes || null,
+      // The MERGED, sourced detail wins over Sleeper's raw fields — it is the same data plus ESPN's, with
+      // anything stale already dropped. Falls back to the raw fields when syncInjuries hasn't run.
+      injPart: pl.injury_part || pl.injury_body_part || null,
+      injNote: pl.injury_detail || pl.injury_notes || null,
+      injReturn: pl.injury_return || null,
+      injSrc: pl.injury_sources || null,
       injSince: pl.injury_start_date || null,
-      injAt: pl.news_updated != null ? Number(pl.news_updated) : null,
+      injAt: pl.injury_at ? Date.parse(pl.injury_at) : (pl.news_updated != null ? Number(pl.news_updated) : null),
       rookie: pl.years_exp != null && pl.years_exp === 0,
       stats,
       floor: proj && proj.floor_pts != null ? Number(proj.floor_pts) : null,
