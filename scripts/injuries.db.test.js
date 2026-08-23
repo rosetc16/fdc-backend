@@ -103,5 +103,77 @@ ok('7 · every run is recorded, so a job that quietly stops is visible');
   ok('8 · ⭐⭐ a run that delivers no detail explains itself in the result, instead of reporting success');
 }
 
-console.log(`\n${pass}/8 database-backed injury checks passed`);
+// ---- 9. ⭐ THE SOURCE CHAIN IS ACTUALLY WALKED ------------------------------------------------------------
+// The second production run: 32 team calls, 32 successes, zero injuries, warning `shape-unrecognized:` with
+// an EMPTY key list — because that URL answers 200 with a literal {}. One hard-coded URL against an
+// unofficial API cannot tell "wrong endpoint" from "nobody is hurt". So every source must be attempted and
+// every attempt must be reported by name.
+{
+  assert.ok(Array.isArray(detail.espnAttempts) && detail.espnAttempts.length >= 2,
+    'the job should report each source it tried: ' + JSON.stringify(detail.espnAttempts));
+  assert.strictEqual(detail.espnSourceUsed, null, 'nothing should win with ESPN unreachable');
+  const names = detail.espnAttempts.map((a) => a.source);
+  assert.ok(names.includes('site-league'), 'the one-call league-wide source must be attempted: ' + names);
+  // The counts must cover the WHOLE sweep, not just the first source — an undercount in a diagnostic is
+  // exactly how this bug survived two rounds.
+  const totalCalls = detail.espnAttempts.reduce((n, a) => n + a.calls, 0);
+  assert.strictEqual(detail.espnTeamsOk + detail.espnTeamsFailed, totalCalls,
+    `the reported request count (${detail.espnTeamsOk + detail.espnTeamsFailed}) should cover all ${totalCalls} attempted`);
+  ok(`9 · ⭐⭐ every ESPN source is tried and named in the result (${names.join(' → ')})`);
+}
+
+// ---- 10. ⭐⭐ THE FALLTHROUGH, OVER A REAL HTTP HOP --------------------------------------------------------
+// ESPN is unreachable from the build sandbox, so the network hop has been "honestly unverified" through two
+// rounds of this bug — and the network hop is where both failures lived. This is as close as I can get: a
+// LOCAL server standing in for ESPN, serving the exact response production got (a bare {}) on the first
+// source and a real nested payload on the second. It proves the parts that were only ever asserted about:
+// that an empty body causes a FALLTHROUGH rather than a reported success, that the winner is recorded, and
+// that a matched player actually ends up with detail in the database.
+{
+  const http = await import('node:http');
+  let firstHits = 0, secondHits = 0;
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url.startsWith('/empty')) { firstHits++; return res.end('{}'); }
+    secondHits++;
+    // The per-team-group nesting, with the athlete arriving as a $ref link — both real ESPN shapes.
+    res.end(JSON.stringify({ injuries: [{ id: '25', displayName: 'San Francisco 49ers', injuries: [
+      { athlete: { $ref: 'https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/athletes/3117251?lang=en',
+                   displayName: 'Christian McCaffrey' },
+        status: 'Questionable', date: new Date().toISOString(),
+        details: { type: 'Calf', side: 'Right' },
+        longComment: 'Limited in practice Wednesday and Thursday; considered day to day.' },
+    ] }] }));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const { ESPN_INJURY_SOURCES } = await import('../src/lib/injuries.js');
+  const real = ESPN_INJURY_SOURCES.splice(0, ESPN_INJURY_SOURCES.length);
+  ESPN_INJURY_SOURCES.push({ name: 'stub-empty', urls: [`${base}/empty`] });
+  ESPN_INJURY_SOURCES.push({ name: 'stub-good', urls: [`${base}/good`] });
+
+  const d2 = await syncInjuries();
+  server.close();
+  ESPN_INJURY_SOURCES.splice(0, ESPN_INJURY_SOURCES.length, ...real);   // put the real chain back
+
+  assert.strictEqual(firstHits, 1, 'the first source should have been tried');
+  assert.strictEqual(secondHits, 1, 'an empty body must fall through to the next source, not end the run');
+  assert.strictEqual(d2.espnSourceUsed, 'stub-good', 'the winning source must be named: ' + JSON.stringify(d2));
+  assert.ok(d2.espnAttempts.some((a) => a.source === 'stub-empty' && a.warnings.includes('empty-object')),
+    'the empty source should be recorded as empty: ' + JSON.stringify(d2.espnAttempts));
+  assert.strictEqual(d2.espnInjuriesSeen, 1, 'the nested + $ref record should have been read');
+  assert.strictEqual(d2.espnMatched, 1, 'it should have matched our player by espn_id 3117251');
+  assert.ok(!d2.espnSample, 'no raw sample should ship when a source succeeded');
+  ok('10 · ⭐⭐ an empty body FALLS THROUGH to the next source, over a real HTTP hop');
+
+  // And the detail must actually be in the row — the whole point of the feature.
+  const { rows: after } = await q(`SELECT injury_detail, injury_part, injury_sources FROM players WHERE player_id='p1'`);
+  assert.strictEqual(after[0].injury_part, 'Right Calf', 'ESPN should supply the richer body part');
+  assert.ok(/day to day/i.test(after[0].injury_detail || ''), 'the note never reached the database: ' + after[0].injury_detail);
+  assert.strictEqual(after[0].injury_sources, 'sleeper,espn');
+  ok('11 · ⭐ the merged note and body part are written to the player row — end to end');
+}
+
+console.log(`\n${pass}/11 database-backed injury checks passed`);
 process.exit(0);

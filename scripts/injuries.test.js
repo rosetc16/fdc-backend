@@ -5,7 +5,7 @@
 // table did to Christian McCaffrey, and a merge that prefers "richest text" over "freshest text" would
 // reintroduce it from a live feed instead of a hardcoded one.
 import assert from 'assert';
-import { mapEspnInjuries, mergeInjury, normalizeDesignation, NOTE_MAX_AGE_DAYS } from '../src/lib/injuries.js';
+import { mapEspnInjuries, mergeInjury, normalizeDesignation, NOTE_MAX_AGE_DAYS, ESPN_INJURY_SOURCES } from '../src/lib/injuries.js';
 
 let pass = 0;
 const ok = (n) => { console.log('  PASS  ' + n); pass++; };
@@ -79,7 +79,43 @@ const daysAgo = (d) => new Date(NOW - d * 86400000).toISOString();
   assert.strictEqual(nested.injuries[0].part, 'Calf');
   ok('4c · ⭐ injury records nested inside a per-team group are found — the shape that returned nothing');
 
-  for (const junk of [null, undefined, {}, [], 'nonsense', 42, { items: null }]) {
+  // ⭐⭐ THE SHAPE PRODUCTION ACTUALLY SENT. All 32 team calls answered HTTP 200 with a literal {} — that
+  // URL has no injuries sub-resource at all. The warning printed as a bare "shape-unrecognized:" with an
+  // empty key list, which reads like the diagnostic is broken rather than like the endpoint is wrong.
+  {
+    const e = mapEspnInjuries({}, { now: NOW });
+    assert.strictEqual(e.injuries.length, 0);
+    assert.deepStrictEqual(e.warnings, ['empty-object'],
+      'an empty body must say so by name, not print an empty key list: ' + JSON.stringify(e.warnings));
+    assert.deepStrictEqual(mapEspnInjuries([], { now: NOW }).warnings, ['empty-array']);
+    ok('4d · ⭐⭐ an EMPTY response is diagnosed as empty, not as an unrecognised shape');
+  }
+
+  // The core API hands back the athlete as a $ref URL. The id is in the URL — following the link would be
+  // one extra request per injured player for a number we already have.
+  {
+    const core = mapEspnInjuries({ items: [
+      { athlete: { $ref: 'https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/athletes/3117251?lang=en' },
+        status: 'Out', date: daysAgo(2), details: { type: 'Ankle', side: 'Right' },
+        longComment: 'Did not practise all week.' },
+    ] }, { now: NOW });
+    assert.strictEqual(core.injuries.length, 1, 'a $ref athlete was skipped: ' + JSON.stringify(core.warnings));
+    assert.strictEqual(core.injuries[0].espnId, '3117251', 'the id should come out of the ref URL');
+    assert.strictEqual(core.injuries[0].part, 'Right Ankle');
+    ok('4e · ⭐ an athlete given only as a $ref URL is read by parsing the id out of the link');
+  }
+
+  // The name is the fallback matching key, because espn_id is blank for a slice of players.
+  {
+    const named = mapEspnInjuries({ injuries: [{ injuries: [
+      { athlete: { id: '5', displayName: 'Rookie Guy' }, status: 'Questionable', date: daysAgo(1),
+        details: { type: 'Groin' } },
+    ] }] }, { now: NOW });
+    assert.strictEqual(named.injuries[0].name, 'Rookie Guy', 'the display name must survive for name matching');
+    ok('4f · the athlete display name is carried through, so a player with no espn_id can still match');
+  }
+
+  for (const junk of [null, undefined, 'nonsense', 42, { items: null }]) {
     assert.doesNotThrow(() => mapEspnInjuries(junk, { now: NOW }), `threw on ${JSON.stringify(junk)}`);
     assert.deepStrictEqual(mapEspnInjuries(junk, { now: NOW }).injuries, []);
   }
@@ -149,4 +185,20 @@ const daysAgo = (d) => new Date(NOW - d * 86400000).toISOString();
   ok('11 · a healthy player produces no injury record at all');
 }
 
-console.log(`\n${pass}/13 injury checks passed`);
+// ---- 7. the source chain is ordered cheapest-first and the old broken URL is kept LAST ------------------
+{
+  const names = ESPN_INJURY_SOURCES.map((s) => s.name);
+  assert.ok(names.length >= 2, 'a single source is a guess with no fallback — that is what failed');
+  assert.strictEqual(ESPN_INJURY_SOURCES[0].urls.length, 1,
+    'the first source should be the one-call league-wide endpoint, so the 32-call ones never run when it works');
+  // The URL that answered {} 32 times is kept, but last: it costs nothing once the others have failed.
+  const last = ESPN_INJURY_SOURCES[ESPN_INJURY_SOURCES.length - 1];
+  assert.ok(/site\.api\.espn\.com.+teams.+injuries/.test(last.urls[0]),
+    'the endpoint that returned {} should be demoted to last, not trusted first');
+  for (const s of ESPN_INJURY_SOURCES) {
+    assert.ok(s.urls.length && s.urls.every((u) => /^https:\/\//.test(u)), 'bad url in source ' + s.name);
+  }
+  ok('12 · ⭐ ESPN is a chain of sources, cheapest first, with the URL that returned nothing demoted to last');
+}
+
+console.log(`\n${pass}/17 injury checks passed`);

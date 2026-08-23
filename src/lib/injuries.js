@@ -83,9 +83,17 @@ function collectInjuryNodes(root, cap = 4000, maxDepth = 8) {
       continue;
     }
     // An injury record is an object with an athlete (or athleteId) AND some notion of status/type.
-    const hasAthlete = (node.athlete && typeof node.athlete === 'object' && node.athlete.id != null)
+    //
+    // ⭐ The core API hands us the athlete as a LINK rather than an object: { athlete: { $ref:
+    // ".../athletes/3117251?lang=en" } }. The id is right there in the URL, so we count that as having an
+    // athlete and parse it out below — following the ref would be one extra HTTP call per injured player
+    // for a number we already have.
+    const refId = (n) => (n && typeof n === 'object' && typeof n.$ref === 'string'
+      ? (/\/athletes\/(\d+)/.exec(n.$ref) || [])[1] || null : null);
+    const hasAthlete = (node.athlete && typeof node.athlete === 'object'
+        && (node.athlete.id != null || refId(node.athlete)))
       || node.athleteId != null
-      || (node.player && typeof node.player === 'object' && node.player.id != null);
+      || (node.player && typeof node.player === 'object' && (node.player.id != null || refId(node.player)));
     const hasStatus = node.status != null || node.type != null || node.details != null
       || node.longComment != null || node.shortComment != null;
     if (hasAthlete && hasStatus) { found.push(node); continue; }   // don't descend into a matched record
@@ -110,6 +118,16 @@ export function mapEspnInjuries(payload, opts = {}) {
     }
     // ⭐ SAY SO. "We read the response and understood none of it" must never look like "nobody is hurt".
     // The top-level keys are logged so the next run diagnoses the shape instead of another guess.
+    //
+    // ⚠ AND NAME THE EMPTY CASE SEPARATELY. The first diagnostic run came back with a bare
+    // `shape-unrecognized:` — an empty key list — which reads like the warning itself is broken. It wasn't:
+    // the endpoint was answering 200 with a literal `{}` for all 32 teams, i.e. that URL has no such
+    // sub-resource. "Empty" and "unfamiliar" are different problems and must not print the same way.
+    if (payload && typeof payload === 'object' && !Array.isArray(payload) && !Object.keys(payload).length) {
+      warnings.push('empty-object');
+      return { injuries: out, warnings };
+    }
+    if (Array.isArray(payload) && !payload.length) { warnings.push('empty-array'); return { injuries: out, warnings }; }
     const keys = (payload && typeof payload === 'object' && !Array.isArray(payload))
       ? Object.keys(payload).slice(0, 12) : (Array.isArray(payload) ? ['<array>'] : [typeof payload]);
     warnings.push('shape-unrecognized:' + keys.join(','));
@@ -122,8 +140,14 @@ export function mapEspnInjuries(payload, opts = {}) {
     if (it.$ref && !it.athlete && !it.status && !it.type) { warnings.push('unexpanded-ref'); continue; }
 
     const ath = it.athlete || it.player || {};
-    const espnId = ath.id != null ? String(ath.id) : (it.athleteId != null ? String(it.athleteId) : null);
-    if (!espnId) { warnings.push('no-athlete-id'); continue; }
+    const fromRef = typeof ath.$ref === 'string' ? (/\/athletes\/(\d+)/.exec(ath.$ref) || [])[1] || null : null;
+    const espnId = ath.id != null ? String(ath.id)
+      : (it.athleteId != null ? String(it.athleteId) : fromRef);
+    // The NAME is the fallback key. espn_id comes to us from Sleeper's player record and is missing on a
+    // slice of players (rookies especially, whose cross-source ids lag), so an id-only match silently drops
+    // exactly the players whose news is newest.
+    const name = clean(ath.displayName || ath.fullName || ath.name || null, 60);
+    if (!espnId && !name) { warnings.push('no-athlete-id'); continue; }
 
     // Status arrives as a bare string on some endpoints and as a {name,description,abbreviation} object
     // on others. Take whichever is present rather than assuming.
@@ -146,6 +170,7 @@ export function mapEspnInjuries(payload, opts = {}) {
 
     out.push({
       espnId,
+      name,
       designation,
       part,
       note,
@@ -211,3 +236,41 @@ export const ESPN_TEAM_IDS = [
 
 export const ESPN_TEAM_INJURIES = (teamId) =>
   `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/injuries`;
+
+// ⭐⭐ WHY THIS IS A CHAIN AND NOT A URL.
+//
+// The first production run called ESPN_TEAM_INJURIES for all 32 teams, got HTTP 200 every time, and read a
+// literal `{}` out of every one — that path has no injuries sub-resource. 32 successful requests, zero
+// information, and the job reported `espnTeamsOk: 32`. A single hard-coded URL against an UNOFFICIAL API is
+// a guess with no fallback and no way to tell a wrong guess from an injury-free league.
+//
+// So the job now works down an ordered list and stops at the first source that actually yields records.
+// Cheapest and most likely first. Which one won is reported back in the job result, so the next time ESPN
+// moves something we learn it from the result box instead of another deploy cycle.
+export const ESPN_INJURY_SOURCES = [
+  {
+    // ONE call for the whole league. If this works, the other 32-call sources never run.
+    name: 'site-league',
+    urls: ['https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries'],
+  },
+  {
+    // The web host mirrors the site host but exposes different sub-resources; per team.
+    name: 'web-team',
+    urls: ESPN_TEAM_IDS.map((id) =>
+      `https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/teams/${id}/injuries`),
+  },
+  {
+    // The core API definitely has this, but hands back { items: [{ $ref }] }. We do NOT follow those refs —
+    // the athlete id is embedded in the ref URL and the mapper parses it out. When the refs carry no inline
+    // status this source yields nothing and we fall through, which the warnings will say.
+    name: 'core-team',
+    urls: ESPN_TEAM_IDS.map((id) =>
+      `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/teams/${id}/injuries?limit=100`),
+  },
+  {
+    // The original guess, kept LAST rather than deleted: it costs nothing once the others have failed, and
+    // if ESPN ever fills it in we pick that up for free.
+    name: 'site-team',
+    urls: ESPN_TEAM_IDS.map((id) => ESPN_TEAM_INJURIES(id)),
+  },
+];
