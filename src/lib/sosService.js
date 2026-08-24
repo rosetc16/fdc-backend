@@ -7,11 +7,15 @@
 import { q } from './db.js';
 import { getDefVsPos, warmDefVsPos } from './defVsPos.js';
 import { computePlayoffSos, playoffWeeks } from './playoffSos.js';
+import { clearPlayerPackCache } from './packCache.js';
 
 // The table is identical for every user in a league shape, and rebuilding it per request would mean a
 // database read plus a 32x4 ranking on every board load.
 const memo = new Map();                 // `${season}:${playoffStart}` -> { at, table }
 const MEMO_MS = 30 * 60 * 1000;
+// ⚠ A NEGATIVE ANSWER GETS A SHORT LEASH. Caching "no SOS available" for half an hour means that after the
+// admin finally runs the two jobs, the feature stays dark for another 30 minutes and looks like it failed.
+const MEMO_NULL_MS = 45 * 1000;
 
 async function loadSchedule(season) {
   try {
@@ -45,7 +49,7 @@ export async function getPlayoffSos(season, playoffStartWeek = 15, currentWeek =
   const start = Number(playoffStartWeek) || 15;
   const key = `${season}:${start}:${currentWeek || 0}`;
   const hit = memo.get(key);
-  if (hit && Date.now() - hit.at < MEMO_MS) return hit.value;
+  if (hit && Date.now() - hit.at < (hit.value ? MEMO_MS : MEMO_NULL_MS)) return hit.value;
 
   const schedule = await loadSchedule(season);
   if (!schedule.length) { memo.set(key, { at: Date.now(), value: null }); return null; }
@@ -60,3 +64,57 @@ export async function getPlayoffSos(season, playoffStartWeek = 15, currentWeek =
 }
 
 export function clearSosMemo() { memo.clear(); }
+
+// ⭐⭐ THE INSTRUMENT. Both jobs reported success — 544 schedule rows, 32 defences — and every row on the board
+// still showed a dash. That is the fourth time in this codebase that two green numbers have failed to add up
+// to a working feature, and the lesson each time was the same: stop reasoning about the gap and print it.
+//
+// This reports every link in the chain, and in particular the ONE number that a summary can never show you:
+// how many schedule teams actually find a match in the defence table. A join that matches nothing looks
+// exactly like a feature with no data.
+export async function sosDiagnose(season, playoffStartWeek = 15) {
+  const out = { season, playoffStartWeek };
+  const schedule = await loadSchedule(season);
+  out.scheduleRows = schedule.length;
+  const schedTeams = [...new Set(schedule.map((r) => r.team))].sort();
+  const schedWeeks = [...new Set(schedule.map((r) => r.week))].sort((a, b) => a - b);
+  out.scheduleTeams = schedTeams.length;
+  out.scheduleWeeks = schedWeeks.length;
+  if (!schedule.length) {
+    out.verdict = `No schedule stored for ${season}. Run "Pull schedule" — and check it reported the SAME season the board is asking for.`;
+    return out;
+  }
+
+  const { table: defTable, basis } = await loadDefTable(season, null);
+  out.defBasis = basis;
+  out.defTeams = defTable ? Object.keys(defTable).length : 0;
+  if (!defTable) {
+    out.verdict = 'No defence-vs-position table. Run "Build defense ranks" — it needs the PREVIOUS season, and caches under (season, throughWeek).';
+    return out;
+  }
+
+  // ⭐ THE JOIN. Two feeds, two sets of abbreviations, and nothing anywhere says when they disagree.
+  const defKeys = new Set(Object.keys(defTable));
+  const missing = schedTeams.filter((t) => !defKeys.has(t));
+  out.teamsMatched = schedTeams.length - missing.length;
+  if (missing.length) out.teamsMissingFromDefTable = missing.slice(0, 12);
+  const defOnly = Object.keys(defTable).filter((t) => !schedTeams.includes(t));
+  if (defOnly.length) out.teamsOnlyInDefTable = defOnly.slice(0, 12);
+
+  const weeks = playoffWeeks(Number(playoffStartWeek) || 15, 3);
+  out.weeksUsed = weeks;
+  const inWeeks = schedule.filter((r) => weeks.includes(r.week)).length;
+  out.scheduleRowsInPlayoffWeeks = inWeeks;
+
+  const table = computePlayoffSos(schedule, defTable, weeks);
+  out.teamsRated = Object.keys(table).length;
+  const sampleTeam = Object.keys(table)[0];
+  if (sampleTeam) out.sample = { team: sampleTeam, RB: table[sampleTeam].RB };
+
+  out.verdict = out.teamsRated > 0
+    ? `Working: ${out.teamsRated} teams rated. If the board still shows dashes, it is a CACHE — the pack is cached for 10 minutes and this table for 30.`
+    : (missing.length >= schedTeams.length
+      ? `The schedule and the defence table use DIFFERENT team abbreviations, so the join matched nothing. Schedule has ${schedTeams.slice(0, 4).join(',')}…; defences have ${Object.keys(defTable).slice(0, 4).join(',')}…`
+      : `Both inputs are present and the codes match, but no team came out rated — check that the playoff weeks (${weeks.join(',')}) exist in the schedule (${out.scheduleRowsInPlayoffWeeks} rows there).`);
+  return out;
+}

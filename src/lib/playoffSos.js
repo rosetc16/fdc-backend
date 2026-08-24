@@ -11,6 +11,8 @@
 // positional difficulty model, and — crucially — THE LEAGUE'S OWN PLAYOFF WEEKS, which we know from the
 // connected league's settings and a generic ranking site cannot.
 //
+import { normTeam } from './nflSchedule.js';
+
 // ⚠ WHAT THIS IS NOT. It is not a projection and it must never be folded silently into VBD. Schedule is a
 // weak signal next to talent and role: defences change between seasons, and the ranking it leans on is LAST
 // season's. Shown as its own number a drafter can weigh, it is genuinely useful; multiplied into the value
@@ -36,9 +38,26 @@ export function playoffWeeks(playoffStartWeek = 15, rounds = 3, lastWeek = 18) {
 // soft matchup — it is a zero, and treating it as "no data" would flatter exactly the players a drafter most
 // needs warning about.
 export function computePlayoffSos(schedule, defTable, weeks, positions = ['QB', 'RB', 'WR', 'TE']) {
+  // ⭐⭐ NORMALISE BOTH SIDES BEFORE JOINING THEM.
+  //
+  // The schedule's team codes come from one feed and the defence table's from another, and the NFL has half a
+  // dozen abbreviations that differ between sources (JAC/JAX, WSH/WAS, LA/LAR, OAK/LV). A join on raw strings
+  // does not fail loudly — it just matches nothing, every team ends with no rated opponents, the table comes
+  // back empty, and the whole feature renders as a column of dashes with both jobs reporting success. That is
+  // precisely the failure mode this codebase keeps rediscovering, so the join is defended rather than trusted.
+  const norm = (t) => normTeam(t) || (t == null ? null : String(t).trim().toUpperCase());
+  const def = {};
+  for (const k of Object.keys(defTable || {})) {
+    const nk = norm(k);
+    if (nk) def[nk] = defTable[k];
+  }
+  defTable = def;
   const byTeamWeek = new Map();
-  for (const r of schedule || []) byTeamWeek.set(`${r.team}:${r.week}`, r.opponent);
-  const teams = [...new Set((schedule || []).map((r) => r.team))].sort();
+  for (const r of schedule || []) {
+    const t = norm(r.team), o = norm(r.opponent);
+    if (t && o) byTeamWeek.set(`${t}:${r.week}`, o);
+  }
+  const teams = [...new Set((schedule || []).map((r) => norm(r.team)).filter(Boolean))].sort();
   if (!teams.length || !weeks || !weeks.length) return {};
 
   const raw = {};   // team -> pos -> { sum, n, opps, byes }

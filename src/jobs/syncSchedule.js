@@ -12,6 +12,8 @@ import { q } from '../lib/db.js';
 import { log } from '../lib/log.js';
 import { recordJob } from '../lib/jobs.js';
 import { fetchSchedule, toTeamRows, byeWeeksFrom, TEAMS } from '../lib/nflSchedule.js';
+import { clearPlayerPackCache } from '../lib/packCache.js';
+import { clearSosMemo } from '../lib/sosService.js';
 
 export async function syncSchedule(opts = {}) {
   const started = Date.now();
@@ -70,6 +72,12 @@ export async function syncSchedule(opts = {}) {
       wrote = 0;
     }
   }
+
+  // ⚠ NEW DATA MUST INVALIDATE THE CACHES THAT HID IT. The player pack is cached for 10 minutes and the SOS
+  // table for 30, so a successful schedule pull could sit behind a stale "there is no schedule" answer and
+  // look like it had failed. Writing data and not clearing the caches over it is its own species of the
+  // silent-failure bug: everything reports success and nothing changes on screen.
+  if (wrote > 0) { try { clearPlayerPackCache(); clearSosMemo(); } catch (e) { log.error(e, 'syncSchedule: cache clear'); } }
 
   const byes = usable ? byeWeeksFrom(rows) : {};
   const missing = TEAMS.filter((t) => !teamsSeen.has(t));

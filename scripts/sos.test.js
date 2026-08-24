@@ -201,6 +201,34 @@ const ok = (n) => { console.log('  PASS  ' + n); pass++; };
   ok('14 · ⭐ SOS is computed PER POSITION — the same opponent is soft for one and brutal for another');
 }
 
+// ---- 6b. ⭐⭐ THE JOIN BETWEEN TWO FEEDS ---------------------------------------------------------------------
+// Both jobs reported success — 544 schedule rows, 32 defences — and every row on the board still showed a
+// dash. The schedule's team codes and the defence table's come from DIFFERENT feeds, and the NFL has half a
+// dozen abbreviations that differ between sources. A join on raw strings does not fail loudly: it matches
+// nothing, no team ends up rated, the table comes back empty, and the feature reads as "no data" while both
+// halves of it are sitting right there.
+{
+  const defTable = {
+    // The defence table spells them one way…
+    JAC: { RB: { rank: 30, of: 32, tier: 'soft' } },
+    WSH: { RB: { rank: 28, of: 32, tier: 'soft' } },
+    LA:  { RB: { rank: 3, of: 32, tier: 'tough' } },
+    OAK: { RB: { rank: 5, of: 32, tier: 'tough' } },
+  };
+  // …and the schedule the other.
+  const sched = [
+    { team: 'KC', week: 15, opponent: 'JAX' }, { team: 'KC', week: 16, opponent: 'WAS' },
+    { team: 'BUF', week: 15, opponent: 'LAR' }, { team: 'BUF', week: 16, opponent: 'LV' },
+  ];
+  const sos = computePlayoffSos(sched, defTable, [15, 16], ['RB']);
+  assert.strictEqual(Object.keys(sos).length, 2,
+    'the two feeds\' abbreviations did not reconcile, so nothing was rated: ' + JSON.stringify(sos));
+  assert.strictEqual(sos.KC.RB.rank, 1, 'KC faces the two soft defences and should rank easiest');
+  assert.strictEqual(sos.BUF.RB.rank, 2);
+  assert.deepStrictEqual(sos.KC.RB.opps.map((o) => o.opp), ['JAX', 'WAS'], 'opponents should be reported normalised');
+  ok('20 · ⭐⭐ schedule and defence codes are RECONCILED before joining (JAC/JAX, WSH/WAS, LA/LAR, OAK/LV)');
+}
+
 // ---- 7. the league's OWN playoff weeks --------------------------------------------------------------------
 {
   assert.deepStrictEqual(playoffWeeks(15, 3), [15, 16, 17]);
@@ -246,4 +274,4 @@ const ok = (n) => { console.log('  PASS  ' + n); pass++; };
   ok('19 · ⭐ the shared walker counts $ref links instead of reporting an empty result');
 }
 
-console.log(`\n${pass}/19 playoff-SOS checks passed`);
+console.log(`\n${pass}/20 playoff-SOS checks passed`);

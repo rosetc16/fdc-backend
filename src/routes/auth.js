@@ -173,9 +173,26 @@ authRouter.post('/rank-sets', requireAuth, async (req, res) => {
   // basic guard: cap size so a runaway payload can't bloat the row
   const json = JSON.stringify(sets);
   if (json.length > 2_000_000) return res.status(413).json({ error: 'rankings too large' });
-  const { rows } = await q(
-    `UPDATE users SET rank_sets=$1::jsonb WHERE id=$2 RETURNING *`, [json, req.user.id]
-  );
+
+  // ⭐ PLATFORM RANKS RIDE ALONG. They had NO server home at all — they lived only on the browser's copy of
+  // the user record, which every page load then overwrote with the server's copy. So a user's hand-entered
+  // league ADP was destroyed on reload and there was nowhere for it to come back from. Same jsonb treatment
+  // as rank sets, and the column creates itself because db/schema.sql is only applied by a manual migrate.
+  const hasPr = req.body.platformRanks && typeof req.body.platformRanks === 'object';
+  if (hasPr) {
+    try { await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS platform_ranks jsonb;`); } catch { /* reported below */ }
+  }
+  let rows;
+  if (hasPr) {
+    const prJson = JSON.stringify(req.body.platformRanks);
+    if (prJson.length > 2_000_000) return res.status(413).json({ error: 'platform ranks too large' });
+    ({ rows } = await q(
+      `UPDATE users SET rank_sets=$1::jsonb, platform_ranks=$2::jsonb WHERE id=$3 RETURNING *`,
+      [json, prJson, req.user.id]
+    ));
+  } else {
+    ({ rows } = await q(`UPDATE users SET rank_sets=$1::jsonb WHERE id=$2 RETURNING *`, [json, req.user.id]));
+  }
   res.json({ user: publicUser(rows[0]) });
 });
 
@@ -186,6 +203,7 @@ function publicUser(u) {
     id: u.id, email: u.email, admin: !!u.is_admin && !disabled,
     paid: !!paidActive, paidUntil: u.paid_until, comp: !!u.comp, disabled,
     rankSets: u.rank_sets || [],
+    platformRanks: u.platform_ranks || {},
     sleeperUserId: u.sleeper_user_id || null,
     sleeperUsername: u.sleeper_username || null,
   };

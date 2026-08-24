@@ -72,7 +72,22 @@ adminRouter.post('/run-job', async (req, res) => {
       const { config } = await import('../lib/config.js');
       const prev = Number(config.activeSeason) - 1;
       const table = await warmDefVsPos(prev, 19);
-      detail = { season: prev, throughWeek: 18, defenses: Object.keys(table || {}).length };
+      // Same rule as the schedule job: data that lands behind a stale cache looks like data that never landed.
+      try {
+        const { clearPlayerPackCache } = await import('../lib/packCache.js');
+        const { clearSosMemo } = await import('../lib/sosService.js');
+        clearPlayerPackCache(); clearSosMemo();
+      } catch { /* the caches expire on their own; this just makes it immediate */ }
+      detail = { season: prev, throughWeek: 18, defenses: Object.keys(table || {}).length,
+        note: Object.keys(table || {}).length >= 24
+          ? 'Ready. If Playoff SOS still shows dashes, run "Check Playoff SOS" — it reports every link in the chain.'
+          : 'Too few defences to rank against. Playoff SOS stays off rather than ranking a partial league.' };
+    } else if (job === 'sos-check') {
+      // ⭐ THE INSTRUMENT, not another guess. Two jobs reported success and the column still showed dashes;
+      // this prints every link between them — rows stored, defences built, and how many team codes actually
+      // JOIN, which is the one number a per-job summary can never show.
+      const { sosDiagnose } = await import('../lib/sosService.js');
+      detail = await sosDiagnose(Number(req.body.season) || config.activeSeason, Number(req.body.pw) || 15);
     } else if (job === 'injuries') {
       // Detailed injury reports: 32 ESPN team calls merged over Sleeper's designations. Safe to run any
       // time — it only ever writes detail columns, never the designation the leagues actually see.
