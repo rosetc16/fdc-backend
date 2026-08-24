@@ -64,6 +64,42 @@ export function normalizeDesignation(raw) {
 // group, and that nesting has changed before. Instead of encoding one shape, this WALKS the payload and
 // collects every object that looks like an injury — one carrying an athlete with an id. Depth- and
 // node-capped so a hostile or huge payload can't spin.
+// The fields a real injury record carries. Used as a SCORE, not a checklist — see the walker below.
+const INJURY_FIELDS = ['status', 'type', 'details', 'longComment', 'shortComment', 'date', 'athlete'];
+
+// Pull an athlete id out of a $ref URL. ESPN's core API hands us `{ $ref: ".../athletes/3117251?lang=en" }`
+// instead of the athlete; the id is right there in the link, so following it would be an HTTP request per
+// injured player for a number we already have.
+const refAthleteId = (n) => (n && typeof n === 'object' && typeof n.$ref === 'string'
+  ? (/\/athletes\/(\d+)/.exec(n.$ref) || [])[1] || null : null);
+
+// WHO is this injury about? Returns { id, name } or null.
+//
+// Deliberately separate from "is this an injury record". Conflating the two is what made a readable payload
+// look unreadable: an athlete in an unexpected place meant the whole record was discarded silently rather
+// than reported as "found the injury, couldn't name the player" — two very different things to tell a user.
+export function athleteOf(node) {
+  if (!node || typeof node !== 'object') return null;
+  for (const key of ['athlete', 'player']) {
+    const a = node[key];
+    if (a && typeof a === 'object') {
+      const id = a.id != null ? String(a.id) : refAthleteId(a);
+      const name = a.displayName || a.fullName || a.name || null;
+      if (id || name) return { id: id || null, name: name ? String(name) : null };
+    }
+  }
+  if (node.athleteId != null) return { id: String(node.athleteId), name: null };
+  // Last resort: something one level down that looks like a person rather than a lookup table.
+  for (const k of Object.keys(node)) {
+    const v = node[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) && v.displayName
+        && (v.position || v.firstName || v.lastName || v.headshot || v.jersey)) {
+      return { id: v.id != null ? String(v.id) : refAthleteId(v), name: String(v.displayName) };
+    }
+  }
+  return null;
+}
+
 function collectInjuryNodes(root, cap = 4000, maxDepth = 8) {
   const found = [];
   let refsSeen = 0;      // $ref links we were given instead of data — a distinct, actionable condition
@@ -82,21 +118,21 @@ function collectInjuryNodes(root, cap = 4000, maxDepth = 8) {
       for (const child of node) queue.push([child, depth + 1]);
       continue;
     }
-    // An injury record is an object with an athlete (or athleteId) AND some notion of status/type.
+    // ⭐⭐ RECOGNISE THE RECORD BY ITSELF, IDENTIFY THE PLAYER SEPARATELY.
     //
-    // ⭐ The core API hands us the athlete as a LINK rather than an object: { athlete: { $ref:
-    // ".../athletes/3117251?lang=en" } }. The id is right there in the URL, so we count that as having an
-    // athlete and parse it out below — following the ref would be one extra HTTP call per injured player
-    // for a number we already have.
-    const refId = (n) => (n && typeof n === 'object' && typeof n.$ref === 'string'
-      ? (/\/athletes\/(\d+)/.exec(n.$ref) || [])[1] || null : null);
-    const hasAthlete = (node.athlete && typeof node.athlete === 'object'
-        && (node.athlete.id != null || refId(node.athlete)))
-      || node.athleteId != null
-      || (node.player && typeof node.player === 'object' && (node.player.id != null || refId(node.player)));
-    const hasStatus = node.status != null || node.type != null || node.details != null
-      || node.longComment != null || node.shortComment != null;
-    if (hasAthlete && hasStatus) { found.push(node); continue; }   // don't descend into a matched record
+    // The previous rule was "has an athlete AND has a status", and against the real league-wide response it
+    // matched NOTHING — so the job reported "no injury records" when the payload was full of them. Requiring
+    // the athlete to be present in the shape I expected meant one unexpected athlete field turned a payload
+    // we could read into a payload we claimed was unreadable.
+    //
+    // So detection is now about the record's OWN fields, scored rather than demanded: real injury records
+    // carry most of status/type/details/longComment/shortComment/date/athlete, and the objects we must NOT
+    // match carry at most one. `details` ({type, side, returnDate}) scores 1. `type`
+    // ({id,name,description}) scores 0. `season` ({year,type,name}) scores 1. A real record scores 5-7.
+    // Whether we can then NAME the player is a separate question, answered — and reported — below.
+    const score = INJURY_FIELDS.reduce((n, f) => n + (node[f] != null ? 1 : 0), 0);
+    const hasAthlete = athleteOf(node) != null;
+    if (score >= 3 || (score >= 2 && hasAthlete)) { found.push(node); continue; }  // don't descend into a match
     if (node.$ref && !hasAthlete) refsSeen++;
     for (const k of Object.keys(node)) queue.push([node[k], depth + 1]);
   }
@@ -139,15 +175,18 @@ export function mapEspnInjuries(payload, opts = {}) {
     // read them", which are very different answers to give a user.
     if (it.$ref && !it.athlete && !it.status && !it.type) { warnings.push('unexpanded-ref'); continue; }
 
-    const ath = it.athlete || it.player || {};
-    const fromRef = typeof ath.$ref === 'string' ? (/\/athletes\/(\d+)/.exec(ath.$ref) || [])[1] || null : null;
-    const espnId = ath.id != null ? String(ath.id)
-      : (it.athleteId != null ? String(it.athleteId) : fromRef);
+    const who = athleteOf(it);
+    const espnId = who && who.id ? who.id : null;
     // The NAME is the fallback key. espn_id comes to us from Sleeper's player record and is missing on a
     // slice of players (rookies especially, whose cross-source ids lag), so an id-only match silently drops
     // exactly the players whose news is newest.
-    const name = clean(ath.displayName || ath.fullName || ath.name || null, 60);
-    if (!espnId && !name) { warnings.push('no-athlete-id'); continue; }
+    const name = who ? clean(who.name, 60) : null;
+    if (!espnId && !name) {
+      // ⭐ NAME THE SHAPE. "Found a record I couldn't attribute" is a different problem from "found no
+      // records", and printing them the same way is what sent the last two rounds chasing the wrong thing.
+      warnings.push('record-no-athlete:' + Object.keys(it).slice(0, 10).join(','));
+      continue;
+    }
 
     // Status arrives as a bare string on some endpoints and as a {name,description,abbreviation} object
     // on others. Take whichever is present rather than assuming.
@@ -227,6 +266,25 @@ export function mergeInjury(sleeper = {}, espn = null, opts = {}) {
   };
 }
 
+// ⭐ A STRUCTURAL MAP OF A RESPONSE — keys and types, no content.
+//
+// The previous diagnostic shipped 600 raw characters of the payload. A single 400-character blurb about a
+// kicker's field-goal percentage consumed almost all of it, so the one thing needed — what the injury
+// records look like — was cut off mid-sentence. Values are never the question; structure is. Arrays collapse
+// to a count plus their first element, strings become `str`, and nothing long can crowd out the shape.
+export function describeShape(v, depth = 0, maxDepth = 6) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return depth >= maxDepth ? `[${v.length}]`
+    : `[${v.length}]` + (v.length ? describeShape(v[0], depth + 1, maxDepth) : '');
+  const t = typeof v;
+  if (t !== 'object') return t === 'string' ? 'str' : t === 'number' ? 'num' : t === 'boolean' ? 'bool' : t;
+  if (depth >= maxDepth) return '{…}';
+  const keys = Object.keys(v);
+  const shown = keys.slice(0, 14).map((k) => `${k}:${describeShape(v[k], depth + 1, maxDepth)}`);
+  if (keys.length > 14) shown.push(`+${keys.length - 14} more`);
+  return `{${shown.join(',')}}`;
+}
+
 // The 32 NFL team ids ESPN uses. Static because they do not change during a season and a lookup call per
 // sync would double our request count for nothing.
 export const ESPN_TEAM_IDS = [
@@ -273,4 +331,28 @@ export const ESPN_INJURY_SOURCES = [
     name: 'site-team',
     urls: ESPN_TEAM_IDS.map((id) => ESPN_TEAM_INJURIES(id)),
   },
+  {
+    // ⭐ THE ONE THAT CANNOT FAIL ON SHAPE. core-team demonstrably returns real injuries — it just returns
+    // them as `{ items: [{ $ref }] }`, links rather than data. Following those links is the one path whose
+    // success does not depend on my guessing an envelope correctly.
+    //
+    // It is LAST because it is expensive: one request per injured player, several hundred of them. It only
+    // ever runs when every cheap source has already failed, it is bounded hard (see expandRefs), and the
+    // nightly is the thing that pays the cost. Correct and slow beats fast and empty.
+    name: 'core-expand',
+    urls: ESPN_TEAM_IDS.map((id) =>
+      `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/teams/${id}/injuries?limit=100`),
+    expandRefs: { max: 600, concurrency: 8 },
+  },
 ];
+
+// Collect the $ref URLs out of a core-API listing so they can be fetched.
+export function refsIn(payload, cap = 200) {
+  const out = [];
+  const items = payload && Array.isArray(payload.items) ? payload.items : [];
+  for (const it of items) {
+    if (out.length >= cap) break;
+    if (it && typeof it === 'object' && typeof it.$ref === 'string') out.push(it.$ref);
+  }
+  return out;
+}

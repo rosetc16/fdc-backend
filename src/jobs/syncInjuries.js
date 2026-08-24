@@ -13,7 +13,7 @@
 import { q } from '../lib/db.js';
 import { log } from '../lib/log.js';
 import { recordJob } from '../lib/jobs.js';
-import { mapEspnInjuries, mergeInjury, ESPN_INJURY_SOURCES } from '../lib/injuries.js';
+import { mapEspnInjuries, mergeInjury, describeShape, refsIn, ESPN_INJURY_SOURCES } from '../lib/injuries.js';
 import { normName } from '../lib/names.js';
 
 async function getJson(url, ms = 7000) {
@@ -26,6 +26,20 @@ async function getJson(url, ms = 7000) {
   } catch { return null; } finally { clearTimeout(t); }
 }
 
+// Fetch a list of URLs with a bounded number in flight. Sequential would make the ref-expanding source take
+// minutes; unbounded would open several hundred sockets at ESPN at once and earn a rate-limit.
+async function getAllJson(urls, concurrency = 8) {
+  const out = [];
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, async () => {
+    while (i < urls.length) {
+      const j = await getJson(urls[i++], 5000);
+      if (j) out.push(j);
+    }
+  }));
+  return out;
+}
+
 // Work down ESPN_INJURY_SOURCES and STOP at the first source that yields actual records.
 //
 // ⭐ This exists because the previous version had one hard-coded URL, that URL answered 200 with `{}` for
@@ -33,28 +47,41 @@ async function getJson(url, ms = 7000) {
 // recorded winner turns the next ESPN change into a line in the result box instead of a deploy cycle.
 async function fetchEspnInjuries(now) {
   const attempts = [];
-  let sample = null;                 // a truncated slice of a real response, kept for the failure case
+  let shape = null;                  // a STRUCTURAL map of the first real response — keys and types only
   for (const src of ESPN_INJURY_SOURCES) {
-    let ok = 0, failed = 0, seen = 0;
+    let ok = 0, failed = 0, seen = 0, expanded = 0;
     const warnings = [];
     const injuries = [];
     for (const url of src.urls) {
       const j = await getJson(url);
       if (!j) { failed++; continue; }
       ok++;
-      // ⭐ KEEP THE FIRST REAL RESPONSE. Guessing at a shape twice cost two deploys; a 600-character slice
-      // of what ESPN actually sent ends the guessing, and it only ships when the run found nothing.
-      if (sample == null) { try { sample = JSON.stringify(j).slice(0, 600); } catch { sample = '<unserializable>'; } }
-      const m = mapEspnInjuries(j, { now });
+      // ⭐ KEEP THE STRUCTURE OF THE FIRST REAL RESPONSE — never its content. The previous version kept 600
+      // raw characters and a single long injury blurb ate the entire budget before reaching the part that
+      // mattered. It only ships when the run found nothing.
+      if (shape == null) { try { shape = describeShape(j).slice(0, 1200); } catch { shape = '<undescribable>'; } }
+
+      // A ref-expanding source gets its links followed; every other source is mapped as it arrives.
+      let payload = j;
+      if (src.expandRefs) {
+        const refs = refsIn(j, src.expandRefs.max);
+        if (refs.length) {
+          const docs = await getAllJson(refs.slice(0, src.expandRefs.max), src.expandRefs.concurrency);
+          expanded += docs.length;
+          payload = { items: docs };
+        }
+      }
+      const m = mapEspnInjuries(payload, { now });
       m.warnings.forEach((w) => warnings.push(w));
       seen += m.injuries.length;
       m.injuries.forEach((inj) => injuries.push(inj));
     }
     attempts.push({ source: src.name, calls: src.urls.length, ok, failed, injuries: seen,
+      ...(src.expandRefs ? { refsExpanded: expanded } : {}),
       warnings: [...new Set(warnings)].slice(0, 4) });
-    if (seen > 0) return { injuries, attempts, used: src.name, sample: null };
+    if (seen > 0) return { injuries, attempts, used: src.name, shape: null };
   }
-  return { injuries: [], attempts, used: null, sample };
+  return { injuries: [], attempts, used: null, shape };
 }
 
 export async function syncInjuries(opts = {}) {
@@ -145,8 +172,8 @@ export async function syncInjuries(opts = {}) {
   if (!espnRes.used && anyOk) {
     hints.push(
       emptyEverywhere && !shapeProblem
-        ? `Every ESPN source answered but returned an empty body — those URLs no longer carry injuries. The raw sample below is what they actually sent.`
-        : `ESPN answered but none of the ${espnRes.attempts.length} sources produced readable injury records (${[...new Set(unreadable)].slice(0, 3).join(' | ')}). The raw sample below is what it actually sent.`
+        ? `Every ESPN source answered but returned an empty body — those URLs no longer carry injuries. The espnShape field below maps what they actually sent.`
+        : `ESPN answered but none of the ${espnRes.attempts.length} sources produced readable injury records (${[...new Set(unreadable)].slice(0, 3).join(' | ')}). The espnShape field below maps what it actually sent.`
     );
   } else if (!anyOk) {
     hints.push('Every ESPN request failed outright — network, block or outage. Platform detail is unaffected.');
@@ -167,7 +194,7 @@ export async function syncInjuries(opts = {}) {
     espnWarnings: [...new Set(unreadable)].slice(0, 6),
     // ⭐ ONLY present when nothing worked. Two deploys were spent guessing at a shape nobody had seen; this
     // is 600 characters of the real thing, and it ends the guessing.
-    ...(espnRes.sample ? { espnSample: espnRes.sample } : {}),
+    ...(espnRes.shape ? { espnShape: espnRes.shape } : {}),
     ...(hints.length ? { hints } : {}),
     ms: Date.now() - started,
   };

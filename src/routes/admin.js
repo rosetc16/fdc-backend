@@ -13,6 +13,7 @@ adminRouter.use(requireAdmin);
 // job's result detail (observationsWritten, etc.) so you can confirm it actually wrote data.
 //   POST /api/admin/run-job  { job: 'adp' | 'published' | 'refresh' | 'byes' | 'players' | 'harvest'
 //                              | 'rebuild-trends' | 'harvest-more' | 'prune' | 'news'
+//                              | 'schedule' | 'defvspos'
 //                              | 'weekly-brief-dry' | 'weekly-brief' }
 adminRouter.post('/run-job', async (req, res) => {
   const job = String(req.body.job || 'adp');
@@ -59,6 +60,19 @@ adminRouter.post('/run-job', async (req, res) => {
       // when the DB filled up and suspended on 2026-08-05).
       const { pruneObservations } = await import('../jobs/pruneObservations.js');
       detail = await pruneObservations();
+    } else if (job === 'schedule') {
+      // The NFL schedule for the active season. Fixed once released, so this is a "have we got it yet" job
+      // rather than a freshness one — but playoff SOS cannot exist without it, so it is worth a button.
+      const { syncSchedule } = await import('../jobs/syncSchedule.js');
+      detail = await syncSchedule();
+    } else if (job === 'defvspos') {
+      // Build LAST season's defense-vs-position table, which is what playoff SOS leans on at draft time
+      // (the current season has no completed weeks in August). ~18 Sleeper calls, then cached in the DB.
+      const { warmDefVsPos } = await import('../lib/defVsPos.js');
+      const { config } = await import('../lib/config.js');
+      const prev = Number(config.activeSeason) - 1;
+      const table = await warmDefVsPos(prev, 19);
+      detail = { season: prev, throughWeek: 18, defenses: Object.keys(table || {}).length };
     } else if (job === 'injuries') {
       // Detailed injury reports: 32 ESPN team calls merged over Sleeper's designations. Safe to run any
       // time — it only ever writes detail columns, never the designation the leagues actually see.

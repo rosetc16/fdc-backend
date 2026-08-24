@@ -8,6 +8,7 @@ import { config } from '../lib/config.js';
 import { q } from '../lib/db.js';
 import { formatFallbacks } from '../lib/formatKey.js';
 import { packCacheGet, packCacheSet } from '../lib/packCache.js';
+import { getPlayoffSos } from '../lib/sosService.js';
 
 export const playerPackRouter = Router();
 
@@ -45,7 +46,11 @@ playerPackRouter.get('/', async (req, res) => {
   const cacheKey = [season, format,
     String(req.query.k || '') === '1' ? 'k1' : 'k0',
     String(req.query.dst || '') === '1' ? 'd1' : 'd0',
-    String(req.query.idp || '') === '1' ? 'i1' : 'i0'].join('~');
+    String(req.query.idp || '') === '1' ? 'i1' : 'i0',
+    // ⚠ The playoff window CHANGES the SOS numbers, so it must be part of the cache identity. Leaving it out
+    // would serve a week-14 league the week-15 league's schedule read — the same class of bug as the K/DST
+    // pack collision, where two league shapes shared a key and whichever loaded first won for everybody.
+    'pw' + (Number(req.query.pw) || 15)].join('~');
   const cached = packCacheGet(cacheKey);
   if (cached) {
     // Let the browser/CDN reuse it too, so a repeat open doesn't even reach us.
@@ -180,6 +185,18 @@ playerPackRouter.get('/', async (req, res) => {
   // include core skill positions. K/DST are only included when the league rosters them — otherwise a
   // pile of kickers from harvested K-leagues pollutes the board (e.g. 40 kickers in a row). We infer
   // K/DST inclusion from the request (?k=1&dst=1) defaulting to OFF, since most modern leagues skip them.
+  // The playoff-SOS table is one lookup for the whole request rather than a query per player.
+  const sosData = await getPlayoffSos(season, Number(req.query.pw) || 15, Number(req.query.week) || null)
+    .catch(() => null);
+  const sosFor = (team, pos) => {
+    if (!sosData || !team) return undefined;
+    const e = sosData.table[team] && sosData.table[team][pos];
+    if (!e) return undefined;
+    // Compact on the wire: this rides on every player of a 600-row pack.
+    return { s: e.score, r: e.rank, of: e.of, t: e.tier, b: e.byes || 0,
+      o: e.opps.map((x) => ({ w: x.week, t: x.opp, r: x.rank, y: x.bye ? 1 : 0 })) };
+  };
+
   const wantK = String(req.query.k || '') === '1';
   const wantDST = String(req.query.dst || '') === '1';
   const wantIDP = String(req.query.idp || '') === '1';
@@ -281,6 +298,10 @@ playerPackRouter.get('/', async (req, res) => {
       injSince: pl.injury_start_date || null,
       injAt: pl.injury_at ? Date.parse(pl.injury_at) : (pl.news_updated != null ? Number(pl.news_updated) : null),
       rookie: pl.years_exp != null && pl.years_exp === 0,
+      // PLAYOFF STRENGTH OF SCHEDULE for this player's team and position. Absent entirely when we have no
+      // schedule or no defensive ranks — the board then simply doesn't show the column, which is the right
+      // behaviour for a number we cannot source.
+      sos: sosFor(pl.team, pos),
       stats,
       floor: proj && proj.floor_pts != null ? Number(proj.floor_pts) : null,
       ceil: proj && proj.ceil_pts != null ? Number(proj.ceil_pts) : null,
@@ -298,7 +319,11 @@ playerPackRouter.get('/', async (req, res) => {
   const adpSources = pack.reduce((acc, p) => {
     const k = p.adpSrc || 'none'; acc[k] = (acc[k] || 0) + 1; return acc;
   }, {});
-  const body = { format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, harvestChainTried, harvestFormatUsed: adpRows.length ? usedFormat : null, players: pack };
+  const body = { format: usedFormat, publishedFormat: usedPubFormat, requestedFormat: format, season, count: pack.length, adpSources, harvestChainTried, harvestFormatUsed: adpRows.length ? usedFormat : null,
+    // Provenance for the SOS column. In August these ranks are LAST season's, and the UI says so — an
+    // unlabelled number would imply a currency it does not have.
+    sosMeta: sosData ? { weeks: sosData.weeks, basis: sosData.basis, teams: sosData.teams } : null,
+    players: pack };
   packCacheSet(cacheKey, body);
   res.set('Cache-Control', 'public, max-age=300');
   res.set('X-Pack-Cache', 'MISS');

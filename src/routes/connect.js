@@ -189,8 +189,14 @@ function cfgFromLeague(league, draft) {
   const isRookie = draftType === 'rookie' || draftType.includes('rookie');
   const isBestBall = !!(league && league.settings && league.settings.best_ball === 1);
   const leagueType = (league && league.settings && league.settings.type === 2) ? 'dynasty' : 'redraft';
+  // ⭐ THE LEAGUE'S PLAYOFF WINDOW, captured at import. Playoff-weighted SOS is only a real differentiator
+  // if it uses THIS league's playoff weeks — a site that assumes 15-17 for everybody is answering a question
+  // the user in a week-14 league did not ask. Sleeper tells us; nothing else has to.
+  const pws = Number(ls.playoff_week_start);
+  const playoffStartWeek = Number.isFinite(pws) && pws >= 12 && pws <= 18 ? pws : undefined;
   return {
     teams, rounds: (draft && draft.settings && draft.settings.rounds) || 15,
+    ...(playoffStartWeek ? { playoffStartWeek } : {}),
     sf: superflex, qbType: superflex ? 'SF' : qb >= 2 ? '2QB' : '1QB',
     scoringType: rec >= 1 ? 'ppr' : rec >= 0.5 ? 'half' : 'std',
     tePrem: tep, tePremMult: Math.round(tePremMult * 100) / 100,

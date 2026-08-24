@@ -164,7 +164,7 @@ ok('7 · every run is recorded, so a job that quietly stops is visible');
     'the empty source should be recorded as empty: ' + JSON.stringify(d2.espnAttempts));
   assert.strictEqual(d2.espnInjuriesSeen, 1, 'the nested + $ref record should have been read');
   assert.strictEqual(d2.espnMatched, 1, 'it should have matched our player by espn_id 3117251');
-  assert.ok(!d2.espnSample, 'no raw sample should ship when a source succeeded');
+  assert.ok(!d2.espnShape, 'no shape map should ship when a source succeeded');
   ok('10 · ⭐⭐ an empty body FALLS THROUGH to the next source, over a real HTTP hop');
 
   // And the detail must actually be in the row — the whole point of the feature.
@@ -175,5 +175,65 @@ ok('7 · every run is recorded, so a job that quietly stops is visible');
   ok('11 · ⭐ the merged note and body part are written to the player row — end to end');
 }
 
-console.log(`\n${pass}/11 database-backed injury checks passed`);
+// ---- 12. ⭐⭐ THE REF-EXPANDING FALLBACK, OVER A REAL HTTP HOP ---------------------------------------------
+// core-team demonstrably returns real injuries — as `{ items: [{ $ref }] }`, links rather than data. It is
+// the one source whose success does not depend on my guessing an envelope right, so it is the safety net
+// under every other guess in this file. An untested safety net is not one.
+{
+  const http = await import('node:http');
+  let listHits = 0, refHits = 0;
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url.startsWith('/list')) {
+      listHits++;
+      return res.end(JSON.stringify({ count: 2, items: [{ $ref: `http://127.0.0.1:${port}/ref/1` },
+                                                        { $ref: `http://127.0.0.1:${port}/ref/2` }] }));
+    }
+    refHits++;
+    const id = req.url.endsWith('/1') ? '3117251' : '999999';
+    res.end(JSON.stringify({
+      id: '634999', longComment: 'Missed practice all week and is not expected to play.',
+      status: 'Out', date: new Date().toISOString(),
+      athlete: { $ref: `http://sports.core.api.espn.com/v2/sports/football/leagues/nfl/athletes/${id}?lang=en` },
+      type: { id: '2', description: 'Out', abbreviation: 'O' },
+      details: { type: 'Hamstring', side: 'Left' },
+    }));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+
+  const { ESPN_INJURY_SOURCES } = await import('../src/lib/injuries.js');
+  const real = ESPN_INJURY_SOURCES.splice(0, ESPN_INJURY_SOURCES.length);
+  ESPN_INJURY_SOURCES.push({ name: 'stub-empty', urls: [`http://127.0.0.1:${port}/empty`] });
+  ESPN_INJURY_SOURCES.push({ name: 'stub-refs', urls: [`http://127.0.0.1:${port}/list`],
+    expandRefs: { max: 50, concurrency: 4 } });
+
+  // The empty source must answer {} so the run genuinely falls through to the ref-expanding one.
+  const prev = server.listeners('request')[0];
+  server.removeAllListeners('request');
+  server.on('request', (req, res) => {
+    if (req.url.startsWith('/empty')) { res.setHeader('content-type', 'application/json'); return res.end('{}'); }
+    return prev(req, res);
+  });
+
+  const d3 = await syncInjuries();
+  server.close();
+  ESPN_INJURY_SOURCES.splice(0, ESPN_INJURY_SOURCES.length, ...real);
+
+  assert.strictEqual(d3.espnSourceUsed, 'stub-refs', 'the ref-expanding source should have won: ' + JSON.stringify(d3));
+  assert.strictEqual(listHits, 1, 'the listing should be fetched once');
+  assert.strictEqual(refHits, 2, 'BOTH refs should have been followed, not just the first');
+  const att = d3.espnAttempts.find((a) => a.source === 'stub-refs');
+  assert.strictEqual(att.refsExpanded, 2, 'the job should report how many links it followed: ' + JSON.stringify(att));
+  assert.strictEqual(d3.espnInjuriesSeen, 2, 'both expanded records should have been read');
+  assert.strictEqual(d3.espnMatched, 1, 'the one whose id we hold should match; the other should not');
+  ok('12 · ⭐⭐ the $ref fallback follows its links and delivers — the path that cannot fail on shape');
+
+  const { rows: r3 } = await q(`SELECT injury_part, injury_detail FROM players WHERE player_id='p1'`);
+  assert.strictEqual(r3[0].injury_part, 'Left Hamstring');
+  assert.ok(/not expected to play/.test(r3[0].injury_detail || ''), 'the expanded note never landed');
+  ok('13 · ⭐ detail obtained by following a $ref reaches the player row');
+}
+
+console.log(`\n${pass}/13 database-backed injury checks passed`);
 process.exit(0);

@@ -16,6 +16,9 @@ export async function refreshAll() {
   // Straight after players, so the detail is merged onto designations that were written moments ago.
   // Wrapped like everything else: ESPN being down must never fail the nightly refresh.
   try { out.injuries = await syncInjuries(); } catch (e) { out.injuries = { error: e.message }; log.error(e); }
+  // The schedule is fixed once released, so this is cheap when we already have it — and running it
+  // nightly is how we avoid discovering on draft morning that we never fetched it at all.
+  try { const { syncSchedule } = await import('./syncSchedule.js'); out.schedule = await syncSchedule(); } catch (e) { log.error(e, 'refreshAll: schedule'); }
   // Published ADP gives broad, clean veteran coverage immediately; harvested drafts refine specific
   // buckets. Both are observations the consensus step blends — published must land before consensus.
   try { out.publishedAdp = await syncPublishedAdp(); } catch (e) { out.publishedAdp = { error: e.message }; log.error(e); }

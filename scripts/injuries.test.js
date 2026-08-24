@@ -5,7 +5,7 @@
 // table did to Christian McCaffrey, and a merge that prefers "richest text" over "freshest text" would
 // reintroduce it from a live feed instead of a hardcoded one.
 import assert from 'assert';
-import { mapEspnInjuries, mergeInjury, normalizeDesignation, NOTE_MAX_AGE_DAYS, ESPN_INJURY_SOURCES } from '../src/lib/injuries.js';
+import { mapEspnInjuries, mergeInjury, normalizeDesignation, NOTE_MAX_AGE_DAYS, ESPN_INJURY_SOURCES, describeShape, refsIn } from '../src/lib/injuries.js';
 
 let pass = 0;
 const ok = (n) => { console.log('  PASS  ' + n); pass++; };
@@ -185,20 +185,112 @@ const daysAgo = (d) => new Date(NOW - d * 86400000).toISOString();
   ok('11 · a healthy player produces no injury record at all');
 }
 
-// ---- 7. the source chain is ordered cheapest-first and the old broken URL is kept LAST ------------------
+// ---- 7. ⭐⭐ THE REAL PRODUCTION PAYLOAD -------------------------------------------------------------------
+// Reconstructed from what the live endpoint actually returned, key for key: a per-team group under
+// `injuries`, records carrying long prose comments, and the athlete arriving as a bare core-API $ref. The
+// previous rule ("must have an athlete AND a status, in the shapes I expect") matched NONE of this and the
+// job reported the payload as unreadable while it was full of injuries.
+{
+  const real = {
+    timestamp: '2026-08-23T23:12:11Z',
+    status: 'success',
+    season: { year: 2026, type: 1, name: 'Preseason', displayName: '2026' },
+    injuries: [
+      { id: '22', displayName: 'Arizona Cardinals', injuries: [
+        { id: '634572',
+          longComment: "Ryland's one miss was excusable considering the distance, and the fourth-year pro was otherwise perfect on the night.",
+          shortComment: 'Ryland made three of four attempts.',
+          status: 'Questionable',
+          date: daysAgo(1),
+          athlete: { $ref: 'http://sports.core.api.espn.com/v2/sports/football/leagues/nfl/athletes/4362081?lang=en&region=us' },
+          type: { id: '3', name: 'QUESTIONABLE', description: 'Questionable', abbreviation: 'Q' },
+          details: { fantasyStatus: { description: 'GTD', abbreviation: 'GTD' }, type: 'Hip', location: 'Hip', detail: 'Flexor', side: 'Left', returnDate: '2026-09-07' } },
+      ] },
+      { id: '33', displayName: 'Baltimore Ravens', injuries: [
+        { id: '634573', longComment: 'Placed on injured reserve Tuesday.', status: 'Out', date: daysAgo(2),
+          athlete: { id: '3117251', displayName: 'Christian McCaffrey' },
+          details: { type: 'Achilles' } },
+        // ⭐ THE CASE THAT DEFEATED 114: the person is here, but not under `athlete`. Requiring the athlete
+        // to sit where I expected meant a readable record was thrown away AND reported as unreadable.
+        // Detection now scores the record's own fields, and finding the player is a separate step that can
+        // look around — and that says so when it fails.
+        { id: '634574', shortComment: 'Left the game.', status: 'Doubtful', date: daysAgo(1),
+          details: { type: 'Shoulder', side: 'Right' },
+          participant: { id: '9901', displayName: 'Odd Key Guy', position: { abbreviation: 'WR' } } },
+      ] },
+    ],
+  };
+  const { injuries, warnings } = mapEspnInjuries(real, { now: NOW });
+  assert.strictEqual(injuries.length, 3,
+    'the real payload was read as ' + injuries.length + ' injuries; warnings: ' + JSON.stringify(warnings));
+  assert.deepStrictEqual(warnings, [], 'a payload we can read should raise no warnings: ' + warnings);
+
+  const ryland = injuries.find((i) => i.espnId === '4362081');
+  assert.ok(ryland, 'the $ref athlete was not identified: ' + JSON.stringify(injuries.map((i) => i.espnId)));
+  assert.strictEqual(ryland.part, 'Left Hip', 'side + type should combine');
+  assert.strictEqual(ryland.designation, 'Q');
+  assert.strictEqual(ryland.returnDate, '2026-09-07');
+  ok('12 · ⭐⭐ THE REAL PRODUCTION PAYLOAD reads cleanly — nested team groups, prose comments, $ref athletes');
+
+  // And the objects that must NOT be mistaken for injury records.
+  assert.ok(!injuries.some((i) => i.espnId === '2026'), 'the season block was read as an injury');
+  ok('13 · the season / type / details blocks are not mistaken for injury records');
+
+  const odd = injuries.find((i) => i.espnId === '9901');
+  assert.ok(odd, 'a record whose person sits under an unexpected key was dropped — the 114 failure');
+  assert.strictEqual(odd.name, 'Odd Key Guy', 'the name must survive for the fallback match');
+  assert.strictEqual(odd.part, 'Right Shoulder');
+  ok('13b · ⭐⭐ a record whose athlete is under an UNEXPECTED key is still read and attributed');
+
+  // ⭐ The diagnostic that failed us: 600 raw characters got eaten by one 400-character blurb. A structural
+  // map is immune to that — it carries no content at all.
+  const map = describeShape(real);
+  assert.ok(/injuries:\[2\]\{/.test(map), 'the skeleton should show the nesting: ' + map);
+  assert.ok(/athlete:\{\$ref:str\}/.test(map), 'the skeleton should reveal the $ref athlete: ' + map);
+  assert.ok(!/Ryland/.test(map), 'the skeleton must carry structure, never content: ' + map);
+  assert.ok(map.length < 700, 'a skeleton should stay small enough to read: ' + map.length);
+  ok('14 · ⭐ describeShape maps structure without content, so no single long string can crowd it out');
+}
+
+// ---- 8. a record we find but cannot attribute is reported as exactly that ---------------------------------
+{
+  const orphan = mapEspnInjuries({ injuries: [{ injuries: [
+    { id: '1', status: 'Out', date: daysAgo(1), longComment: 'Out for the year.', details: { type: 'Knee' } },
+  ] }] }, { now: NOW });
+  assert.strictEqual(orphan.injuries.length, 0);
+  assert.ok(orphan.warnings.some((w) => w.startsWith('record-no-athlete:')),
+    '"found it, cannot name the player" must be its own diagnosis: ' + JSON.stringify(orphan.warnings));
+  assert.ok(orphan.warnings[0].includes('longComment'), 'the warning should list the record keys it saw');
+  ok('15 · ⭐ "found a record but could not name the player" is reported separately from "found nothing"');
+}
+
+// ---- 9. the source chain is ordered cheapest-first and the old broken URL is kept LAST ------------------
 {
   const names = ESPN_INJURY_SOURCES.map((s) => s.name);
   assert.ok(names.length >= 2, 'a single source is a guess with no fallback — that is what failed');
   assert.strictEqual(ESPN_INJURY_SOURCES[0].urls.length, 1,
     'the first source should be the one-call league-wide endpoint, so the 32-call ones never run when it works');
-  // The URL that answered {} 32 times is kept, but last: it costs nothing once the others have failed.
+  // The URL that answered {} 32 times is kept but DEMOTED — it costs nothing once the others have failed,
+  // and if ESPN ever fills it in we pick it up for free.
+  assert.ok(names.indexOf('site-team') > 0, 'the endpoint that returned {} must not be tried first');
+  // ⭐ The expensive ref-following source must be dead LAST: it makes a request per injured player, and it
+  // exists only so one path's success does not depend on my guessing an envelope correctly.
   const last = ESPN_INJURY_SOURCES[ESPN_INJURY_SOURCES.length - 1];
-  assert.ok(/site\.api\.espn\.com.+teams.+injuries/.test(last.urls[0]),
-    'the endpoint that returned {} should be demoted to last, not trusted first');
+  assert.ok(last.expandRefs && last.expandRefs.max > 0 && last.expandRefs.concurrency > 0,
+    'the ref-expanding source should be last and bounded');
+  assert.ok(!ESPN_INJURY_SOURCES.slice(0, -1).some((s) => s.expandRefs),
+    'only the last source may follow refs — the rest must stay cheap');
   for (const s of ESPN_INJURY_SOURCES) {
     assert.ok(s.urls.length && s.urls.every((u) => /^https:\/\//.test(u)), 'bad url in source ' + s.name);
   }
-  ok('12 · ⭐ ESPN is a chain of sources, cheapest first, with the URL that returned nothing demoted to last');
+  ok('16 · ⭐ ESPN is a chain: cheapest first, the empty URL demoted, the expensive one last');
+
+  // The ref collector reads a core-API listing without following anything itself.
+  assert.deepStrictEqual(refsIn({ count: 2, items: [{ $ref: 'https://x/1' }, { $ref: 'https://x/2' }, { nope: 1 }] }),
+    ['https://x/1', 'https://x/2']);
+  assert.deepStrictEqual(refsIn({ items: [{ $ref: 'a' }, { $ref: 'b' }] }, 1), ['a'], 'the cap must be honoured');
+  assert.deepStrictEqual(refsIn(null), [], 'junk in, empty list out');
+  ok('17 · the $ref collector reads a core listing and honours its cap');
 }
 
-console.log(`\n${pass}/17 injury checks passed`);
+console.log(`\n${pass}/23 injury checks passed`);
