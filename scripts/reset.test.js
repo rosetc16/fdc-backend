@@ -87,7 +87,7 @@ const clearResets = async () => { await q('DELETE FROM password_resets').catch((
   const u = await seedUser('trey@example.com', 'oldpassword');
   const r = await callRoute('post', '/forgot', { email: 'trey@example.com' });
   assert.strictEqual(r.status, 200);
-  assert.deepStrictEqual(r.body, { ok: true });
+  assert.deepStrictEqual(r.body, { ok: true, sent: true });   // `sent` is the confirmation a silent send-failure can no longer fake
   assert.strictEqual(sentMail.length, 1, 'an email should have been sent');
   assert.strictEqual((await resets()).length, 1, 'a token row should exist');
 
@@ -166,16 +166,61 @@ const clearResets = async () => { await q('DELETE FROM password_resets').catch((
   ok('5 · asking again issues a new token and kills the previous one');
 }
 
-// ---- 6 · /forgot is not an account-existence oracle -------------------------------------------------
+// ---- 6 · ⭐⭐ AN UNKNOWN ADDRESS IS TOLD SO, AND THE ORACLE IS BOUNDED --------------------------------
+// Trey: "If they put in an email that doesn't have an account, can you share an error that says that email
+// doesn't exist with an account." This deliberately reverses the original design. The trade is managed, not
+// waved away: a caller gets a straight answer for the first few MISSES and then the endpoint goes back to
+// the indistinguishable response, so one person who mistyped their address is helped and somebody walking a
+// list of addresses is not.
 {
   await clearResets(); sentMail.length = 0;
   const real = await callRoute('post', '/forgot', { email: 'trey@example.com' });
   const fake = await callRoute('post', '/forgot', { email: 'nobody@example.com' });
-  assert.strictEqual(real.status, fake.status, 'status must not reveal whether the account exists');
-  assert.deepStrictEqual(real.body, fake.body, 'body must not reveal whether the account exists');
+  assert.strictEqual(real.status, 200, 'a real address should still get its link');
+  assert.strictEqual(fake.status, 404, 'an unknown address should be told there is no account');
+  assert.strictEqual(fake.body.code, 'NO_ACCOUNT');
+  assert.ok(/no Fantasy Draft Compass account/i.test(fake.body.error), `unhelpful message: ${fake.body.error}`);
+  assert.ok(fake.body.error.includes('nobody@example.com'), 'the message should name the address they typed');
   assert.strictEqual(sentMail.length, 1, 'no email should go to an address with no account');
   assert.strictEqual((await resets()).length, 1, 'no token should be minted for an unknown address');
-  ok('6 · an unknown address gets the same answer as a real one — no account-enumeration oracle');
+  ok('6 · ⭐⭐ an unknown address is told there is no account for it — the lockout Trey reported');
+}
+
+// ---- 6b · ⭐ …and a harvester runs out of answers ----------------------------------------------------
+// ⚠ THE FAILABLE HALF. Without the budget this endpoint answers "does this person have an account here"
+// an unlimited number of times, which is why it was hidden in the first place.
+{
+  await clearResets(); sentMail.length = 0;
+  let told = 0, refused = 0;
+  for (let i = 0; i < 30; i++) {
+    const r = await callRoute('post', '/forgot', { email: `ghost${i}@example.com` });
+    if (r.status === 404) told++; else if (r.status === 200) refused++;
+  }
+  assert.ok(told > 0, 'the honest answer never appeared at all');
+  assert.ok(told <= 12, `the endpoint answered ${told} unknown addresses in a row — that is a harvestable oracle`);
+  assert.ok(refused >= 15, `only ${refused} of 30 lookups fell back to the silent answer`);
+  assert.strictEqual(sentMail.length, 0, 'no mail should be sent to any of them');
+  // And a REAL address still works once the budget is spent — the limit must not lock out genuine users.
+  const still = await callRoute('post', '/forgot', { email: 'trey@example.com' });
+  assert.strictEqual(still.status, 200, 'the miss budget must never block a real reset');
+  assert.strictEqual(sentMail.length, 1, 'the real user should still get their email');
+  ok(`6b · ⭐ the oracle is bounded — ${told} straight answers, then ${refused} that reveal nothing, while a real address still gets its link`);
+}
+
+// ---- 6c · ⭐ "FORGOT USERNAME" IS NO LONGER A DEAD BUTTON --------------------------------------------
+// It set a local flag and said "we've sent its sign-in details there" without making a request — the exact
+// bug /forgot used to have. The username here IS the email, so the only useful thing it can do is say
+// whether that address has an account, and now it does, over the same bounded budget and with no email.
+{
+  sentMail.length = 0;
+  const yes = await callRoute('post', '/account-exists', { email: 'trey@example.com' });
+  assert.strictEqual(yes.status, 200);
+  assert.strictEqual(yes.body.exists, true);
+  const no = await callRoute('post', '/account-exists', { email: 'definitely-not-here@example.com' });
+  assert.ok(no.body.exists === false || no.body.exists === null, `unexpected body ${JSON.stringify(no.body)}`);
+  assert.strictEqual((await callRoute('post', '/account-exists', { email: 'nope' })).status, 400);
+  assert.strictEqual(sentMail.length, 0, 'a username lookup must not send email');
+  ok('6c · ⭐ the username lookup answers for real instead of claiming an email was sent');
 }
 
 // ---- 7 · input validation --------------------------------------------------------------------------
@@ -210,4 +255,4 @@ const clearResets = async () => { await q('DELETE FROM password_resets').catch((
 }
 
 await pool.end();
-console.log(`\n${pass}/8 password-reset checks passed`);
+console.log(`\n${pass} password-reset checks passed`);

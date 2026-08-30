@@ -59,13 +59,42 @@ authRouter.post('/signin', async (req, res) => {
 //
 // Design notes:
 //  · The token is random, and only its SHA-256 hash is stored. A leaked database row cannot be replayed.
-//  · /forgot always answers 200 with the same body whether or not the address exists — otherwise the
-//    endpoint doubles as a "does this person have an account here" oracle.
+//  · ⭐⭐ /forgot NAMES AN UNKNOWN ADDRESS. Trey: "If they put in an email that doesn't have an account,
+//    can you share an error that says that email doesn't exist with an account." That is a deliberate
+//    trade: the endpoint now confirms whether an address has an account, which is an enumeration oracle,
+//    and the reason it was originally hidden. It is a small site with no directory to protect and the
+//    alternative — a user typing the wrong address and waiting forever for an email that was never sent to
+//    anybody — is a real, frequent lockout. The risk is BOUNDED instead of accepted: LOOKUP_LIMIT misses
+//    per IP per window and the endpoint falls back to the old indistinguishable answer, so it cannot be
+//    used to harvest a list even though it can answer one honest question.
 //  · Tokens are single-use and expire in 30 minutes (the app already promises 30 minutes).
 //  · If mail isn't configured the endpoint says so plainly instead of claiming an email was sent. A
 //    silent no-op here is exactly the bug being fixed.
 const RESET_TTL_MIN = 30;
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+
+// ---- bounded enumeration ------------------------------------------------------------------------
+// One person who mistyped their address asks two or three times. Somebody walking a list of addresses to
+// find out who has an account asks hundreds. Count only the MISSES: a caller who keeps naming addresses
+// that don't exist is the second kind, and past the limit they get the old "same answer either way"
+// response, which tells them nothing.
+const LOOKUP_LIMIT = 8;
+const LOOKUP_WINDOW_MS = 15 * 60 * 1000;
+const lookupMisses = new Map();   // ip -> { n, until }
+function missBudgetLeft(ip) {
+  const now = Date.now();
+  const rec = lookupMisses.get(ip);
+  if (!rec || rec.until <= now) return true;
+  return rec.n < LOOKUP_LIMIT;
+}
+function noteMiss(ip) {
+  const now = Date.now();
+  const rec = lookupMisses.get(ip);
+  if (!rec || rec.until <= now) lookupMisses.set(ip, { n: 1, until: now + LOOKUP_WINDOW_MS });
+  else rec.n++;
+  if (lookupMisses.size > 5000) for (const [k, v] of lookupMisses) if (v.until <= now) lookupMisses.delete(k);
+}
+const ipOf = (req) => String(req.ip || (req.headers && req.headers['x-forwarded-for']) || 'unknown').split(',')[0].trim();
 
 let resetTableEnsured = false;
 async function ensureResetTable() {
@@ -124,12 +153,38 @@ authRouter.post('/forgot', async (req, res) => {
         [hashToken(token), user.id, String(RESET_TTL_MIN)]
       );
       const base = process.env.APP_URL || 'https://www.fantasydraftcompass.com';
-      await sendResetEmail(user.email, `${base}/?reset=${token}`);
+      const mailed = await sendResetEmail(user.email, `${base}/?reset=${token}`);
+      // ⚠ A send that silently failed used to answer "ok" — the same lockout in a different coat.
+      if (!mailed) return res.status(502).json({ error: "We couldn't send the reset email just now. Try again in a minute, or use \"Report a bug\" and we'll reset it by hand.", code: 'MAIL_FAILED' });
+      return res.json({ ok: true, sent: true });
     }
-    // Same answer either way — never confirm or deny that an account exists.
-    res.json({ ok: true });
+    // No account. Say so — unless this caller has spent its miss budget, in which case fall back to the
+    // answer that reveals nothing.
+    const ip = ipOf(req);
+    if (!missBudgetLeft(ip)) return res.json({ ok: true });
+    noteMiss(ip);
+    res.status(404).json({ error: `There's no Fantasy Draft Compass account for ${email}. Check the spelling, or create an account with that address.`, code: 'NO_ACCOUNT' });
   } catch (e) {
     res.status(500).json({ error: 'Could not start a password reset. Try again in a moment.' });
+  }
+});
+
+// ⭐ "FORGOT USERNAME" WAS THE SAME DEAD BUTTON /forgot USED TO BE — it set a local flag and told the user
+// "we've sent its sign-in details there" without making a request. The username on this site IS the email,
+// so there is nothing to send; the only useful thing it can do is answer whether that address has an
+// account. Same bounded-enumeration rule as /forgot, and no email at all.
+authRouter.post('/account-exists', async (req, res) => {
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'A valid email is required' });
+  try {
+    const { rows } = await q('SELECT id FROM users WHERE email=$1', [email]);
+    if (rows[0]) return res.json({ exists: true });
+    const ip = ipOf(req);
+    if (!missBudgetLeft(ip)) return res.json({ exists: null });   // budget spent: refuse to answer either way
+    noteMiss(ip);
+    res.json({ exists: false });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not look that up. Try again in a moment.' });
   }
 });
 
