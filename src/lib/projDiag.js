@@ -28,10 +28,10 @@ const USED = {
 export async function projDiagnose(season, mapStats) {
   const out = { season, positions: {}, hints: [] };
   const { rows } = await q(
-    `SELECT p.player_id, p.pos, pr.stats
+    `SELECT p.player_id, p.position AS pos, pr.stats
        FROM players p LEFT JOIN projections pr
          ON pr.player_id = p.player_id AND pr.season = $1 AND pr.source = 'sleeper'
-      WHERE p.pos IS NOT NULL`, [season]
+      WHERE p.position IS NOT NULL`, [season]
   );
   if (!rows.length) { out.hints.push('no players in the database — run Full refresh first'); return out; }
 
