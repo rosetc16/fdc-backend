@@ -12,17 +12,53 @@ import { getPlayoffSos } from '../lib/sosService.js';
 
 export const playerPackRouter = Router();
 
+// Exported so the admin `proj-check` diagnostic reports on the SAME mapper the pack uses. A diagnostic that
+// reimplements the thing it is diagnosing can agree with itself while production disagrees with both.
+export const mapStatsForDiag = (s) => mapStats(s);
+
 // Map Sleeper projection stat keys -> the engine's stat keys (see scoreFromStats in the front-end).
 function mapStats(s) {
   if (!s) return {};
   const n = (v) => (v == null ? undefined : Math.round(v * 10) / 10);
+  // Sleeper's projection blobs are not consistent about stat-key spelling across positions and seasons.
+  // `first` takes whichever alias is actually present; `sum` adds every alias that is (for buckets like
+  // 50-59 / 60+ that some seasons publish separately and others as one 50+ figure).
+  const first = (o, keys) => { for (const k of keys) if (o[k] != null) return o[k]; return undefined; };
+  const sum = (o, keys) => { let t, any = false; for (const k of keys) if (o[k] != null) { t = (t || 0) + o[k]; any = true; } return any ? t : undefined; };
+  const sum2 = (a, b) => (a == null && b == null ? undefined : (a || 0) + (b || 0));
   const out = {
     passYd: n(s.pass_yd), passTD: n(s.pass_td), INT: n(s.pass_int),
     rushAtt: n(s.rush_att), rushYd: n(s.rush_yd), rushTD: n(s.rush_td),
     rec: n(s.rec), tgt: n(s.rec_tgt), recYd: n(s.rec_yd), recTD: n(s.rec_td),
     fum: n(s.fum_lost),
-    // kicker
-    fg: n(s.fgm), fg50: n(s.fgm_50_59 != null || s.fgm_60p != null ? (s.fgm_50_59 || 0) + (s.fgm_60p || 0) : undefined), pat: n(s.xpm),
+    // ---- kicker ------------------------------------------------------------------------------
+    // ⚠ Trey: "I also think the Kicker projected points is extremely low (in the 40s)." A kicker with only
+    //   `pat` mapped scores almost exactly that (≈40 extra points × 1), which is the signature of the made
+    //   field goals never arriving. Sleeper is not consistent about which of these keys it publishes, and a
+    //   single spelling that misses is indistinguishable from a kicker who never kicks — so take the first
+    //   one that exists rather than betting on one name. `fga - fgmiss` is the last resort.
+    fg: n(first(s, ['fgm', 'fg_made', 'fgm_tot']) ?? (s.fga != null ? (s.fga || 0) - (s.fgmiss || s.fg_miss || 0) : undefined)),
+    // ⚠ Some seasons publish 50-59 and 60+ separately, others publish one 50+ figure. Adding all four
+    //   aliases would double-count a season that carries both, so take the split pair when it exists.
+    fg50: n(s.fgm_50_59 != null || s.fgm_60p != null
+      ? (s.fgm_50_59 || 0) + (s.fgm_60p || 0)
+      : first(s, ['fgm_50p', 'fgm_50'])),
+    pat: n(first(s, ['xpm', 'pat_made', 'xp_made'])),
+    fgMiss: n(first(s, ['fgmiss', 'fg_miss', 'fgm_miss'])),
+    // ---- team defense ------------------------------------------------------------------------
+    // ⭐⭐ THIS BLOCK DID NOT EXIST. Trey: "can you check DST point projections… most/all are coming up as
+    //   0 (and VBD is 0)." Not a rounding problem or a scoring-setting problem — mapStats had no team-defense
+    //   branch at all, so every DST reached the engine with an EMPTY stat object. scoreFromStats then
+    //   computes `max(0, 35 - (pa ?? 350)/10) * paPer` = 0 and adds nothing else, which is why the number
+    //   was a clean zero rather than a wrong one. The same key names are already used by connect.js, which
+    //   is how I know they are the ones Sleeper publishes.
+    sack: n(first(s, ['sack', 'def_sack', 'sacks'])),
+    dint: n(first(s, ['int', 'def_int', 'ints'])),
+    dfr: n(first(s, ['fum_rec', 'def_fr', 'def_fum_rec'])),
+    // A defensive touchdown and a special-teams touchdown both score for the DST unit and are separate
+    //   Sleeper fields — but `def_st_td` and `st_td` are two names for the same one, so only one counts.
+    dtd: n(sum2(first(s, ['def_td', 'def_dtd']), first(s, ['def_st_td', 'st_td']))),
+    pa: n(first(s, ['pts_allow', 'pts_allowed', 'def_pa'])),
     // idp (Sleeper uses idp_* keys)
     solo: n(s.idp_tkl_solo), ast: n(s.idp_tkl_ast), idpSack: n(s.idp_sack), tfl: n(s.idp_tkl_loss),
     qbh: n(s.idp_qb_hit), idpInt: n(s.idp_int), pd: n(s.idp_pass_def), ff: n(s.idp_ff), fr: n(s.idp_fum_rec),

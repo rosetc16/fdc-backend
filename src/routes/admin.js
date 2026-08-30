@@ -88,6 +88,15 @@ adminRouter.post('/run-job', async (req, res) => {
       // JOIN, which is the one number a per-job summary can never show.
       const { sosDiagnose } = await import('../lib/sosService.js');
       detail = await sosDiagnose(Number(req.body.season) || config.activeSeason, Number(req.body.pw) || 15);
+    } else if (job === 'proj-check') {
+      // ⭐ THE INSTRUMENT for "DST projections are all 0 and kickers score 40". The DST half was certain —
+      // mapStats had no team-defense branch — but WHICH key the kicker's made field goals arrive under is
+      // something only the live feed can answer, and Sleeper is unreachable from a sandbox. This prints, per
+      // position, how many players have a projection at all, the raw keys those projections carry, what the
+      // mapper makes of them, and which stats the engine reads that never survive.
+      const { projDiagnose } = await import('../lib/projDiag.js');
+      const { mapStatsForDiag } = await import('./playerPack.js');
+      detail = await projDiagnose(Number(req.body.season) || config.activeSeason, mapStatsForDiag);
     } else if (job === 'injuries') {
       // Detailed injury reports: 32 ESPN team calls merged over Sleeper's designations. Safe to run any
       // time — it only ever writes detail columns, never the designation the leagues actually see.
