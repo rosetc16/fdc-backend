@@ -45,6 +45,9 @@ function mapStats(s) {
       : first(s, ['fgm_50p', 'fgm_50'])),
     pat: n(first(s, ['xpm', 'pat_made', 'xp_made'])),
     fgMiss: n(first(s, ['fgmiss', 'fg_miss', 'fgm_miss'])),
+    // Distance buckets when Sleeper publishes them. The engine models the 40-49 share when it can't see it,
+    // so passing the real count through is strictly better than the estimate.
+    fg40: n(sum(s, ['fgm_40_49'])),
     // ---- team defense ------------------------------------------------------------------------
     // ⭐⭐ THIS BLOCK DID NOT EXIST. Trey: "can you check DST point projections… most/all are coming up as
     //   0 (and VBD is 0)." Not a rounding problem or a scoring-setting problem — mapStats had no team-defense

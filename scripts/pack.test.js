@@ -91,5 +91,29 @@ const scoreD = (s) => (s.sack || 0) * DEFAULT.sack + (s.dint || 0) * DEFAULT.din
   ok('5 · a running back maps exactly as before, with no kicking or defensive keys attached');
 }
 
-console.log(`\n${pass}/5 player-pack mapping checks passed`);
+// ---- 6 · ⭐⭐ SLEEPER'S FIELD-GOAL DISTANCE SETTINGS ARE VALUES, NOT BONUSES -----------------------
+// Trey: "I wonder if you're not taking into account the rules for different points for different length
+// field goals… or the value of PATs. Something is off."
+// Two separate things were wrong. The engine had no 40-49 bonus at all, so a league scoring long field
+// goals at 4 graded every one of them as a 3. And Sleeper expresses distance scoring as ABSOLUTE VALUES
+// (`fgm_0_19 … fgm_50p`, default 3/3/3/4/5) while the engine models a base plus bonuses — importing 4
+// straight into the bonus would have scored a 45-yarder as 3 + 4 = 7, overshooting in the other direction.
+import { mapSleeperScoringForDiag as mapScoring } from '../src/routes/connect.js';
+{
+  const dflt = mapScoring({ fgm_0_19: 3, fgm_20_29: 3, fgm_30_39: 3, fgm_40_49: 4, fgm_50p: 5, xpm: 1, fgmiss: -1 });
+  assert.strictEqual(dflt.fg, 3, `base field goal came through as ${dflt.fg}`);
+  assert.strictEqual(dflt.fg40, 1, `a 40-49 yarder worth 4 should be a +1 bonus, got ${dflt.fg40}`);
+  assert.strictEqual(dflt.fg50, 2, `a 50+ yarder worth 5 should be a +2 bonus, got ${dflt.fg50}`);
+  assert.strictEqual(dflt.pat, 1);
+  // a generous league: 5 / 6 for the long ones
+  const rich = mapScoring({ fgm_0_19: 3, fgm_40_49: 5, fgm_50p: 6, xpm: 1 });
+  assert.strictEqual(rich.fg40, 2); assert.strictEqual(rich.fg50, 3);
+  // ⚠ a flat-scoring league must not gain phantom bonuses
+  const flat = mapScoring({ fgm: 3, xpm: 1 });
+  assert.strictEqual(flat.fg, 3);
+  assert.ok(flat.fg40 === undefined && flat.fg50 === undefined, `a flat league picked up distance bonuses: ${JSON.stringify(flat)}`);
+  ok(`6 · ⭐⭐ distance scoring converts to bonuses (4 → +1, 5 → +2; a generous 5/6 → +2/+3) and a flat league gains none`);
+}
+
+console.log(`\n${pass}/6 player-pack mapping checks passed`);
 process.exit(0);

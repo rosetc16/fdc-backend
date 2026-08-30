@@ -121,6 +121,9 @@ connectRouter.get('/sleeper/my-leagues', async (req, res) => {
 
 
 // Map a Sleeper draft's scoring/roster settings to our league cfg shape (best-effort; user can edit).
+// Exported for the pack-mapping test, so the distance-scoring conversion is checked against the SAME code
+// the import runs rather than a copy of it that can drift.
+export const mapSleeperScoringForDiag = (scoring) => cfgFromLeague({ scoring_settings: scoring, roster_positions: [] }, null).scoring;
 function cfgFromLeague(league, draft) {
   const rp = (league && league.roster_positions) || (draft && draft.settings && []) || [];
   const count = (pos) => rp.filter((p) => p === pos).length;
@@ -164,7 +167,17 @@ function cfgFromLeague(league, draft) {
   // common yardage bonuses
   setIf('bonus300pass', num('bonus_pass_yd_300'));
   // kicker
-  setIf('fg', num('fgm')); setIf('pat', num('xpm')); setIf('fgMiss', num('fgmiss'));
+  // ⚠⚠ SLEEPER'S DISTANCE KEYS ARE ABSOLUTE VALUES, THE ENGINE'S ARE BONUSES. Sleeper publishes
+  //   `fgm_0_19 … fgm_50p` as what a made field goal of that length is WORTH (default 3/3/3/4/5); the
+  //   engine models a base plus a bonus for the long ones. Importing 4 straight into `fg40` would score a
+  //   45-yarder as 3 + 4 = 7. Convert: base = the short bucket (or the flat `fgm`, or 3), bonuses = the
+  //   long buckets MINUS that base. A league with no distance settings just keeps the flat value.
+  const fgBase = num('fgm_0_19') != null ? num('fgm_0_19') : (num('fgm') != null ? num('fgm') : null);
+  setIf('fg', fgBase);
+  const base = fgBase != null ? fgBase : 3;
+  if (num('fgm_40_49') != null) setIf('fg40', Math.max(0, num('fgm_40_49') - base));
+  if (num('fgm_50p') != null) setIf('fg50', Math.max(0, num('fgm_50p') - base));
+  setIf('pat', num('xpm')); setIf('fgMiss', num('fgmiss'));
   // DST
   setIf('sack', num('sack')); setIf('dint', num('int')); setIf('dfr', num('fum_rec')); setIf('dtd', num('def_td'));
   // Positional MAXIMUMS: some Sleeper leagues cap how many of a position you can roster. Sleeper stores these
