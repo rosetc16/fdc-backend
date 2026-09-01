@@ -57,7 +57,7 @@ export async function getAllPlayers({ force = false } = {}) {
 }
 
 // ---- Projections (season). Sleeper stats API host differs from the v1 base. ----
-const STATS_BASE = 'https://api.sleeper.app';
+const STATS_BASE = config.sleeperStatsBase;
 export async function getSeasonProjections(season, { positions } = {}) {
   // returns array of { player_id, stats: {...}, ... }
   const posQ = (positions || ['QB', 'RB', 'WR', 'TE', 'K', 'DEF', 'DL', 'LB', 'DB']).map((p) => `position[]=${p}`).join('&');

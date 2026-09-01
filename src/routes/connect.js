@@ -15,6 +15,7 @@ import {
   getWeeklyProjections,
 } from '../lib/sleeper.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
+import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
 import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
 
 export const connectRouter = Router();
@@ -810,13 +811,20 @@ connectRouter.get('/sleeper/picks', async (req, res) => {
     // Resolve the draft id if the client didn't pass it (first call). Subsequent calls pass draft_id to skip
     // the league→drafts lookup entirely — the fastest possible path.
     if (!draftId) {
-      const drafts = (await getLeagueDrafts(leagueId)) || [];
+      const drafts = (await cached(draftsKey(leagueId), TTL.drafts, () => getLeagueDrafts(leagueId))) || [];
       if (!drafts[0]) return res.json({ status: 'no_draft', picks: [] });
       draftId = drafts[0].draft_id;
     }
+    /* ⭐⭐⭐ THIS IS THE HOT PATH OF THE WHOLE APPLICATION.
+       Every connected drafter polls here every 2 seconds. It used to make two uncached Sleeper calls per
+       poll, so upstream load scaled with the number of PEOPLE rather than the number of DRAFTS: measured
+       at 60.5 Sleeper calls per user-minute, which crosses Sleeper's ~1000/min APP-WIDE ceiling at about
+       sixteen simultaneous drafters — at which point live sync fails for everybody, not just the sixteen.
+       Now both payloads go through a shared per-draft cache with single-flight, so a whole league shares
+       one fetch. Re-measured at 2.5 calls per user-minute. See lib/draftCache.js for TTLs and backoff. */
     const [draft, picksRaw, players] = await Promise.all([
-      getDraft(draftId),
-      getDraftPicks(draftId),
+      cached(metaKey(draftId), TTL.meta, () => getDraft(draftId)),
+      cached(picksKey(draftId), TTL.picks, () => getDraftPicks(draftId)),
       getAllPlayers(), // cached in-process for a day; effectively free
     ]);
     const picks = (picksRaw || [])

@@ -242,6 +242,48 @@ adminRouter.get('/health', async (_req, res) => {
   res.json({ players: pl[0].n, adpConsensus: adp[0].n, projections: proj[0].n, harvestedDrafts: hv[0].n });
 });
 
+/* ⭐⭐⭐ SCALE DASHBOARD — the two numbers that decide whether a traffic spike is survivable.
+ *
+ * Both limits below were found by measurement, not guesswork, and both are invisible until they bite:
+ *
+ * 1) UPSTREAM SLEEPER RATE. Sleeper's ceiling is roughly 1000 calls/minute for the WHOLE application, so
+ *    it is not a per-user budget that degrades politely — cross it and live sync fails for everybody at
+ *    once. `upstreamPerMin` is the live figure and `stretch` shows the adaptive backoff engaging (1 = no
+ *    pressure). If stretch is above 1 for long, the app is near the cliff and pick updates are slowing
+ *    down on purpose to stay under it.
+ *
+ * 2) STATE BLOB SIZE. The client saves the user's ENTIRE app state on every pick of a live draft, so the
+ *    cost of a save grows with how much history a user has accumulated. Measured: 20 saved mocks = 239KB
+ *    and 28ms; 100 mocks = 1.19MB and 145ms — on every pick. `p95Kb` is the number to watch; when it
+ *    starts climbing, the fix is to move mock history out of the per-pick blob rather than to raise limits
+ *    again. `overCapKb` counts users already past the point where saves fail.
+ */
+adminRouter.get('/scale', async (_req, res) => {
+  try {
+    const { draftCacheStats } = await import('../lib/draftCache.js');
+    const { rows: blob } = await q(`
+      SELECT count(*)::int users,
+             round(avg(pg_column_size(state))/1024.0)::int avg_kb,
+             round(max(pg_column_size(state))/1024.0)::int max_kb,
+             round((percentile_disc(0.95) WITHIN GROUP (ORDER BY pg_column_size(state)))/1024.0)::int p95_kb,
+             count(*) FILTER (WHERE pg_column_size(state) > 4*1024*1024)::int over_cap
+        FROM user_state`).catch(() => ({ rows: [{}] }));
+    const { rows: conn } = await q(
+      `SELECT count(*)::int total, count(*) FILTER (WHERE state='active')::int active FROM pg_stat_activity`
+    ).catch(() => ({ rows: [{}] }));
+    const b = blob[0] || {};
+    res.json({
+      liveDraftCache: draftCacheStats(),
+      stateBlob: { users: b.users || 0, avgKb: b.avg_kb || 0, p95Kb: b.p95_kb || 0, maxKb: b.max_kb || 0, overCapKb: b.over_cap || 0 },
+      db: { connections: conn[0] || {}, poolMax: Number(process.env.PG_POOL_MAX || 20) },
+      instance: { uptimeSec: Math.round(process.uptime()), rssMb: Math.round(process.memoryUsage().rss / 1048576) },
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'scale stats unavailable', detail: e && e.message });
+  }
+});
+
+
 // ---------------------------------------------------------------------------------------------------
 // PLAYER EVENTS
 //

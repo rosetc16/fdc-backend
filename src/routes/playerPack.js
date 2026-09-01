@@ -12,6 +12,43 @@ import { getPlayoffSos } from '../lib/sosService.js';
 
 export const playerPackRouter = Router();
 
+/* ⭐⭐⭐ DEGRADATION IS PER-POSITION, NOT PER-BOARD.
+ *
+ * `adpDegraded` means "this number was measured in a DIFFERENT format from the one you asked for". The
+ * client takes it seriously: a degraded player is excluded from the ADP health guards, from VBD's ADP
+ * anchor, and from the trusted-ADP count — and if EVERY player is degraded the app concludes it has no
+ * usable market and ranks the whole board by projections instead.
+ *
+ * That makes a board-wide flag far too blunt. Sleeper publishes no TE-premium ADP at all, so a TEP league
+ * must always be answered with standard-TE numbers. Flagging the entire board for it would throw away 250
+ * perfectly good RB/WR/QB numbers because of a setting that only moves tight ends — trading a small, known
+ * inaccuracy at one position for a total loss of market data at every position.
+ *
+ * So we ask, per axis, which positions that axis actually re-prices:
+ *   · POOL (redraft vs dynasty vs rookie) — everyone. Dynasty prices age: Kelce 89 redraft, 129 dynasty.
+ *   · QB (1QB vs superflex)               — everyone, QBs enormously. Josh Allen 21.0 in 1QB, 3.6 in 2QB;
+ *                                           and because QBs eat early picks, every other position slides
+ *                                           later too (Chase 3.2 -> 4.9).
+ *   · SCORING (PPR/half/standard)         — every pass-catcher and receiving back. NOT quarterbacks, whose
+ *                                           scoring is passing-based and unmoved by points per reception.
+ *   · TE (standard vs premium)            — tight ends only. A TE premium does not move a running back.
+ *
+ * The result: a TE-premium league keeps exact-format confidence everywhere except at TE, where it is
+ * honestly marked provisional and can be overridden by TE-premium-aware harvested drafts.
+ */
+function degradationAxes(reqFmt, gotFmt) {
+  const r = String(reqFmt || '').split('|'), g = String(gotFmt || '').split('|');
+  return { scoring: r[0] !== g[0], qb: r[1] !== g[1], te: r[2] !== g[2], pool: r[3] !== g[3] };
+}
+function degradedForPos(pos, axes) {
+  if (!axes) return false;
+  if (axes.pool || axes.qb) return true;                 // re-prices the whole board
+  if (axes.scoring) return pos !== 'QB';                 // reception scoring moves everyone but QBs
+  if (axes.te) return pos === 'TE';                      // a TE premium moves tight ends and nobody else
+  return false;
+}
+
+
 // Exported so the admin `proj-check` diagnostic reports on the SAME mapper the pack uses. A diagnostic that
 // reimplements the thing it is diagnosing can agree with itself while production disagrees with both.
 export const mapStatsForDiag = (s) => mapStats(s);
@@ -72,6 +109,24 @@ function mapStats(s) {
   return out;
 }
 
+/* Season points from the MAPPED stats, under a given points-per-reception value.
+ *
+ * This exists only to give the TE-premium model an exchange rate between points and draft slots, so it is
+ * deliberately the plain standard-scoring formula every site shares (yardage, touchdowns, turnovers, plus
+ * whatever the league pays per catch). It is not used to rank the board, price a player, or grade a pick —
+ * the front-end engine does all of that with the league's full custom scoring. Keeping this narrow is the
+ * point: a second, subtly different scoring model competing with the real one is how two screens start
+ * disagreeing about the same player.
+ */
+function ptsFromMapped(s, rec) {
+  if (!s) return 0;
+  const n = (v) => Number(v) || 0;
+  return n(s.passYd) * 0.04 + n(s.passTD) * 4 - n(s.INT) * 2
+    + n(s.rushYd) * 0.1 + n(s.rushTD) * 6
+    + n(s.recYd) * 0.1 + n(s.recTD) * 6 + n(s.rec) * rec
+    - n(s.fum) * 2;
+}
+
 // Rough rookie flag: Sleeper carries years_exp (0 = rookie). We pass it through from players table
 // if present (added opportunistically); otherwise null.
 // GET /api/player-pack?format=...&season=...
@@ -89,7 +144,12 @@ playerPackRouter.get('/', async (req, res) => {
     // ⚠ The playoff window CHANGES the SOS numbers, so it must be part of the cache identity. Leaving it out
     // would serve a week-14 league the week-15 league's schedule read — the same class of bug as the K/DST
     // pack collision, where two league shapes shared a key and whichever loaded first won for everybody.
-    'pw' + (Number(req.query.pw) || 15)].join('~');
+    'pw' + (Number(req.query.pw) || 15),
+    // ⚠ THE TE-PREMIUM SIZE IS PART OF THE RESPONSE, SO IT IS PART OF THE KEY. Two leagues can share a
+    //   format key (both "TEP") and still deserve different tight-end numbers — a 0.5/rec premium and a
+    //   1.5/rec premium are not the same market. Leaving this out would serve whichever league asked
+    //   first to every league behind it: correct on the first request of the day, quietly wrong after.
+    `t${Number(req.query.tep || 0) || 0}`].join('~');
   const cached = packCacheGet(cacheKey);
   if (cached) {
     // Let the browser/CDN reuse it too, so a repeat open doesn't even reach us.
@@ -115,7 +175,19 @@ playerPackRouter.get('/', async (req, res) => {
   // with no rookie-ADP yet gets no published number and the engine ranks him by rookie value instead.
   const pubFallbacks = (key) => {
     const [scoring, qb, te, pool, teams] = key.split('|');
-    const pools = pool === 'ROOKIE' ? ['ROOKIE'] : pool === 'KEEPER' ? [pool, 'DYNASTY'] : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
+    /* ⭐⭐⭐ KEEPER DEGRADES TO REDRAFT, NOT DYNASTY.
+       This one line was the whole of Trey's live-draft complaint. A keeper league asked for
+       PPR|1QB|STD|KEEPER|12; the published sync wrote no KEEPER keys at all, so the chain fell to
+       DYNASTY — a genuinely different market (Kelce: 89 redraft, 129 dynasty; Derrick Henry: 20 vs 47)
+       and, before the sentinel fix, one where 1QB dynasty was 999 for everyone.
+       A keeper league is a REDRAFT draft with some players already off the board. The keepers change WHO
+       is available, not what the rest of the room is worth. Sleeper's own keeper draft rooms show the
+       redraft numbers, which is why his app said 39 and his screen said 52.
+       The sync now writes REDRAFT numbers into KEEPER keys directly, so this is usually an exact hit;
+       REDRAFT stays here ahead of DYNASTY as the fallback for any player the redraft market misses. */
+    const pools = pool === 'ROOKIE' ? ['ROOKIE']
+      : pool === 'KEEPER' ? [pool, 'REDRAFT', 'DYNASTY']
+      : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
     const qbs = qb === 'SF' ? ['SF', '1QB'] : ['1QB'];
     // HALF and PPR are close; both are far from STD. Try the league's own scoring first, then its neighbor,
     // before STD. Crucially we EXHAUST TE-premium-preserving variants (all scorings, all team counts) BEFORE
@@ -273,7 +345,10 @@ playerPackRouter.get('/', async (req, res) => {
     // Did the published number actually come from the format we asked for, or from a DEGRADED fallback?
     // The fallback chain will happily answer an SF request with a 1QB number, or a TE-premium request with a
     // standard-TE number. Those are the wrong market for this league.
-    const pubIsExactFormat = pubFmtForPlayer === format;
+    // Exact when the supplying format IS the requested one; otherwise exact for THIS PLAYER when none of
+    // the axes that differ actually re-price his position (see degradationAxes above).
+    const pubAxes = pubFmtForPlayer ? degradationAxes(format, pubFmtForPlayer) : null;
+    const pubIsExactFormat = pubFmtForPlayer === format || (pubFmtForPlayer != null && !degradedForPos(pos, pubAxes));
     // A format-correct harvested consensus with a healthy sample is the REAL market for this exact league —
     // superflex-aware, TE-premium-aware, dynasty-aware. Require a slightly larger sample than the bare
     // minimum before we let it outrank a published number, so a couple of odd drafts can't move a star.
@@ -313,6 +388,17 @@ playerPackRouter.get('/', async (req, res) => {
     } else if (adp) {
       adpVal = Number(adp.consensus); adpLo = Number(adp.lo); adpHi = Number(adp.hi); trend = Number(adp.trend); sampleN = adp.sample_n; adpSrc = 'harvest';
     }
+    /* ⭐⭐ LAST LINE OF DEFENCE AGAINST A SENTINEL ON THE BOARD.
+       The ingest job now drops Sleeper's 999 marker, which is where it should be caught. This is the
+       backstop for every OTHER way a ~999 could arrive — a harvested consensus computed before that fix
+       landed and still sitting in adp_consensus, a manual ranking uploaded with a placeholder, a future
+       feed with its own marker. A draft has teams x rounds picks; ~200 is a big league. Nothing legitimate
+       is ever 900. Treat it as "no ADP" (which is what it means) rather than shipping it as a pick and
+       letting the engine sort a player to the bottom of the board with total confidence. */
+    if (adpVal != null && adpVal >= 900) { adpVal = null; adpLo = null; adpHi = null; trend = null; sampleN = 0; adpSrc = null; }
+    // A player kept ONLY because he had a "published" number that turned out to be a sentinel is not a
+    // real board entry — without a projection there is nothing left to rank him by.
+    if (adpVal == null && !proj) continue;
     pack.push({
       id: pl.player_id,
       name: pl.full_name,
@@ -345,6 +431,78 @@ playerPackRouter.get('/', async (req, res) => {
       floor: proj && proj.floor_pts != null ? Number(proj.floor_pts) : null,
       ceil: proj && proj.ceil_pts != null ? Number(proj.ceil_pts) : null,
     });
+  }
+
+  /* ⭐⭐⭐ TE PREMIUM: THE ONE FORMAT DIMENSION NOBODY PUBLISHES.
+   *
+   * Sleeper's payload carries twelve ADP fields and not one is TE-premium, so a TEP league can only be
+   * answered three ways: with standard-TE numbers (wrong, and tight ends are the entire point of the
+   * setting), with harvested TEP drafts (right, but only once enough exist), or with a model.
+   *
+   * A model was written here and then taken back out of the default path, which is worth recording so it
+   * is not rebuilt the same way. The first version converted the premium into points (receptions x bonus)
+   * and walked the player up the board's own points-per-pick curve. It moved Brock Bowers from ADP 23 to
+   * 1.5 overall on a HALF-point premium, and produced identical output at 0.5 and 1.5 because both pinned
+   * against the cap. Two faults, one conceptual and one about evidence:
+   *
+   *   1. Points are the wrong currency; VALUE OVER REPLACEMENT is. A TE premium pays every tight end,
+   *      including the replacement-level one you would have taken instead, so an elite TE only gains
+   *      (his receptions - replacement TE receptions) x bonus. Scoring him on his full reception count
+   *      credits him for points the alternative also receives, which is why the shift came out enormous.
+   *   2. It could not be measured. Validating a points-based model needs real projections across the whole
+   *      board; the accuracy rig is seeded from Sleeper's published ADP, which is real, but its projection
+   *      column is synthetic. An unvalidated model that moves a player twenty picks is worse than an
+   *      honest "we do not have this number" — it is wrong with confidence, which is the failure this
+   *      whole change set exists to remove.
+   *
+   * So the shift is VBD-based now, and it is OPT-IN (`&tepModel=1`) rather than on by default. What ships
+   * for a TE-premium league is the honest path: the standard-TE number, flagged `adpDegraded` at TE only
+   * (see degradationAxes), which both tells the client it is provisional and lets format-correct harvested
+   * TEP drafts — which are genuinely TE-premium aware — override it as they accumulate. The admin manual
+   * ranking upload covers the same gap deliberately (see MANUAL_RANKING in adpConsensus).
+   */
+  const tep = Number(req.query.tep || 0);
+  if (tep > 0 && String(req.query.tepModel || '') === '1') {
+    const recVal = format.split('|')[0] === 'PPR' ? 1 : format.split('|')[0] === 'HALF' ? 0.5 : 0;
+    const tes = pack.filter((p) => p.pos === 'TE' && p.adp != null && p.adp < 900 && Number(p.stats && p.stats.rec) > 0)
+      .sort((a, b) => Number(a.adp) - Number(b.adp));
+    // Replacement TE = the last one a 12-team league would start (one TE per team). Everything above him
+    // is only worth the receptions he gains OVER that baseline.
+    const teamCount = Number((format.split('|')[4] || '12').replace('+', '')) || 12;
+    const repl = tes[Math.min(tes.length - 1, teamCount - 1)];
+    if (repl && tes.length >= 6) {
+      const replRec = Number(repl.stats.rec) || 0;
+      const usable = pack.filter((p) => p.adp != null && p.adp < 900 && ptsFromMapped(p.stats, recVal) > 0);
+      const adpsAsc = usable.map((p) => Number(p.adp)).sort((a, b) => a - b);
+      const ptsDesc = usable.map((p) => ptsFromMapped(p.stats, recVal)).sort((a, b) => b - a);
+      // Monotone by construction: the k-th earliest pick in this market buys the k-th best projection.
+      const curve = adpsAsc.map((adp, i) => ({ adp, pts: ptsDesc[i] }));
+      const ptsAtAdp = (a) => {
+        if (a <= curve[0].adp) return curve[0].pts;
+        if (a >= curve[curve.length - 1].adp) return curve[curve.length - 1].pts;
+        let lo = 0, hi = curve.length - 1;
+        while (hi - lo > 1) { const m = (lo + hi) >> 1; if (curve[m].adp <= a) lo = m; else hi = m; }
+        const span = curve[hi].adp - curve[lo].adp;
+        const t = span > 0 ? (a - curve[lo].adp) / span : 0;
+        return curve[lo].pts + t * (curve[hi].pts - curve[lo].pts);
+      };
+      const adpAtPts = (want) => {
+        for (let i = 0; i < curve.length; i++) if (curve[i].pts <= want) return curve[i].adp;
+        return curve[curve.length - 1].adp;
+      };
+      const MAX_SHIFT = 12; // a model may nudge the market, never rewrite it
+      for (const p of tes) {
+        const gain = Math.max(0, (Number(p.stats.rec) || 0) - replRec) * tep;
+        if (gain <= 0) continue;
+        const moved = adpAtPts(ptsAtAdp(Number(p.adp)) + gain);
+        const shift = Math.max(0, Math.min(MAX_SHIFT, Number(p.adp) - moved));
+        if (shift >= 0.5) {
+          p.adpBefore = p.adp;
+          p.adp = Math.round((Number(p.adp) - shift) * 10) / 10;
+          p.adpModel = `te-premium+${tep}`;
+        }
+      }
+    }
   }
 
   // sort by ADP (players without ADP sink to the bottom, ordered by having a projection)

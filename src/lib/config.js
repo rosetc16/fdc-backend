@@ -31,6 +31,10 @@ export const config = {
   seasonPassCents: Number(process.env.SEASON_PASS_CENTS || 1999),
 
   sleeperBase: process.env.SLEEPER_BASE || 'https://api.sleeper.app/v1',
+  // The stats/projections host is a DIFFERENT origin from the v1 API. Overridable so the ADP accuracy
+  // rig can point the real ingest code at a fixture server instead of reaching the live API — the
+  // measurement then exercises the shipping code path rather than a re-implementation of it.
+  sleeperStatsBase: process.env.SLEEPER_STATS_BASE || 'https://api.sleeper.app',
   activeSeason: Number(process.env.ACTIVE_SEASON || new Date().getFullYear()),
   leagueYearCutoff: process.env.LEAGUE_YEAR_CUTOFF || `${new Date().getFullYear() + 1}-03-01`,
 

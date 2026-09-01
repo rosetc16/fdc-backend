@@ -9,6 +9,7 @@ import cron from 'node-cron';
 import { config } from './lib/config.js';
 import { log } from './lib/log.js';
 import { attachUser } from './lib/auth.js';
+import { withJobLock } from './lib/jobs.js';
 
 import { authRouter } from './routes/auth.js';
 import { adpRouter } from './routes/adp.js';
@@ -46,9 +47,33 @@ app.use(pinoHttp({ logger: log }));
 app.post('/api/payments/webhook', express.raw({ type: '*/*' }), stripeWebhookHandler);
 
 // JSON parser for everything else. We skip the webhook path so its raw body is never re-parsed.
+/* ⭐⭐⭐ THE STATE BLOB NEEDS A BIGGER BODY LIMIT THAN EVERYTHING ELSE, AND THIS MISMATCH LOST DATA.
+ *
+ * /api/state stores the user's whole app state — every league, every draft's picks, every saved mock —
+ * and its own guard rejects anything over 4MB. But the parser in front of it capped bodies at 1MB, so a
+ * blob between those two numbers never reached the route at all: express threw a parse error, the generic
+ * handler turned it into `500 Server error`, and the client saw a failed save with no explanation.
+ *
+ * Measured (adpfix/staterig.mjs): a user with 100 saved mocks produces a 1.19MB blob. That is not an
+ * abuse case, it is an ENTHUSIAST — precisely the user who runs lots of mocks, and precisely the user a
+ * burst of new signups produces. Their save failed silently, on every pick, mid-draft.
+ *
+ * So the state route gets a limit above its own 4MB guard (the guard is then the real boundary and can
+ * return a clear 413), while everything else stays at 1MB — no reason to widen the surface elsewhere.
+ */
+const stateJson = express.json({ limit: '5mb' });
+const normalJson = express.json({ limit: '1mb' });
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/payments/webhook') return next();
-  return express.json({ limit: '1mb' })(req, res, next);
+  if (req.path.startsWith('/api/state')) return stateJson(req, res, next);
+  return normalJson(req, res, next);
+});
+// Body-size failures must say so. Falling through to the generic 500 is what made this invisible.
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({ error: 'That save is too large. Try removing some old saved mock drafts.' });
+  }
+  return next(err);
 });
 app.use(attachUser);
 
@@ -128,20 +153,26 @@ server = app.listen(config.port, () => {
   if (process.env.DISABLE_INPROCESS_CRON !== '1') {
     // Daily full refresh (players, projections, published ADP, harvest, consensus, AND player news)
     // at 4:00 AM. Player news refreshes here automatically — no manual admin run needed.
+    /* ⭐⭐⭐ EVERY SCHEDULED JOB IS NOW SINGLE-INSTANCE (see withJobLock in lib/jobs.js).
+       These crons live in-process, so with N web instances they fired N times: N nightly refreshes, N
+       harvests crawling the same Sleeper league graph. The harvest one is the dangerous half — it spends
+       the SAME ~1000/min Sleeper budget the live-draft path depends on, so scaling out to survive a
+       traffic spike is exactly what would have caused live sync to fail during it. A Postgres advisory
+       lock costs nothing, needs no table, and releases itself if an instance dies mid-job. */
     cron.schedule('0 4 * * *', () => {
       log.info('cron: daily refreshAll starting');
-      refreshAll().catch((e) => log.error(e, 'cron refreshAll failed'));
+      withJobLock('refreshAll', () => refreshAll()).catch((e) => log.error(e, 'cron refreshAll failed'));
     });
     // midday published-ADP-only refresh (fast; keeps ADP fresh as it moves)
     cron.schedule('15 16 * * *', async () => {
-      try { const { refreshAdpOnly } = await import('./jobs/refreshAdpOnly.js'); log.info('cron: midday ADP refresh'); await refreshAdpOnly(); }
+      try { const { refreshAdpOnly } = await import('./jobs/refreshAdpOnly.js'); log.info('cron: midday ADP refresh'); await withJobLock('refreshAdpOnly', () => refreshAdpOnly()); }
       catch (e) { log.error(e, 'cron midday ADP failed'); }
     });
     // Draft-trends pool growth: harvest a fresh batch several times a day (in addition to the 4 AM full
     // refresh) so the "How the field drafts" pool broadens across the league graph steadily rather than
     // once a night. Each pass crawls the next slice of not-yet-visited users.
     cron.schedule('30 */4 * * *', async () => {
-      try { const { harvestSleeperDrafts } = await import('./jobs/harvestSleeperDrafts.js'); log.info('cron: periodic harvest pass'); const r = await harvestSleeperDrafts(); log.info(r, 'cron: harvest pass done'); }
+      try { const { harvestSleeperDrafts } = await import('./jobs/harvestSleeperDrafts.js'); log.info('cron: periodic harvest pass'); const r = await withJobLock('harvest', () => harvestSleeperDrafts()); log.info(r, 'cron: harvest pass done'); }
       catch (e) { log.error(e, 'cron periodic harvest failed'); }
     });
     // ⚠ DATABASE PRUNE — nightly, right after the full refresh. adp_observations grows with every harvest
@@ -175,7 +206,7 @@ server = app.listen(config.port, () => {
         if (!r.rows[0] || r.rows[0].n === 0) {
           log.info('startup: no published ADP found — running one-time ADP pull');
           const { refreshAdpOnly } = await import('./jobs/refreshAdpOnly.js');
-          await refreshAdpOnly();
+          await withJobLock('startup:adp', () => refreshAdpOnly());
           log.info('startup: ADP pull complete');
         }
       } catch (e) { log.error(e, 'startup ADP catch-up failed'); }
@@ -208,7 +239,7 @@ server = app.listen(config.port, () => {
         if (!r.rows[0] || r.rows[0].n === 0) {
           log.info('startup: no harvested drafts found — running one-time draft harvest for Trends');
           const { harvestSleeperDrafts } = await import('./jobs/harvestSleeperDrafts.js');
-          await harvestSleeperDrafts();
+          await withJobLock('startup:harvest', () => harvestSleeperDrafts());
           log.info('startup: draft harvest complete');
         }
       } catch (e) { log.error(e, 'startup harvest catch-up failed'); }
@@ -228,7 +259,7 @@ server = app.listen(config.port, () => {
       const nProj = jc.rows[0] ? jc.rows[0].n : 0;
       if (nPlayers < 500 || nProj < 200) {
         log.info({ nPlayers, nProj }, 'startup recovery: players/projections look empty — running full refresh');
-        await refreshAll();
+        await withJobLock('startup:recovery', () => refreshAll());
         log.info('startup recovery: full refresh complete');
       }
     } catch (e) { log.error(e, 'startup recovery failed'); }
