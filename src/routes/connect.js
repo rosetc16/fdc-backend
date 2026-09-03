@@ -17,6 +17,10 @@ import {
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
 import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
+import { importEspnPrivate } from '../lib/espnPrivate.js';
+import { mflLeague, mflPicks } from '../lib/mfl.js';
+import { fantraxLeagues, fantraxLeague, fantraxPicks } from '../lib/fantrax.js';
+import { yahooConfigured, yahooAuthUrl, yahooExchange, yahooRefresh, yahooMyLeagues, yahooLeague } from '../lib/yahoo.js';
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
@@ -869,3 +873,142 @@ connectRouter.get('/espn/league', async (req, res) => {
     res.status(status).json({ error: String((e && e.message) || 'ESPN import failed'), code: (e && e.code) || null });
   }
 });
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════════════
+   THE OTHER PLATFORMS
+   ───────────────────────────────────────────────────────────────────────────────────────────────────
+   Users: "for those of us who are not the commissioners, [making the league public] is not an option.
+   Maybe there could be a feature where you would sign into ESPN… perhaps it could also work on
+   platforms such as Yahoo and NFL."
+
+   Four are built here and two are deliberately not. The dividing line is what the user has to hand over:
+
+     ESPN private   two session cookies, used for ONE request and never stored (see espnPrivate.js)
+     MFL            a per-league read key the commissioner mints; safe to store, LIVE draft picks
+     Fantrax        a Secret ID from the user's own profile, revocable by regenerating it; live picks
+     Yahoo          real OAuth — a consent screen, no secrets typed anywhere; needs Yahoo's approval
+
+     CBS            NOT BUILT. Its API is deprecated and undocumented, and the only way in is to POST the
+                    user's CBS USERNAME AND PASSWORD to an endpoint using the mobile app's hard-coded
+                    client secret. Asking a person to type their password into our site so we can replay
+                    it elsewhere is not a feature, it is a phishing pattern with a nice UI, and no amount
+                    of "we don't store it" makes it a reasonable thing to teach users to do. See
+                    /cbs/status for what the user is told instead.
+     NFL.com        NOTHING TO BUILD. The NFL stopped running season-long fantasy in 2026 and moved its
+                    leagues to ESPN; the migration is at espn.com/importnfl. See /nfl/status.
+   ═══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* ---- ESPN, private ------------------------------------------------------------------------------
+   ⚠ POST, NOT GET. The cookies are credentials: a GET puts them in the URL, which means the query string
+     lands in access logs, proxy logs and browser history. This is exactly the "never place sensitive
+     data in a query string" rule and it applies to our own server first. */
+connectRouter.post('/espn/private', async (req, res) => {
+  const { league_id: leagueId, season, espn_s2: s2, swid, team_id: teamId } = req.body || {};
+  try {
+    const out = await importEspnPrivate(leagueId, season || config.activeSeason, { s2, swid, teamId });
+    // ⚠ The response deliberately carries no echo of the cookies. Nothing downstream needs them, and an
+    //   echoed credential ends up in a client-side state blob that DOES get stored.
+    res.json(out);
+  } catch (e) {
+    res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'ESPN import failed'), code: (e && e.code) || null });
+  }
+});
+
+/* ---- MyFantasyLeague ---------------------------------------------------------------------------- */
+connectRouter.get('/mfl/league', async (req, res) => {
+  try {
+    res.json(await mflLeague(req.query.league_id, req.query.season || config.activeSeason, { apiKey: req.query.api_key || null }));
+  } catch (e) {
+    res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'MFL import failed'), code: (e && e.code) || null });
+  }
+});
+// The live poll. MFL is one of only two platforms where this is a real thing rather than a fiction.
+connectRouter.get('/mfl/picks', async (req, res) => {
+  try {
+    res.json({ picks: await mflPicks(req.query.league_id, req.query.season || config.activeSeason, { apiKey: req.query.api_key || null }) });
+  } catch (e) {
+    res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'MFL picks failed') });
+  }
+});
+
+/* ---- Fantrax ------------------------------------------------------------------------------------ */
+connectRouter.get('/fantrax/leagues', async (req, res) => {
+  try { res.json({ leagues: await fantraxLeagues(req.query.secret_id) }); }
+  catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax lookup failed'), code: (e && e.code) || null }); }
+});
+connectRouter.get('/fantrax/league', async (req, res) => {
+  try { res.json(await fantraxLeague(req.query.league_id, { secretId: req.query.secret_id || null, name: req.query.name || null })); }
+  catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax import failed'), code: (e && e.code) || null }); }
+});
+connectRouter.get('/fantrax/picks', async (req, res) => {
+  try { res.json({ picks: await fantraxPicks(req.query.league_id, { secretId: req.query.secret_id || null }) }); }
+  catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax picks failed') }); }
+});
+
+/* ---- Yahoo (OAuth) ------------------------------------------------------------------------------
+   Tokens live in the users table, next to the Sleeper link, because that is what they are: a link to an
+   account. ⚠ NOTHING ELSE FROM YAHOO IS PERSISTED SERVER-SIDE — their terms require user data to be
+   deleted within 24 hours, so leagues go straight to the client's own state and no cache table exists. */
+async function ensureYahooCols() {
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS yahoo_access  TEXT`).catch(() => {});
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS yahoo_refresh TEXT`).catch(() => {});
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS yahoo_expires BIGINT`).catch(() => {});
+}
+connectRouter.get('/yahoo/status', async (req, res) => {
+  if (!yahooConfigured()) return res.json({ configured: false, linked: false, why: 'This server has no Yahoo application credentials yet.' });
+  await ensureYahooCols();
+  const { rows } = await q('SELECT yahoo_refresh FROM users WHERE id=$1', [req.user.id]).catch(() => ({ rows: [] }));
+  res.json({ configured: true, linked: !!(rows[0] && rows[0].yahoo_refresh) });
+});
+connectRouter.get('/yahoo/auth-url', async (req, res) => {
+  try { res.json({ url: yahooAuthUrl(String(req.user.id)) }); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message, code: e.code || null }); }
+});
+connectRouter.post('/yahoo/exchange', async (req, res) => {
+  try {
+    await ensureYahooCols();
+    const t = await yahooExchange(String((req.body || {}).code || '').trim());
+    await q('UPDATE users SET yahoo_access=$1, yahoo_refresh=$2, yahoo_expires=$3 WHERE id=$4',
+      [t.accessToken, t.refreshToken, t.expiresAt, req.user.id]);
+    res.json({ ok: true, linked: true });
+  } catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
+});
+connectRouter.post('/yahoo/unlink', async (req, res) => {
+  await ensureYahooCols();
+  await q('UPDATE users SET yahoo_access=NULL, yahoo_refresh=NULL, yahoo_expires=NULL WHERE id=$1', [req.user.id]).catch(() => {});
+  res.json({ ok: true, linked: false });
+});
+// One hour is short enough that almost every call needs this; refreshing eagerly is cheaper than
+// handling a 401 in four places.
+async function yahooToken(userId) {
+  await ensureYahooCols();
+  const { rows } = await q('SELECT yahoo_access, yahoo_refresh, yahoo_expires FROM users WHERE id=$1', [userId]);
+  const r = rows[0];
+  if (!r || !r.yahoo_refresh) { const e = new Error('Connect your Yahoo account first.'); e.status = 401; e.code = 'YAHOO_NOT_LINKED'; throw e; }
+  if (r.yahoo_access && Number(r.yahoo_expires || 0) > Date.now() + 60000) return r.yahoo_access;
+  const t = await yahooRefresh(r.yahoo_refresh);
+  await q('UPDATE users SET yahoo_access=$1, yahoo_refresh=$2, yahoo_expires=$3 WHERE id=$4',
+    [t.accessToken, t.refreshToken, t.expiresAt, userId]);
+  return t.accessToken;
+}
+connectRouter.get('/yahoo/my-leagues', async (req, res) => {
+  try { res.json({ leagues: await yahooMyLeagues(await yahooToken(req.user.id)) }); }
+  catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
+});
+connectRouter.get('/yahoo/league', async (req, res) => {
+  try { res.json(await yahooLeague(req.query.league_key, await yahooToken(req.user.id))); }
+  catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
+});
+
+/* ---- The two we are not building, and why -------------------------------------------------------
+   These answer honestly rather than 404ing, so the UI can show the real reason instead of a dead end. */
+connectRouter.get('/cbs/status', (_req, res) => res.json({
+  supported: false,
+  reason: "CBS shut its developer API down years ago. The only remaining way in requires you to type your CBS password into a third-party site so it can be replayed against a private endpoint — we won't ask anyone to do that.",
+  instead: 'Set the league up by hand once (about a minute) and enter picks as they happen. Everything else in the app works the same.',
+}));
+connectRouter.get('/nfl/status', (_req, res) => res.json({
+  supported: false,
+  reason: 'The NFL stopped running season-long fantasy football in 2026 — ESPN is now the official fantasy game of the NFL, and NFL.com leagues were migrated there with their settings and history.',
+  instead: 'Import your league at espn.com/importnfl (the league manager has to start it), then connect it here as an ESPN league.',
+}));
