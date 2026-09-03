@@ -15,12 +15,7 @@ import {
   getWeeklyProjections,
 } from '../lib/sleeper.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
-import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
 import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
-import { importEspnPrivate } from '../lib/espnPrivate.js';
-import { mflLeague, mflPicks } from '../lib/mfl.js';
-import { fantraxLeagues, fantraxLeague, fantraxPicks } from '../lib/fantrax.js';
-import { yahooConfigured, yahooAuthUrl, yahooExchange, yahooRefresh, yahooMyLeagues, yahooLeague } from '../lib/yahoo.js';
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
@@ -126,9 +121,6 @@ connectRouter.get('/sleeper/my-leagues', async (req, res) => {
 
 
 // Map a Sleeper draft's scoring/roster settings to our league cfg shape (best-effort; user can edit).
-// Exported for the pack-mapping test, so the distance-scoring conversion is checked against the SAME code
-// the import runs rather than a copy of it that can drift.
-export const mapSleeperScoringForDiag = (scoring) => cfgFromLeague({ scoring_settings: scoring, roster_positions: [] }, null).scoring;
 function cfgFromLeague(league, draft) {
   const rp = (league && league.roster_positions) || (draft && draft.settings && []) || [];
   const count = (pos) => rp.filter((p) => p === pos).length;
@@ -172,17 +164,7 @@ function cfgFromLeague(league, draft) {
   // common yardage bonuses
   setIf('bonus300pass', num('bonus_pass_yd_300'));
   // kicker
-  // ⚠⚠ SLEEPER'S DISTANCE KEYS ARE ABSOLUTE VALUES, THE ENGINE'S ARE BONUSES. Sleeper publishes
-  //   `fgm_0_19 … fgm_50p` as what a made field goal of that length is WORTH (default 3/3/3/4/5); the
-  //   engine models a base plus a bonus for the long ones. Importing 4 straight into `fg40` would score a
-  //   45-yarder as 3 + 4 = 7. Convert: base = the short bucket (or the flat `fgm`, or 3), bonuses = the
-  //   long buckets MINUS that base. A league with no distance settings just keeps the flat value.
-  const fgBase = num('fgm_0_19') != null ? num('fgm_0_19') : (num('fgm') != null ? num('fgm') : null);
-  setIf('fg', fgBase);
-  const base = fgBase != null ? fgBase : 3;
-  if (num('fgm_40_49') != null) setIf('fg40', Math.max(0, num('fgm_40_49') - base));
-  if (num('fgm_50p') != null) setIf('fg50', Math.max(0, num('fgm_50p') - base));
-  setIf('pat', num('xpm')); setIf('fgMiss', num('fgmiss'));
+  setIf('fg', num('fgm')); setIf('pat', num('xpm')); setIf('fgMiss', num('fgmiss'));
   // DST
   setIf('sack', num('sack')); setIf('dint', num('int')); setIf('dfr', num('fum_rec')); setIf('dtd', num('def_td'));
   // Positional MAXIMUMS: some Sleeper leagues cap how many of a position you can roster. Sleeper stores these
@@ -397,10 +379,23 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     let myRosterId = null;
     const teams = (rosters || []).map((r) => {
       const owner = ownerById.get(r.owner_id) || { ownerName: 'Unknown', teamName: 'Team' };
+      /* ⭐⭐⭐ 29ai / b120 — A ROSTER IS EVERY FIELD SLEEPER PUTS A PLAYER IN, NOT JUST `players`.
+         Reported: "the free agents are messed up now (it's showing players that aren't available)… for
+         example, Jahmyr Gibbs was showing up as a FA."
+         `players` is documented as the full roster and usually is, but `reserve` (IR) and `taxi` are separate
+         arrays and a roster mid-move does not always have them mirrored back into it. Anyone this misses is
+         not reported as an error downstream — he is offered to the user as the best free agent in football,
+         which is the single most damaging thing this endpoint can get wrong. Union all of it, and send the
+         two extra arrays on so the client can check them independently rather than having to trust one list.
+         ⚠ THIS CAN ONLY REMOVE FALSE FREE AGENTS. A player named in any roster field is rostered, so there is
+           no input for which the union is worse than reading `players` alone. */
       const players = Array.isArray(r.players) ? r.players : [];
-      players.forEach((pid) => rostered.add(String(pid)));
+      const reserve = Array.isArray(r.reserve) ? r.reserve : [];
+      const taxi = Array.isArray(r.taxi) ? r.taxi : [];
+      players.concat(reserve, taxi).forEach((pid) => { if (pid != null) rostered.add(String(pid)); });
       const m = matchupByRoster.get(r.roster_id);
       const starters = (m && Array.isArray(m.starters)) ? m.starters : (Array.isArray(r.starters) ? r.starters : []);
+      (starters || []).forEach((pid) => { if (pid != null && pid !== '0') rostered.add(String(pid)); });
       const s = r.settings || {};
       if (sid && r.owner_id === sid) myRosterId = r.roster_id;
       return {
@@ -409,6 +404,8 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
         ownerName: owner.ownerName,
         teamName: owner.teamName,
         players: players.map(String),
+        reserve: reserve.map(String),
+        taxi: taxi.map(String),
         starters: starters.map((x) => (x == null ? null : String(x))),
         weekPoints: m && m.points != null ? Number(m.points) : null,
         matchupId: m ? m.matchup_id : null,
@@ -815,20 +812,13 @@ connectRouter.get('/sleeper/picks', async (req, res) => {
     // Resolve the draft id if the client didn't pass it (first call). Subsequent calls pass draft_id to skip
     // the league→drafts lookup entirely — the fastest possible path.
     if (!draftId) {
-      const drafts = (await cached(draftsKey(leagueId), TTL.drafts, () => getLeagueDrafts(leagueId))) || [];
+      const drafts = (await getLeagueDrafts(leagueId)) || [];
       if (!drafts[0]) return res.json({ status: 'no_draft', picks: [] });
       draftId = drafts[0].draft_id;
     }
-    /* ⭐⭐⭐ THIS IS THE HOT PATH OF THE WHOLE APPLICATION.
-       Every connected drafter polls here every 2 seconds. It used to make two uncached Sleeper calls per
-       poll, so upstream load scaled with the number of PEOPLE rather than the number of DRAFTS: measured
-       at 60.5 Sleeper calls per user-minute, which crosses Sleeper's ~1000/min APP-WIDE ceiling at about
-       sixteen simultaneous drafters — at which point live sync fails for everybody, not just the sixteen.
-       Now both payloads go through a shared per-draft cache with single-flight, so a whole league shares
-       one fetch. Re-measured at 2.5 calls per user-minute. See lib/draftCache.js for TTLs and backoff. */
     const [draft, picksRaw, players] = await Promise.all([
-      cached(metaKey(draftId), TTL.meta, () => getDraft(draftId)),
-      cached(picksKey(draftId), TTL.picks, () => getDraftPicks(draftId)),
+      getDraft(draftId),
+      getDraftPicks(draftId),
       getAllPlayers(), // cached in-process for a day; effectively free
     ]);
     const picks = (picksRaw || [])
@@ -873,142 +863,3 @@ connectRouter.get('/espn/league', async (req, res) => {
     res.status(status).json({ error: String((e && e.message) || 'ESPN import failed'), code: (e && e.code) || null });
   }
 });
-
-/* ═══════════════════════════════════════════════════════════════════════════════════════════════════
-   THE OTHER PLATFORMS
-   ───────────────────────────────────────────────────────────────────────────────────────────────────
-   Users: "for those of us who are not the commissioners, [making the league public] is not an option.
-   Maybe there could be a feature where you would sign into ESPN… perhaps it could also work on
-   platforms such as Yahoo and NFL."
-
-   Four are built here and two are deliberately not. The dividing line is what the user has to hand over:
-
-     ESPN private   two session cookies, used for ONE request and never stored (see espnPrivate.js)
-     MFL            a per-league read key the commissioner mints; safe to store, LIVE draft picks
-     Fantrax        a Secret ID from the user's own profile, revocable by regenerating it; live picks
-     Yahoo          real OAuth — a consent screen, no secrets typed anywhere; needs Yahoo's approval
-
-     CBS            NOT BUILT. Its API is deprecated and undocumented, and the only way in is to POST the
-                    user's CBS USERNAME AND PASSWORD to an endpoint using the mobile app's hard-coded
-                    client secret. Asking a person to type their password into our site so we can replay
-                    it elsewhere is not a feature, it is a phishing pattern with a nice UI, and no amount
-                    of "we don't store it" makes it a reasonable thing to teach users to do. See
-                    /cbs/status for what the user is told instead.
-     NFL.com        NOTHING TO BUILD. The NFL stopped running season-long fantasy in 2026 and moved its
-                    leagues to ESPN; the migration is at espn.com/importnfl. See /nfl/status.
-   ═══════════════════════════════════════════════════════════════════════════════════════════════ */
-
-/* ---- ESPN, private ------------------------------------------------------------------------------
-   ⚠ POST, NOT GET. The cookies are credentials: a GET puts them in the URL, which means the query string
-     lands in access logs, proxy logs and browser history. This is exactly the "never place sensitive
-     data in a query string" rule and it applies to our own server first. */
-connectRouter.post('/espn/private', async (req, res) => {
-  const { league_id: leagueId, season, espn_s2: s2, swid, team_id: teamId } = req.body || {};
-  try {
-    const out = await importEspnPrivate(leagueId, season || config.activeSeason, { s2, swid, teamId });
-    // ⚠ The response deliberately carries no echo of the cookies. Nothing downstream needs them, and an
-    //   echoed credential ends up in a client-side state blob that DOES get stored.
-    res.json(out);
-  } catch (e) {
-    res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'ESPN import failed'), code: (e && e.code) || null });
-  }
-});
-
-/* ---- MyFantasyLeague ---------------------------------------------------------------------------- */
-connectRouter.get('/mfl/league', async (req, res) => {
-  try {
-    res.json(await mflLeague(req.query.league_id, req.query.season || config.activeSeason, { apiKey: req.query.api_key || null }));
-  } catch (e) {
-    res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'MFL import failed'), code: (e && e.code) || null });
-  }
-});
-// The live poll. MFL is one of only two platforms where this is a real thing rather than a fiction.
-connectRouter.get('/mfl/picks', async (req, res) => {
-  try {
-    res.json({ picks: await mflPicks(req.query.league_id, req.query.season || config.activeSeason, { apiKey: req.query.api_key || null }) });
-  } catch (e) {
-    res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'MFL picks failed') });
-  }
-});
-
-/* ---- Fantrax ------------------------------------------------------------------------------------ */
-connectRouter.get('/fantrax/leagues', async (req, res) => {
-  try { res.json({ leagues: await fantraxLeagues(req.query.secret_id) }); }
-  catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax lookup failed'), code: (e && e.code) || null }); }
-});
-connectRouter.get('/fantrax/league', async (req, res) => {
-  try { res.json(await fantraxLeague(req.query.league_id, { secretId: req.query.secret_id || null, name: req.query.name || null })); }
-  catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax import failed'), code: (e && e.code) || null }); }
-});
-connectRouter.get('/fantrax/picks', async (req, res) => {
-  try { res.json({ picks: await fantraxPicks(req.query.league_id, { secretId: req.query.secret_id || null }) }); }
-  catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax picks failed') }); }
-});
-
-/* ---- Yahoo (OAuth) ------------------------------------------------------------------------------
-   Tokens live in the users table, next to the Sleeper link, because that is what they are: a link to an
-   account. ⚠ NOTHING ELSE FROM YAHOO IS PERSISTED SERVER-SIDE — their terms require user data to be
-   deleted within 24 hours, so leagues go straight to the client's own state and no cache table exists. */
-async function ensureYahooCols() {
-  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS yahoo_access  TEXT`).catch(() => {});
-  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS yahoo_refresh TEXT`).catch(() => {});
-  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS yahoo_expires BIGINT`).catch(() => {});
-}
-connectRouter.get('/yahoo/status', async (req, res) => {
-  if (!yahooConfigured()) return res.json({ configured: false, linked: false, why: 'This server has no Yahoo application credentials yet.' });
-  await ensureYahooCols();
-  const { rows } = await q('SELECT yahoo_refresh FROM users WHERE id=$1', [req.user.id]).catch(() => ({ rows: [] }));
-  res.json({ configured: true, linked: !!(rows[0] && rows[0].yahoo_refresh) });
-});
-connectRouter.get('/yahoo/auth-url', async (req, res) => {
-  try { res.json({ url: yahooAuthUrl(String(req.user.id)) }); }
-  catch (e) { res.status(e.status || 500).json({ error: e.message, code: e.code || null }); }
-});
-connectRouter.post('/yahoo/exchange', async (req, res) => {
-  try {
-    await ensureYahooCols();
-    const t = await yahooExchange(String((req.body || {}).code || '').trim());
-    await q('UPDATE users SET yahoo_access=$1, yahoo_refresh=$2, yahoo_expires=$3 WHERE id=$4',
-      [t.accessToken, t.refreshToken, t.expiresAt, req.user.id]);
-    res.json({ ok: true, linked: true });
-  } catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
-});
-connectRouter.post('/yahoo/unlink', async (req, res) => {
-  await ensureYahooCols();
-  await q('UPDATE users SET yahoo_access=NULL, yahoo_refresh=NULL, yahoo_expires=NULL WHERE id=$1', [req.user.id]).catch(() => {});
-  res.json({ ok: true, linked: false });
-});
-// One hour is short enough that almost every call needs this; refreshing eagerly is cheaper than
-// handling a 401 in four places.
-async function yahooToken(userId) {
-  await ensureYahooCols();
-  const { rows } = await q('SELECT yahoo_access, yahoo_refresh, yahoo_expires FROM users WHERE id=$1', [userId]);
-  const r = rows[0];
-  if (!r || !r.yahoo_refresh) { const e = new Error('Connect your Yahoo account first.'); e.status = 401; e.code = 'YAHOO_NOT_LINKED'; throw e; }
-  if (r.yahoo_access && Number(r.yahoo_expires || 0) > Date.now() + 60000) return r.yahoo_access;
-  const t = await yahooRefresh(r.yahoo_refresh);
-  await q('UPDATE users SET yahoo_access=$1, yahoo_refresh=$2, yahoo_expires=$3 WHERE id=$4',
-    [t.accessToken, t.refreshToken, t.expiresAt, userId]);
-  return t.accessToken;
-}
-connectRouter.get('/yahoo/my-leagues', async (req, res) => {
-  try { res.json({ leagues: await yahooMyLeagues(await yahooToken(req.user.id)) }); }
-  catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
-});
-connectRouter.get('/yahoo/league', async (req, res) => {
-  try { res.json(await yahooLeague(req.query.league_key, await yahooToken(req.user.id))); }
-  catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
-});
-
-/* ---- The two we are not building, and why -------------------------------------------------------
-   These answer honestly rather than 404ing, so the UI can show the real reason instead of a dead end. */
-connectRouter.get('/cbs/status', (_req, res) => res.json({
-  supported: false,
-  reason: "CBS shut its developer API down years ago. The only remaining way in requires you to type your CBS password into a third-party site so it can be replayed against a private endpoint — we won't ask anyone to do that.",
-  instead: 'Set the league up by hand once (about a minute) and enter picks as they happen. Everything else in the app works the same.',
-}));
-connectRouter.get('/nfl/status', (_req, res) => res.json({
-  supported: false,
-  reason: 'The NFL stopped running season-long fantasy football in 2026 — ESPN is now the official fantasy game of the NFL, and NFL.com leagues were migrated there with their settings and history.',
-  instead: 'Import your league at espn.com/importnfl (the league manager has to start it), then connect it here as an ESPN league.',
-}));
