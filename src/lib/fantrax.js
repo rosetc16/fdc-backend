@@ -19,6 +19,8 @@
      optional and never let a missing one throw. If Fantrax changes something the import should degrade
      to "we got the settings but not the rosters", not to a 500.
    ═══════════════════════════════════════════════════════════════════════════════════════════════════ */
+import { withPlayerNames } from './playerIds.js';
+
 const BASE = 'https://www.fantrax.com/fxea/general';
 const UA = 'FantasyDraftCompass/1.0 (+https://www.fantasydraftcompass.com)';
 
@@ -109,28 +111,44 @@ export async function fantraxLeague(leagueId, { secretId = null, name = null } =
     caps: {}, keepers: [], pickTrades: [],
   };
 
+  /* ⭐⭐ Both lists go through the id directory for anything the feed left name-less — a roster or a
+     keeper list of bare Fantrax ids leaves every one of those players sitting on the board as
+     available. getTeamRosters usually does carry names, so this is normally a no-op that costs
+     nothing; when it doesn't, it is the difference between an import that works and one that doesn't. */
   const existingRosters = {};
+  const rosterSlots = [];
+  const rosterRows = [];
   const rosterEntries = rosters?.rosters || rosters || {};
   Object.entries(rosterEntries).forEach(([teamId, r]) => {
     const slot = slotOfTeam[String(teamId)]; if (!slot) return;
     const players = Array.isArray(r?.rosterItems) ? r.rosterItems : Array.isArray(r) ? r : [];
-    const list = players.map((p) => ({ player_id: String(p.id || p.playerId || ''), name: p.name || null, pos: POS(p.position) }))
-      .filter((p) => p.player_id);
-    if (list.length) existingRosters[slot] = list;
+    players.forEach((p) => {
+      const pid = String(p.id || p.playerId || '');
+      if (!pid) return;
+      rosterSlots.push(slot);
+      rosterRows.push({ player_id: pid, name: p.name || null, pos: POS(p.position) });
+    });
+  });
+  (await withPlayerNames(rosterRows, 'fantrax')).forEach((row, i) => {
+    const slot = rosterSlots[i];
+    (existingRosters[slot] = existingRosters[slot] || []).push(row);
   });
 
   const rawPicks = Array.isArray(draft?.draftPicks) ? draft.draftPicks : Array.isArray(draft) ? draft : [];
-  const picks = rawPicks
-    .filter((p) => p && (p.playerId || p.player))
-    .sort((a, b) => (Number(a.overall || a.pick) || 0) - (Number(b.overall || b.pick) || 0))
-    .map((p, i) => ({
-      overall: Number(p.overall || p.pick) || i + 1,
-      round: Number(p.round) || null,
-      slot: slotOfTeam[String(p.teamId || p.team)] || null,
-      player_id: String(p.playerId || p.player),
-      name: p.playerName || null,
-      keeper: false,
-    }));
+  const picks = await withPlayerNames(
+    rawPicks
+      .filter((p) => p && (p.playerId || p.player))
+      .sort((a, b) => (Number(a.overall || a.pick) || 0) - (Number(b.overall || b.pick) || 0))
+      .map((p, i) => ({
+        overall: Number(p.overall || p.pick) || i + 1,
+        round: Number(p.round) || null,
+        slot: slotOfTeam[String(p.teamId || p.team)] || null,
+        player_id: String(p.playerId || p.player),
+        name: p.playerName || null,
+        keeper: false,
+      })),
+    'fantrax',
+  );
 
   return {
     league_id: id, name: cfg.name, platform: 'fantrax',
@@ -146,6 +164,16 @@ export async function fantraxLeague(leagueId, { secretId = null, name = null } =
 export async function fantraxPicks(leagueId, { secretId = null } = {}) {
   const draft = await fx('getDraftPicks', { leagueId: String(leagueId).trim(), ...(secretId ? { userSecretId: String(secretId).trim() } : {}) });
   const raw = Array.isArray(draft?.draftPicks) ? draft.draftPicks : Array.isArray(draft) ? draft : [];
-  return raw.filter((p) => p && (p.playerId || p.player))
-    .map((p, i) => ({ overall: Number(p.overall || p.pick) || i + 1, round: Number(p.round) || null, team: String(p.teamId || p.team || ''), player_id: String(p.playerId || p.player) }));
+  const picks = raw.filter((p) => p && (p.playerId || p.player))
+    .map((p, i) => ({
+      overall: Number(p.overall || p.pick) || i + 1,
+      round: Number(p.round) || null,
+      team: String(p.teamId || p.team || ''),
+      player_id: String(p.playerId || p.player),
+      // Fantrax's own feed carries the name sometimes and not others; when it does, it wins.
+      name: p.playerName || p.name || null,
+    }));
+  /* ⭐⭐⭐ NAMES, OR THIS FEED IS DECORATIVE — the board places picks by name, not by Fantrax id.
+     See src/lib/playerIds.js. Free when the feed already supplied every name. */
+  return withPlayerNames(picks, 'fantrax');
 }

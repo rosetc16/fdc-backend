@@ -929,36 +929,74 @@ connectRouter.post('/espn/private', async (req, res) => {
   }
 });
 
+/* ⚠⚠⚠ EVERY MFL AND FANTRAX ROUTE BELOW IS A POST, AND THAT IS NOT A STYLE CHOICE.
+   ───────────────────────────────────────────────────────────────────────────────────────────────────
+   They carry a credential — an MFL league API key, a Fantrax Secret ID — and a GET puts a credential in
+   the URL, where it is written to the access log of every hop it passes through, kept in the browser's
+   history, and handed to the next site in a Referer header. That is the same rule the ESPN private
+   import is built around; it applies here with more force, because these are the two platforms the
+   draft room POLLS. A GET here does not leak a credential once at import time: it writes it into the
+   access log every two seconds for the length of a draft, a few thousand times a night, per user.
+
+   ⚠ THERE IS NO GET FALLBACK. Leaving the old GET in "for compatibility" would leave the leak in place
+     for anyone running a cached bundle, which is precisely the population that would still be using it.
+   ───────────────────────────────────────────────────────────────────────────────────────────────── */
+
 /* ---- MyFantasyLeague ---------------------------------------------------------------------------- */
-connectRouter.get('/mfl/league', async (req, res) => {
+connectRouter.post('/mfl/league', async (req, res) => {
+  const { league_id: leagueId, season, api_key: apiKey } = req.body || {};
   try {
-    res.json(await mflLeague(req.query.league_id, req.query.season || config.activeSeason, { apiKey: req.query.api_key || null }));
+    res.json(await mflLeague(leagueId, season || config.activeSeason, { apiKey: apiKey || null }));
   } catch (e) {
     res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'MFL import failed'), code: (e && e.code) || null });
   }
 });
 // The live poll. MFL is one of only two platforms where this is a real thing rather than a fiction.
-connectRouter.get('/mfl/picks', async (req, res) => {
+connectRouter.post('/mfl/picks', async (req, res) => {
+  const { league_id: leagueId, season, api_key: apiKey } = req.body || {};
   try {
-    res.json({ picks: await mflPicks(req.query.league_id, req.query.season || config.activeSeason, { apiKey: req.query.api_key || null }) });
+    res.json({ picks: await livePicks('mfl', leagueId, season || config.activeSeason, apiKey || null) });
   } catch (e) {
     res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'MFL picks failed') });
   }
 });
 
 /* ---- Fantrax ------------------------------------------------------------------------------------ */
-connectRouter.get('/fantrax/leagues', async (req, res) => {
-  try { res.json({ leagues: await fantraxLeagues(req.query.secret_id) }); }
+connectRouter.post('/fantrax/leagues', async (req, res) => {
+  try { res.json({ leagues: await fantraxLeagues((req.body || {}).secret_id) }); }
   catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax lookup failed'), code: (e && e.code) || null }); }
 });
-connectRouter.get('/fantrax/league', async (req, res) => {
-  try { res.json(await fantraxLeague(req.query.league_id, { secretId: req.query.secret_id || null, name: req.query.name || null })); }
+connectRouter.post('/fantrax/league', async (req, res) => {
+  const { league_id: leagueId, secret_id: secretId, name } = req.body || {};
+  try { res.json(await fantraxLeague(leagueId, { secretId: secretId || null, name: name || null })); }
   catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax import failed'), code: (e && e.code) || null }); }
 });
-connectRouter.get('/fantrax/picks', async (req, res) => {
-  try { res.json({ picks: await fantraxPicks(req.query.league_id, { secretId: req.query.secret_id || null }) }); }
+connectRouter.post('/fantrax/picks', async (req, res) => {
+  const { league_id: leagueId, secret_id: secretId } = req.body || {};
+  try { res.json({ picks: await livePicks('fantrax', leagueId, null, secretId || null) }); }
   catch (e) { res.status(e && e.status ? e.status : 502).json({ error: String((e && e.message) || 'Fantrax picks failed') }); }
 });
+
+/* ⭐⭐⭐ ONE UPSTREAM FETCH PER DRAFT, NOT ONE PER VIEWER — the same lesson the Sleeper poll learned the
+   expensive way (see src/lib/draftCache.js: twelve people in one league were making sixty upstream
+   calls a minute between them, against an app-wide rate limit). MFL and Fantrax are smaller shops than
+   Sleeper with no published ceiling at all, and hammering either one from a single IP on a Sunday
+   afternoon is how an app gets blocked wholesale.
+   ⚠ THE CACHE KEY IS THE LEAGUE, NOT THE CREDENTIAL. Two people in the same league hold different
+     credentials and must share one fetch; keying on the credential would give each of them their own,
+     which is the entire problem back again — and would put a credential in a cache key besides.
+   ⚠ IT DOES RECORD WHETHER THERE WAS ONE. A private league answers only to a key holder, so without
+     this a key holder's fetch would warm a cache entry that then served the private draft to anyone
+     who knew the league id and had no key at all. Sharing between key holders is the point; sharing
+     from a key holder to a stranger is a leak. One bit, no credential, both properties kept. */
+function livePicks(platform, leagueId, season, credential) {
+  const id = String(leagueId || '').trim();
+  if (!id) { const e = new Error('A league id is required.'); e.status = 400; throw e; }
+  const key = `livepicks:${platform}:${id}:${season || ''}:${credential ? 'auth' : 'open'}`;
+  return cached(key, TTL.picks, () => (platform === 'mfl'
+    ? mflPicks(id, season, { apiKey: credential })
+    : fantraxPicks(id, { secretId: credential })));
+}
 
 /* ---- Yahoo (OAuth) ------------------------------------------------------------------------------
    Tokens live in the users table, next to the Sleeper link, because that is what they are: a link to an

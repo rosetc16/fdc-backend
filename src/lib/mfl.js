@@ -20,6 +20,8 @@
      a numbered host works right up until the league is migrated and then fails for one user at a time.
    ⚠ IDENTIFY YOURSELF IN User-Agent. MFL asks for it and rate-limits anonymous callers harder.
    ═══════════════════════════════════════════════════════════════════════════════════════════════════ */
+import { withPlayerNames } from './playerIds.js';
+
 const BASE = 'https://api.myfantasyleague.com';
 const UA = 'FantasyDraftCompass/1.0 (+https://www.fantasydraftcompass.com)';
 
@@ -120,25 +122,38 @@ export async function mflLeague(leagueId, season, { apiKey = null } = {}) {
     if (Number.isFinite(pts)) cfg.scoring.rec = pts;
   } catch { /* leave the default — a wrong PPR is worse than a stated default */ }
 
+  /* ⭐⭐ ROSTERS AND PICKS BOTH GO THROUGH THE DIRECTORY. A dynasty import whose existing rosters are a
+     list of bare MFL ids tells the app nothing — every one of those players stays on the board as
+     available, and the whole point of importing a keeper league is that they are not. One directory
+     fetch is shared by both lookups and by the live poll. */
   const existingRosters = {};
+  const rosterSlots = [];
+  const rosterRows = [];
   arr(ros?.rosters?.franchise).forEach((f) => {
     const slot = slotOfFranchise[f.id]; if (!slot) return;
-    const list = arr(f.player).map((p) => ({ player_id: String(p.id), name: null, pos: null }));
-    if (list.length) existingRosters[slot] = list;
+    arr(f.player).forEach((p) => { rosterSlots.push(slot); rosterRows.push({ player_id: String(p.id), name: null, pos: null }); });
+  });
+  const namedRoster = await withPlayerNames(rosterRows, 'mfl', yr);
+  namedRoster.forEach((row, i) => {
+    const slot = rosterSlots[i];
+    (existingRosters[slot] = existingRosters[slot] || []).push(row);
   });
 
-  const picks = arr(dr?.draftResults?.draftUnit)
-    .flatMap((u) => arr(u.draftPick))
-    .filter((p) => p && p.player && p.timestamp)
-    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
-    .map((p, i) => ({
-      overall: i + 1,
-      round: Number(p.round) || null,
-      slot: slotOfFranchise[p.franchise] || null,
-      player_id: String(p.player),
-      name: null,
-      keeper: false,
-    }));
+  const picks = await withPlayerNames(
+    arr(dr?.draftResults?.draftUnit)
+      .flatMap((u) => arr(u.draftPick))
+      .filter((p) => p && p.player && p.timestamp)
+      .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
+      .map((p, i) => ({
+        overall: i + 1,
+        round: Number(p.round) || null,
+        slot: slotOfFranchise[p.franchise] || null,
+        player_id: String(p.player),
+        name: null,
+        keeper: false,
+      })),
+    'mfl', yr,
+  );
 
   return {
     league_id: id, name: cfg.name, season: yr, platform: 'mfl',
@@ -157,9 +172,23 @@ export async function mflLeague(leagueId, season, { apiKey = null } = {}) {
 export async function mflPicks(leagueId, season, { apiKey = null } = {}) {
   const yr = Number(season) || new Date().getUTCFullYear();
   const dr = await mflGet(yr, 'draftResults', { L: String(leagueId).trim(), ...(apiKey ? { APIKEY: String(apiKey).trim() } : {}) });
-  return arr(dr?.draftResults?.draftUnit)
+  const raw = arr(dr?.draftResults?.draftUnit)
     .flatMap((u) => arr(u.draftPick))
     .filter((p) => p && p.player && p.timestamp)
     .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
-    .map((p, i) => ({ overall: i + 1, round: Number(p.round) || null, franchise: p.franchise, player_id: String(p.player) }));
+    /* The slot, so the board can attribute the pick without a second call for the league's franchise
+       list. An MFL franchise id is "0001".."00NN" and its numeric value is the slot — the same rule
+       mflLeague() uses to build slotNames, kept identical here on purpose. */
+    .map((p, i) => ({
+      overall: i + 1,
+      round: Number(p.round) || null,
+      franchise: p.franchise,
+      slot: Number(String(p.franchise || '').replace(/\D/g, '')) || null,
+      player_id: String(p.player),
+      name: null,
+    }));
+  /* ⭐⭐⭐ NAMES, OR THIS FEED IS DECORATIVE. MFL answers with player IDs and the draft room places picks
+     by NAME — see src/lib/playerIds.js. Without this the poll returns a perfectly-formed list of picks
+     that the board cannot place, and reports a healthy sync while quietly filling with holes. */
+  return withPlayerNames(raw, 'mfl', yr);
 }
