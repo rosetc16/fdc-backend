@@ -225,6 +225,46 @@ authRouter.get('/me', requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
+/* ⭐⭐⭐ THE ANSWER TO "BUT I'M SIGNED IN."
+ *
+ * Everything else here refuses to talk to you when your session is dead, which is correct and also
+ * exactly why the failure was so hard to name from the outside: every diagnosis you might want is behind
+ * the thing that is broken. This one route always answers, and says which of the four states the request
+ * is in — so the admin screen can report "your sign-in expired" or "the database didn't answer" instead
+ * of relaying a four-word refusal that blames the wrong party.
+ *
+ * ⚠ It is deliberately thin: it reveals only what the CALLER already presented (their own email, and
+ *   whether it is an admin address). No lookup by email, no existence check on anyone else's account.
+ */
+authRouter.get('/session', (req, res) => {
+  const state = req.user ? 'ok' : (req.authState || 'anon');
+  res.json({
+    state,                                   // ok | anon | expired | unavailable
+    signedIn: !!req.user,
+    email: req.user ? req.user.email : null,
+    admin: req.user ? (!!req.user.is_admin && isAdminEmail(req.user.email)) : false,
+    // Split so a false `admin` above is never ambiguous between "not on the allowlist" and "flag not set
+    // on the row" — the two need different fixes and used to look identical from the browser.
+    adminEmail: req.user ? isAdminEmail(req.user.email) : false,
+    adminFlag: req.user ? !!req.user.is_admin : false,
+  });
+});
+
+/* ⭐⭐ THE ONLY WAY THE WEEKLY BRIEF IS EVER TURNED ON. It is opt-in — nobody is emailed unless they asked
+   — so this endpoint is the subscription itself, not a preference about one. It also serves the way BACK
+   on after an unsubscribe, because a switch that only ever moves one way is a door that only locks. */
+authRouter.post('/email-prefs', requireAuth, async (req, res) => {
+  const on = !!(req.body || {}).briefOptIn;
+  try {
+    const { ensureBriefColumn } = await import('./brief.js');
+    await ensureBriefColumn();
+    await q('UPDATE users SET brief_opt_in=$1 WHERE id=$2', [on, req.user.id]);
+    res.json({ ok: true, briefOptIn: on });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not save that just now. Try again in a moment.' });
+  }
+});
+
 // Persist the user's personal ranking sets (their custom boards). Stored on the user row so they
 // survive across sessions/devices.
 authRouter.post('/rank-sets', requireAuth, async (req, res) => {
@@ -265,5 +305,8 @@ function publicUser(u) {
     platformRanks: u.platform_ranks || {},
     sleeperUserId: u.sleeper_user_id || null,
     sleeperUsername: u.sleeper_username || null,
+    // Whether this address has ASKED for the Tuesday weekly brief. Opt-in: false for everyone until they
+    // switch it on, so the account page shows an honest "off" rather than a switch that is already live.
+    briefOptIn: !!u.brief_opt_in,
   };
 }

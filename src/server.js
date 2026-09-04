@@ -21,6 +21,7 @@ import { paymentsRouter, stripeWebhookHandler } from './routes/payments.js';
 import { adminRouter } from './routes/admin.js';
 import { connectRouter } from './routes/connect.js';
 import { feedbackRouter } from './routes/feedback.js';
+import { briefRouter } from './routes/brief.js';
 import { trendsRouter } from './routes/trends.js';
 import { refreshAll } from './jobs/refreshAll.js';
 
@@ -63,8 +64,15 @@ app.post('/api/payments/webhook', express.raw({ type: '*/*' }), stripeWebhookHan
  */
 const stateJson = express.json({ limit: '5mb' });
 const normalJson = express.json({ limit: '1mb' });
+/* ⚠ THE UNSUBSCRIBE POST IS FORM-ENCODED, NOT JSON, and both of its callers make it so: our own confirm
+   page submits a plain <form>, and Gmail/Yahoo's native one-click button posts an empty
+   application/x-www-form-urlencoded body. A json-only parser leaves req.body undefined for both, so the
+   route would reject every genuine unsubscribe and the link would look broken to exactly the person least
+   inclined to give us the benefit of the doubt. */
+const formBody = express.urlencoded({ extended: false, limit: '16kb' });
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/payments/webhook') return next();
+  if (req.path.startsWith('/api/brief')) return formBody(req, res, next);
   if (req.path.startsWith('/api/state')) return stateJson(req, res, next);
   return normalJson(req, res, next);
 });
@@ -110,6 +118,9 @@ app.use('/api/payments', paymentsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/connect', connectRouter);
 app.use('/api/feedback', feedbackRouter);
+// Public and unauthenticated ON PURPOSE — an unsubscribe link has to work from a mail client with no
+// session, which is the whole reason it carries its own HMAC. See routes/brief.js.
+app.use('/api/brief', briefRouter);
 app.use('/api/trends', trendsRouter);
 
 // fallback 404 for unknown api routes
