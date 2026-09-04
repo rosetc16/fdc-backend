@@ -58,12 +58,19 @@ const ADP_FIELDS = [
   { field: 'adp_ppr',              scoring: 'PPR',  qb: '1QB', pools: ['REDRAFT', 'KEEPER', 'BESTBALL'], prio: PRIO.exact },
   { field: 'adp_half_ppr',         scoring: 'HALF', qb: '1QB', pools: ['REDRAFT', 'KEEPER', 'BESTBALL'], prio: PRIO.exact },
   { field: 'adp_std',              scoring: 'STD',  qb: '1QB', pools: ['REDRAFT', 'KEEPER', 'BESTBALL'], prio: PRIO.exact },
-  { field: 'adp_2qb',              scoring: 'PPR',  qb: 'SF',  pools: ['REDRAFT', 'KEEPER', 'BESTBALL'], prio: PRIO.exact },
+  /* ⭐⭐⭐⭐ SLEEPER'S ONLY MULTI-QB FIELD IS LITERALLY THE 2QB MARKET, AND IT WAS FILED UNDER SUPERFLEX.
+     The field is `adp_2qb`. Now that 2QB has its own format key it goes there as the EXACT source — it is
+     the market it names — and into SF at alias priority, because it is also the best published proxy for a
+     superflex room and superflex has no published field of its own. Alias priority means any real harvested
+     superflex data outranks it in that bucket while it still fills gaps. */
+  { field: 'adp_2qb',              scoring: 'PPR',  qb: '2QB', pools: ['REDRAFT', 'KEEPER', 'BESTBALL'], prio: PRIO.exact },
+  { field: 'adp_2qb',              scoring: 'PPR',  qb: 'SF',  pools: ['REDRAFT', 'KEEPER', 'BESTBALL'], prio: PRIO.alias },
   // ---- Dynasty ----
   { field: 'adp_dynasty_ppr',      scoring: 'PPR',  qb: '1QB', pools: ['DYNASTY'], prio: PRIO.exact },
   { field: 'adp_dynasty_half_ppr', scoring: 'HALF', qb: '1QB', pools: ['DYNASTY'], prio: PRIO.exact },
   { field: 'adp_dynasty_std',      scoring: 'STD',  qb: '1QB', pools: ['DYNASTY'], prio: PRIO.exact },
-  { field: 'adp_dynasty_2qb',      scoring: 'PPR',  qb: 'SF',  pools: ['DYNASTY'], prio: PRIO.exact },
+  { field: 'adp_dynasty_2qb',      scoring: 'PPR',  qb: '2QB', pools: ['DYNASTY'], prio: PRIO.exact },
+  { field: 'adp_dynasty_2qb',      scoring: 'PPR',  qb: 'SF',  pools: ['DYNASTY'], prio: PRIO.alias },
   // `adp_dynasty` is an unscoped alias for 1QB dynasty. It reads 999 for every player we have ever
   // sampled, so in practice the sentinel filter drops it entirely — but it is kept at ALIAS priority so
   // that if Sleeper ever populates it, it can fill a gap without outranking the scoped fields.

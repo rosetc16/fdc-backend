@@ -21,7 +21,7 @@
     "brief:dry": "node src/jobs/weeklyBrief.js --dry",
     "prune": "node src/jobs/pruneObservations.js",
     "test:espn": "node scripts/espn.test.js",
-    "test": "node scripts/selftest.js && node scripts/coverage.test.js && node scripts/authstate.test.js && node scripts/playerIds.test.js && node scripts/connectDiag.test.js && node scripts/brief.test.js && node scripts/unsub.route.test.js && node scripts/pack.test.js && node scripts/espn.test.js && node scripts/injuries.test.js && node scripts/injuries.db.test.js && node scripts/sos.test.js && node scripts/sos.db.test.js && node scripts/reset.test.js && node scripts/projdiag.db.test.js",
+    "test": "node scripts/selftest.js && node scripts/coverage.test.js && node scripts/authstate.test.js && node scripts/formatKey.test.js && node scripts/playerIds.test.js && node scripts/connectDiag.test.js && node scripts/brief.test.js && node scripts/unsub.route.test.js && node scripts/pack.test.js && node scripts/espn.test.js && node scripts/injuries.test.js && node scripts/injuries.db.test.js && node scripts/sos.test.js && node scripts/sos.db.test.js && node scripts/reset.test.js && node scripts/projdiag.db.test.js",
     "test:reset": "node scripts/reset.test.js"
   },
   "dependencies": {

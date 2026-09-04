@@ -189,7 +189,13 @@ playerPackRouter.get('/', async (req, res) => {
     const pools = pool === 'ROOKIE' ? ['ROOKIE']
       : pool === 'KEEPER' ? [pool, 'REDRAFT', 'DYNASTY']
       : pool === 'BESTBALL' ? [pool, 'REDRAFT'] : [pool];
-    const qbs = qb === 'SF' ? ['SF', '1QB'] : ['1QB'];
+    /* ⭐⭐⭐ 2QB IS ITS OWN BUCKET NOW, AND THIS LIST IS WHERE FORGETTING THAT WOULD HURT MOST.
+          These fallbacks are built by hand here rather than via formatFallbacks, so the split had to be
+          carried in by hand too — and the default arm is ['1QB']. A 2QB league landing on it would be served
+          the SINGLE-quarterback published board: the one market guaranteed to be wrong for it, and wrong in
+          exactly the direction Trey reported. Each multi-QB class tries itself, then its neighbour; 1QB stays
+          last so a fringe player missing from both still gets a number rather than none. */
+    const qbs = qb === '2QB' ? ['2QB', 'SF', '1QB'] : qb === 'SF' ? ['SF', '2QB', '1QB'] : ['1QB'];
     // HALF and PPR are close; both are far from STD. Try the league's own scoring first, then its neighbor,
     // before STD. Crucially we EXHAUST TE-premium-preserving variants (all scorings, all team counts) BEFORE
     // dropping TEP->STD, because TE premium materially changes TE ADP — a TEP league should stay on TEP data.

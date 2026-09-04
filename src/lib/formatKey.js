@@ -4,7 +4,7 @@
 //
 // Format key shape:  SCORING | QB | TE | POOL | TEAMS
 //   SCORING: STD | HALF | PPR
-//   QB:      1QB | SF        (SuperFlex / 2QB)
+//   QB:      1QB | SF | 2QB  (1QB / SuperFlex / two dedicated QB slots — see qbClass)
 //   TE:      STD | TEP       (TE premium)
 //   POOL:    REDRAFT | DYNASTY | KEEPER | BESTBALL | ROOKIE
 //   TEAMS:   bucket -> '8-10' | '12' | '14+'
@@ -14,6 +14,36 @@ export function isSuperflex(cfg) {
   if (cfg.sf) return true;
   const st = cfg.start || {};
   return (st.SUPER || 0) > 0 || (st.QB || 0) >= 2;
+}
+
+/* ⭐⭐⭐⭐ 2QB AND SUPERFLEX ARE DIFFERENT MARKETS AND USED TO SHARE A BUCKET.
+ *
+ * Trey, looking at a 2QB board: "I feel like QBs are being undervalued by a lot / are you pulling from the
+ * right drafts on sleeper for ADP? … i'd anticipate something way more aggressive on QBs (even more so
+ * than a superflex league)."
+ *
+ * He was reading the symptom of this line. Every multi-QB league — superflex or true 2QB — was keyed 'SF',
+ * so one bucket held both, and the bucket is dominated by whichever format people actually draft on
+ * Sleeper. Superflex rooms outnumber 2QB rooms heavily, and a superflex slot is OPTIONAL: when the
+ * quarterbacks dry up you start a running back there. A dedicated second QB slot cannot be filled that
+ * way, so 2QB rooms take quarterbacks earlier and deeper. Averaging the two gives a 2QB drafter a market
+ * that is systematically too soft on exactly the position his format is built around.
+ *
+ * ⚠ THE WEIGHTS MAKE IT WORSE THAN THE LABEL SUGGESTS. A harvested draft contributes weight 0.34 per pick
+ *   and Sleeper's published `adp_2qb` contributes 6 — so about eighteen superflex drafts outvote the one
+ *   number that is actually the 2QB market. The split is what lets each format keep its own evidence.
+ *
+ * ⚠ SF still means what it always meant, so nothing about a superflex league moves. Only the true-2QB
+ *   rooms leave the bucket — which is the correct reading of "same as superflex, but more on QBs".
+ */
+export function qbClass(cfg) {
+  if (!cfg) return '1QB';
+  const st = cfg.start || {};
+  // Two or more DEDICATED starting QB slots. A SUPER/OP slot is not one of these: it is a flex that
+  // usually holds a quarterback, which is the whole difference between the two formats.
+  if ((st.QB || 0) >= 2) return '2QB';
+  if (cfg.sf || (st.SUPER || 0) > 0) return 'SF';
+  return '1QB';
 }
 
 export function scoringClass(cfg) {
@@ -50,7 +80,7 @@ export function teamsBucket(teams) {
 export function formatKey(cfg) {
   return [
     scoringClass(cfg),
-    isSuperflex(cfg) ? 'SF' : '1QB',
+    qbClass(cfg),
     tePremium(cfg) ? 'TEP' : 'STD',
     poolClass(cfg),
     teamsBucket(cfg.teams),
@@ -115,11 +145,19 @@ export function formatFallbacks(key) {
   // AFTER exhausting those do we drop TE premium. This keeps a TEP league on TEP data whenever any exists.
   const scoringAlts = scoring === 'HALF' ? ['HALF', 'PPR'] : scoring === 'PPR' ? ['PPR', 'HALF'] : ['STD', 'HALF', 'PPR'];
   const teamAlts = [teams, '12', '8-10', '14+'];
-  // 1) same te, same qb — vary scoring then team count
-  for (const sc of scoringAlts) for (const tm of teamAlts) out.push([sc, qb, te, pool, tm].join('|'));
-  // 2) drop TE premium (te -> STD), same qb — vary scoring then team count
-  if (te === 'TEP') for (const sc of scoringAlts) for (const tm of teamAlts) out.push([sc, qb, 'STD', pool, tm].join('|'));
+  /* ⭐⭐⭐ THE QB DIMENSION FALLS BACK TO ITS NEIGHBOUR, NOT TO 1QB.
+     Splitting 2QB out of SF creates a bucket that starts EMPTY — true 2QB rooms are rare on Sleeper, so
+     without a neighbour a 2QB league would walk all the way down to the 1QB board, which is the one market
+     that is definitely wrong for it. Superflex is the closest real market to 2QB and vice versa, so each
+     borrows the other before anything else is relaxed, and 1QB is never reachable from either.
+     ⚠ Order matters: EXHAUST the exact format first. A 2QB league with real 2QB data at 12 teams must not
+       be served superflex data merely because its own team-size bucket is thin. */
+  const qbAlts = qb === '2QB' ? ['2QB', 'SF'] : qb === 'SF' ? ['SF', '2QB'] : ['1QB'];
+  // 1) same te — vary scoring then team count, for each QB class in order
+  for (const qk of qbAlts) for (const sc of scoringAlts) for (const tm of teamAlts) out.push([sc, qk, te, pool, tm].join('|'));
+  // 2) drop TE premium (te -> STD) — same walk
+  if (te === 'TEP') for (const qk of qbAlts) for (const sc of scoringAlts) for (const tm of teamAlts) out.push([sc, qk, 'STD', pool, tm].join('|'));
   // 3) last resort broad default
-  out.push(['PPR', qb, 'STD', pool, '12'].join('|'));
+  for (const qk of qbAlts) out.push(['PPR', qk, 'STD', pool, '12'].join('|'));
   return [...new Set(out)];
 }
