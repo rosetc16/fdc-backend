@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Fantasy Draft Compass \u2014 backend API + data-aggregation layer",
+  "description": "Fantasy Draft Compass — backend API + data-aggregation layer",
   "engines": {
     "node": ">=20"
   },
@@ -21,23 +21,22 @@
     "brief:dry": "node src/jobs/weeklyBrief.js --dry",
     "prune": "node src/jobs/pruneObservations.js",
     "test:espn": "node scripts/espn.test.js",
-    "test": "node scripts/selftest.js && node scripts/coverage.test.js && node scripts/espn.test.js && node scripts/injuries.test.js && node scripts/injuries.db.test.js && node scripts/sos.test.js && node scripts/sos.db.test.js && node scripts/reset.test.js",
+    "test": "node scripts/selftest.js && node scripts/coverage.test.js && node scripts/pack.test.js && node scripts/espn.test.js && node scripts/injuries.test.js && node scripts/injuries.db.test.js && node scripts/sos.test.js && node scripts/sos.db.test.js && node scripts/reset.test.js && node scripts/projdiag.db.test.js",
     "test:reset": "node scripts/reset.test.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
-    "pg": "^8.13.1",
-    "jsonwebtoken": "^9.0.2",
-    "bcryptjs": "^2.4.3",
-    "zod": "^3.24.1",
-    "node-cron": "^3.0.3",
-    "stripe": "^17.5.0",
-    "cors": "^2.8.5",
-    "helmet": "^8.0.0",
     "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.1",
     "pino": "^9.6.0",
-    "pino-http": "^10.4.0"
-  },
-  "devDependencies": {}
+    "pino-http": "^10.4.0",
+    "stripe": "^17.5.0",
+    "zod": "^3.24.1"
+  }
 }
