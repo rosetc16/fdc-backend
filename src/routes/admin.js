@@ -88,6 +88,23 @@ adminRouter.post('/run-job', async (req, res) => {
       // JOIN, which is the one number a per-job summary can never show.
       const { sosDiagnose } = await import('../lib/sosService.js');
       detail = await sosDiagnose(Number(req.body.season) || config.activeSeason, Number(req.body.pw) || 15);
+    } else if (job === 'connect-check') {
+      /* ⭐ THE INSTRUMENT FOR THE MFL / FANTRAX LIVE PICK SYNC, shipped before it is needed rather than
+         after the first report. That sync rests on a player DIRECTORY translating platform ids into names,
+         and both platforms are unreachable from the sandbox it was written in — so the parser has only ever
+         been checked against a stub built from the same documentation. If production's shape differs, the
+         poll degrades silently: tidy picks, a healthy-looking sync, an empty board. This prints every link
+         — directory size and sample, then a real league's picks and HOW MANY CARRY A NAME — plus the raw
+         upstream shape when something is empty, which is the part that says what to change.
+         ⚠ Body: { platform: 'mfl'|'fantrax', leagueId?, season?, credential? }. The credential is used and
+           never echoed; this output gets pasted into chat windows. */
+      const { connectDiagnose } = await import('../lib/connectDiag.js');
+      const body = req.body || {};
+      detail = await connectDiagnose(body.platform === 'fantrax' ? 'fantrax' : 'mfl', {
+        leagueId: body.leagueId || body.league_id || null,
+        season: body.season || config.activeSeason,
+        credential: body.credential || null,
+      });
     } else if (job === 'proj-check') {
       // ⭐ THE INSTRUMENT for "DST projections are all 0 and kickers score 40". The DST half was certain —
       // mapStats had no team-defense branch — but WHICH key the kicker's made field goals arrive under is
