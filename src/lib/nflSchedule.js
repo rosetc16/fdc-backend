@@ -33,6 +33,26 @@ export function normTeam(t) {
   return TEAMSET.has(a) ? a : null;
 }
 
+/* ⭐⭐⭐ WHEN THE GAME STARTS, which nothing needed until now and weather needs completely.
+   A forecast is only a forecast OF something: without a kickoff time you cannot ask what the conditions will
+   be at the moment the game is played, and "the weather in Buffalo this week" is not a fantasy question.
+   The payloads have carried the timestamp all along — `date` is already in GAME_FIELDS below, used to
+   RECOGNISE a game record — it was simply never read off one. Every shape the parser accepts spells it
+   differently, so this reads them all and returns an ISO string or null; a game with no readable time still
+   stores fine and is simply skipped by anything that needs the hour. */
+export function kickoffOf(node) {
+  if (!node) return null;
+  const cand = [node.date, node.kickoff, node.start_time, node.startTime, node.gameTime,
+    node.competitions && node.competitions[0] && node.competitions[0].date];
+  for (const c of cand) {
+    if (c == null || c === '') continue;
+    // Sleeper gives epoch milliseconds; ESPN gives an ISO string.
+    const d = typeof c === 'number' ? new Date(c) : new Date(String(c));
+    if (!Number.isNaN(d.getTime()) && d.getUTCFullYear() > 2000) return d.toISOString();
+  }
+  return null;
+}
+
 // A game record carries these; metadata blocks in the same payloads carry at most one of them.
 const GAME_FIELDS = ['week', 'home', 'away', 'home_team', 'away_team', 'competitions', 'competitors', 'date'];
 
@@ -102,7 +122,7 @@ export function mapSchedule(payload, { weekHint = null } = {}) {
     const key = `${wk}:${t.home}:${t.away}`;
     if (seen.has(key)) continue;                            // the walker can reach one game by two paths
     seen.add(key);
-    out.push({ week: wk, home: t.home, away: t.away });
+    out.push({ week: wk, home: t.home, away: t.away, kickoff: kickoffOf(n) });
   }
   // Name the partial failures. "Found games but couldn't read the teams" is a different problem from
   // "found no games", and conflating them is what cost three deploys on the injury feed.
@@ -174,7 +194,7 @@ export function toTeamRows(games) {
       // keep the first and count it rather than writing a second row that would silently double a matchup.
       if (seen.has(key)) continue;
       seen.add(key);
-      rows.push({ week: g.week, team, opponent: opp, home });
+      rows.push({ week: g.week, team, opponent: opp, home, kickoff: g.kickoff || null });
     }
   }
   return rows;

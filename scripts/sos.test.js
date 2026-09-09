@@ -45,7 +45,11 @@ const ok = (n) => { console.log('  PASS  ' + n); pass++; };
   const flat = { 1: [{ week: 1, home: 'KC', away: 'BAL' }, { week: 1, home: 'PHI', away: 'DAL' }] };
   const a = mapSchedule(flat);
   assert.strictEqual(a.records.length, 2, JSON.stringify(a.warnings));
-  assert.deepStrictEqual(a.records[0], { week: 1, home: 'KC', away: 'BAL' });
+  /* ⚠ `kickoff` JOINED THIS RECORD IN 29h and this line is why the change was safe: a deepStrictEqual on
+     the whole shape fails the moment a field appears, which is exactly what you want from the parser that
+     feeds the schedule table. A payload with no timestamp yields null rather than being dropped — a game
+     with an unknown kickoff still has to store, it just cannot be given a forecast. */
+  assert.deepStrictEqual(a.records[0], { week: 1, home: 'KC', away: 'BAL', kickoff: null });
   ok('2 · a flat {week, home, away} payload reads');
 
   // (b) ESPN scoreboard: events → competitions → competitors, with homeAway flags
@@ -59,8 +63,12 @@ const ok = (n) => { console.log('  PASS  ' + n); pass++; };
   ] };
   const b = mapSchedule(espn, { weekHint: 16 });
   assert.strictEqual(b.records.length, 2, 'ESPN scoreboard shape failed: ' + JSON.stringify(b.warnings));
-  assert.deepStrictEqual(b.records[0], { week: 16, home: 'SF', away: 'SEA' });
-  assert.deepStrictEqual(b.records[1], { week: 16, home: 'WAS', away: 'JAX' }, 'aliases should normalise');
+  /* ⭐⭐ AND HERE THE TIMESTAMP IS REAL, which makes this the assertion that proves kickoffOf works rather
+     than merely that it exists: the ESPN fixture above carries `date: '2026-12-20T18:00Z'` and it has to
+     come out the other side normalised to a full ISO string. The flat-shape case a few lines up has no date
+     and correctly yields null, so the two together cover both halves. */
+  assert.deepStrictEqual(b.records[0], { week: 16, home: 'SF', away: 'SEA', kickoff: '2026-12-20T18:00:00.000Z' });
+  assert.deepStrictEqual(b.records[1], { week: 16, home: 'WAS', away: 'JAX', kickoff: '2026-12-20T18:00:00.000Z' }, 'aliases should normalise');
   ok('3 · ⭐ the ESPN scoreboard shape reads, including homeAway flags and legacy abbreviations');
 
   // (c) ⭐⭐ THE TRAP THAT WOULD HAVE LOOKED LIKE A BROKEN ENDPOINT. The scoreboard is week-scoped and its

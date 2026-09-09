@@ -28,6 +28,11 @@ export async function syncSchedule(opts = {}) {
       opponent TEXT NOT NULL, home BOOLEAN, updated_at TIMESTAMPTZ DEFAULT now(),
       PRIMARY KEY (season, week, team)
     );`);
+    /* ⚠ ADDED, NOT REDEFINED. The CREATE above is a no-op on every database that already has this table, so
+       a new column has to arrive by ALTER or it will exist only on a database nobody has. That is the same
+       trap the comment above describes for the table itself. `kickoff` is what the weather read needs: a
+       forecast without the hour it applies to is not an answer to anything. */
+    await q('ALTER TABLE nfl_schedule ADD COLUMN IF NOT EXISTS kickoff TIMESTAMPTZ');
   } catch (e) { log.error(e, 'syncSchedule: ensure table'); }
 
   const { rows: had } = await q('SELECT count(*)::int AS n FROM nfl_schedule WHERE season=$1', [season]);
@@ -60,9 +65,10 @@ export async function syncSchedule(opts = {}) {
       await q('BEGIN');
       await q('DELETE FROM nfl_schedule WHERE season=$1', [season]);
       for (const r of rows) {
-        await q(`INSERT INTO nfl_schedule (season, week, team, opponent, home) VALUES ($1,$2,$3,$4,$5)
-                 ON CONFLICT (season, week, team) DO UPDATE SET opponent=EXCLUDED.opponent, home=EXCLUDED.home`,
-          [season, r.week, r.team, r.opponent, r.home]);
+        await q(`INSERT INTO nfl_schedule (season, week, team, opponent, home, kickoff) VALUES ($1,$2,$3,$4,$5,$6)
+                 ON CONFLICT (season, week, team) DO UPDATE SET opponent=EXCLUDED.opponent, home=EXCLUDED.home,
+                   kickoff=COALESCE(EXCLUDED.kickoff, nfl_schedule.kickoff)`,
+          [season, r.week, r.team, r.opponent, r.home, r.kickoff || null]);
         wrote++;
       }
       await q('COMMIT');

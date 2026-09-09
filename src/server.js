@@ -23,6 +23,7 @@ import { connectRouter } from './routes/connect.js';
 import { feedbackRouter } from './routes/feedback.js';
 import { briefRouter } from './routes/brief.js';
 import { trendsRouter } from './routes/trends.js';
+import { weatherRouter } from './routes/weather.js';
 import { refreshAll } from './jobs/refreshAll.js';
 
 const app = express();
@@ -122,6 +123,7 @@ app.use('/api/feedback', feedbackRouter);
 // session, which is the whole reason it carries its own HMAC. See routes/brief.js.
 app.use('/api/brief', briefRouter);
 app.use('/api/trends', trendsRouter);
+app.use('/api/weather', weatherRouter);
 
 // fallback 404 for unknown api routes
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
