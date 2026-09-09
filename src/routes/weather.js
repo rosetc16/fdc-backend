@@ -33,6 +33,7 @@ import { q } from '../lib/db.js';
 import { getJson } from '../lib/shapes.js';
 import { VENUES, weatherConcern } from '../lib/venues.js';
 import { log } from '../lib/log.js';
+import { config } from '../lib/config.js';
 
 export const weatherRouter = express.Router();
 
@@ -83,20 +84,50 @@ async function forecastFor(lat, lon, kickoffIso) {
 
 weatherRouter.get('/week', async (req, res) => {
   const week = Number(req.query.week);
-  const season = Number(req.query.season) || new Date().getUTCFullYear();
+  /* ⚠ config.activeSeason, NOT the calendar year. Everything else in the app reads the season from config
+     (playerPack, connect, playoff SOS), and getUTCFullYear() disagrees with it twice: whenever ACTIVE_SEASON
+     is pinned, and every January, when the calendar rolls over and the NFL season does not — which is
+     exactly when week 18 and the playoffs are being played in the snow. */
+  const season = Number(req.query.season) || Number(config.activeSeason) || new Date().getUTCFullYear();
   if (!Number.isFinite(week) || week < 1 || week > 22) return res.status(400).json({ error: 'week is required (1-22)' });
 
+  /* ⚠⚠ THREE WAYS TO HAVE NO WEATHER, AND THEY NEEDED THREE DIFFERENT ANSWERS.
+     Trey, on the live site: "weather, it's just no forecast yet. The NFL schedule hasn't been loaded."
+     That message was this route's catch-all, and it was wrong in the way that costs the most time: it named
+     a cause. The schedule WAS loaded — playoff SOS reads the same table happily — but `kickoff` is a column
+     this feature added, and it only comes into existence when syncSchedule next runs. So the SELECT threw
+     on a missing column, the catch printed "the schedule hasn't been loaded", and the true fix ("run the
+     schedule job once") was the one thing the message ruled out.
+     Now the three states are distinguished and each says what to do about it:
+       no table / no rows  → the schedule genuinely has not been synced
+       no kickoff column   → the schedule is there, this feature's column is not, run the job once
+       rows but no times   → the schedule is there with no kickoff times, same job, same fix
+     ⚠ AND IT FALLS BACK RATHER THAN FAILING. If `kickoff` is missing we re-read without it, so the route
+       still reports the week's games and the counts; it simply cannot forecast them. A feature that
+       degrades to "here is what I know and here is what I am missing" is worth ten that go dark. */
   let rows = [];
+  let noKickoffColumn = false;
+  const readRows = async (withKickoff) => (await q(
+    `SELECT team, opponent, home${withKickoff ? ', kickoff' : ''} FROM nfl_schedule
+      WHERE season=$1 AND week=$2 AND home = true`, [season, week])).rows || [];
   try {
-    const r = await q(
-      `SELECT team, opponent, home, kickoff FROM nfl_schedule WHERE season=$1 AND week=$2 AND home = true`,
-      [season, week]);
-    rows = r.rows || [];
+    rows = await readRows(true);
   } catch (e) {
-    log.error(e, 'weather: schedule read');
-    return res.json({ week, season, games: [], unavailable: 'schedule', note: "The NFL schedule hasn't been loaded yet." });
+    const msg = String((e && e.message) || e);
+    if (/kickoff/i.test(msg)) {
+      noKickoffColumn = true;
+      try { rows = await readRows(false); } catch (e2) { log.error(e2, 'weather: schedule read (no kickoff)'); rows = []; }
+    } else {
+      log.error(e, 'weather: schedule read');
+      return res.json({ week, season, games: [], unavailable: 'schedule',
+        note: `The NFL schedule isn't in the database yet for ${season}. Run Update schedule from the admin panel, or wait for the nightly refresh.` });
+    }
   }
-  if (!rows.length) return res.json({ week, season, games: [], unavailable: 'schedule', note: `No week ${week} games on file for ${season}.` });
+  if (!rows.length) return res.json({ week, season, games: [], unavailable: 'schedule',
+    note: `No week ${week} games on file for ${season}. Run Update schedule from the admin panel.` });
+  if (noKickoffColumn) return res.json({ week, season, games: [], unavailable: 'kickoff',
+    counts: { games: rows.length, indoors: 0, noKickoff: rows.length, beyondForecast: 0, checked: 0, flagged: 0 },
+    note: `The ${season} schedule is loaded, but it has no kickoff times yet — a forecast needs the hour the game is played. Run Update schedule once and this fills in.` });
 
   const now = Date.now();
   const out = [];

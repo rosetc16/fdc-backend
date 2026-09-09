@@ -10,6 +10,7 @@
 // unlike a missing feature nobody would notice.
 import { q } from '../lib/db.js';
 import { log } from '../lib/log.js';
+import { config } from '../lib/config.js';
 import { recordJob } from '../lib/jobs.js';
 import { fetchSchedule, toTeamRows, byeWeeksFrom, TEAMS } from '../lib/nflSchedule.js';
 import { clearPlayerPackCache } from '../lib/packCache.js';
@@ -17,7 +18,9 @@ import { clearSosMemo } from '../lib/sosService.js';
 
 export async function syncSchedule(opts = {}) {
   const started = Date.now();
-  const season = Number(opts.season) || new Date().getUTCFullYear();
+  // Same source as every other season-aware read in the app — see the note in routes/weather.js for why the
+  // calendar year is the wrong answer for four months of every year.
+  const season = Number(opts.season) || Number(config.activeSeason) || new Date().getUTCFullYear();
 
   // The job creates its own table. db/schema.sql is applied only by a MANUAL `npm run migrate` that nobody
   // runs on deploy, so a new TABLE is dead on an existing database — that is exactly how the injury feature

@@ -284,7 +284,7 @@ playerPackRouter.get('/', async (req, res) => {
   try {
     players = (await q(
       `SELECT player_id, full_name, position, team, age, years_exp, bye_week, injury_status, news_updated,
-              injury_body_part, injury_notes, injury_start_date,
+              injury_body_part, injury_notes, injury_start_date, fantasy_positions,
               injury_detail, injury_part, injury_return, injury_at, injury_sources
          FROM players
         WHERE position IN ('QB','RB','WR','TE','K','DEF','DL','LB','DB')
@@ -333,8 +333,25 @@ playerPackRouter.get('/', async (req, res) => {
   const pack = [];
   const droppedByGate = []; // real, active players the inclusion gate rejected — see the coverage backstop below
   for (const pl of players) {
-    const pos = pl.position === 'DEF' ? 'DST' : pl.position;
-    if (!posAllowed(pos)) continue; // drop K/DST/IDP the league doesn't use
+    /* ⭐⭐⭐⭐ A PLAYER IS ELIGIBLE IF **ANY** OF HIS POSITIONS IS.
+       Feedback via Trey: "Travis Hunter is not available to select in their league… he's listed as both a
+       wide receiver and a defensive back."
+       `position` is one value, and this gate read it as the whole truth. For a two-way player it is half of
+       one: Sleeper's `fantasy_positions` for Hunter is ["WR","DB"], and if DB won the coin toss upstream then
+       posAllowed() answered "IDP, and this league has no defenders" and dropped him from the pack — so he
+       was not merely unranked in an ordinary league, he did not exist in it. syncPlayers now stores the whole
+       list and makes the scalar the offensive one, and this reads the list, so the same player is a receiver
+       in a redraft league and a receiver-or-defender in an IDP one.
+       ⚠ THE POSITION WE SHIP IS THE ONE THIS LEAGUE CAN USE, not the first one in the list. Shipping "DB" to
+         a league with no defensive slots would put him back on the board and then bury him under a position
+         filter nobody can select — visible and unusable, which is a worse bug than absent because it looks
+         deliberate. */
+    const allPos = String(pl.fantasy_positions || pl.position || '')
+      .split(',').map((x) => x.trim()).filter(Boolean).map((x) => (x === 'DEF' ? 'DST' : x));
+    const posList = allPos.length ? allPos : [pl.position === 'DEF' ? 'DST' : pl.position];
+    const usable = posList.filter(posAllowed);
+    if (!usable.length) continue; // drop K/DST/IDP the league doesn't use
+    const pos = usable[0];
     const adpRaw = adpById.get(pl.player_id);
     const proj = projById.get(pl.player_id);
     const hasPublished = publishedIds.has(pl.player_id);
@@ -411,6 +428,9 @@ playerPackRouter.get('/', async (req, res) => {
       id: pl.player_id,
       name: pl.full_name,
       pos,
+      // Every slot this league could start him in — "WR,DB" for a two-way player in an IDP league, and just
+      // "WR" for the same player in a league with no defenders. One element for everybody else.
+      posAll: usable.length > 1 ? usable.join(',') : undefined,
       team: pl.team || null,
       age: pl.age || null,
       bye: pl.bye_week || null,
