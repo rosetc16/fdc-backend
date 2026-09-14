@@ -12,12 +12,14 @@ import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
-  getWeeklyProjections,
+  getWeeklyProjections, getWeeklyStats,
 } from '../lib/sleeper.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
 import { lineupMisses, verdictFor, seasonLedger, pointRanks } from '../lib/review.js';
 import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../lib/rooting.js';
+import { matchupForecast, projectedRecord } from '../lib/winprob.js';
+import { scoreStatsFor } from '../lib/scoring.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
 import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
 import { importEspnPrivate } from '../lib/espnPrivate.js';
@@ -425,26 +427,10 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     // times this league's per-stat values — which correctly handles 4-pt pass TDs, TE premium, and anything
     // else the commissioner set. Same stat vocabulary is used by both the projections and the scoring map.
     const scoring = league.scoring_settings || {};
-    // Keys that are metadata/points fields in the stats object, not scorable stats — never multiply these.
-    const NON_STAT = new Set(['gp', 'gms_active', 'pts_ppr', 'pts_half_ppr', 'pts_std', 'adp_dd_ppr', 'pos_adp_dd_ppr', 'rank_ppr', 'rank_std']);
-    const scoreFromSleeper = (stats, position) => {
-      if (!stats) return null;
-      let pts = 0, matched = 0;
-      for (const key in scoring) {
-        const perPt = Number(scoring[key]);
-        if (!perPt) continue;
-        if (key === 'bonus_rec_te') {
-          // TE-premium: extra points per reception, TE only.
-          if (position === 'TE' && stats.rec != null) { pts += Number(stats.rec) * perPt; matched++; }
-          continue;
-        }
-        if (NON_STAT.has(key)) continue;
-        const statVal = stats[key];
-        if (statVal != null && !Number.isNaN(Number(statVal))) { pts += Number(statVal) * perPt; matched++; }
-      }
-      // If we couldn't match ANY scoring stats (unexpected key mismatch), signal null so we fall back.
-      return matched > 0 ? Math.round(pts * 100) / 100 : null;
-    };
+    /* ⭐ b136 — this was an inline copy of the scoring maths; it now shares one implementation with the live
+       route's forecast (src/lib/scoring.js). Two copies is how a projected score and a live score end up
+       disagreeing on the same screen for one league with one custom rule only one copy knows about. */
+    const scoreFromSleeper = (stats, position) => scoreStatsFor(stats, position, scoring);
 
     // Pull THIS WEEK's projections so points are matchup-specific (not season/17). Same Sleeper stats host
     // we already use. Build a per-player map: weekly points (in the league's scoring), opponent, game date,
@@ -952,11 +938,53 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       });
     } catch { /* ids will stand in for names rather than the whole board failing */ }
 
+    /* ⭐⭐⭐⭐⭐ WHO HAS ACTUALLY PLAYED, AND WHAT THE REST ARE PROJECTED FOR — b136.
+       Trey: "It's saying I'm 8-2… This is true RIGHT NOW, but on sleeper, I'm showed that I'm projected to
+       lose at least 5 total. So the 8-2 is misleading."
+
+       Two feeds, one call each for the whole week no matter how many leagues are asked for, both cached:
+         • STATS   — every player who has recorded a stat line this week. This, not the clock, is how we
+                     know a man has played. A kickoff time tells you a game started; a stat line tells you
+                     he was in it. It also settles the case the clock cannot: a starter who scored exactly
+                     zero and a starter who has not kicked off both show 0.0 in `players_points`, and
+                     treating the first as "still to come" would forecast him twice.
+         • PROJECTIONS — what everyone left is expected to score, so the remainder of the day can be
+                     estimated instead of assumed to be nothing.
+
+       ⚠ THESE ARE PER-WEEK, NOT PER-LEAGUE, so fifteen leagues cost two extra upstream calls between them
+         rather than thirty. Scoring differs by league, which is why the PROJECTION is scaled per league
+         from the raw stats below rather than taken as a single number. */
+    const statsKey = `wstats:${season}:${week}`;
+    const projKey = `wproj:${season}:${week}`;
+    const [weekStats, weekProj] = await Promise.all([
+      cachedCall(statsKey, LIVE_TTL_MS * 6, () => getWeeklyStats(season, week, { positions: ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'] })).catch(() => []),
+      cachedCall(projKey, LEAGUE_TTL_MS, () => getWeeklyProjections(season, week)).catch(() => []),
+    ]);
+    /* `gp` is Sleeper's games-played flag. When it is present it is the cleanest possible signal; when it
+       is not, the presence of a stat row at all means he was on a field. */
+    const playedSet = new Set();
+    for (const row of weekStats || []) {
+      const st = row && row.stats;
+      if (!row || !row.player_id || !st) continue;
+      if (st.gp === 0) continue;
+      playedSet.add(String(row.player_id));
+    }
+    const statsKnown = playedSet.size > 0;
+    // Raw stat projections per player, kept raw so each league can score them under its own rules.
+    const projStats = new Map();
+    for (const row of weekProj || []) {
+      if (row && row.player_id && row.stats) projStats.set(String(row.player_id), row.stats);
+    }
+
     const now = Date.now();
     const stateOf = (sid) => gameState(kickoffByTeam[String(teamById.get(String(sid)))] || null, now);
+    /* ⚠ THE STATS FEED WINS OVER THE CLOCK. The clock is a three-and-a-half-hour window around kickoff and
+       is honest about being an approximation; a stat line is a fact. Where they disagree, believe the fact. */
+    const playedBy = (sid) => (statsKnown ? playedSet.has(String(sid)) : stateOf(sid) === 'done');
 
     const out = await pool(ids, 5, async (leagueId) => {
-      const [users, rosters, ms] = await Promise.all([
+      const [league, users, rosters, ms] = await Promise.all([
+        cachedCall(`l:${leagueId}`, LEAGUE_TTL_MS, () => getLeague(leagueId)),
         cachedCall(`u:${leagueId}`, LEAGUE_TTL_MS, () => getLeagueUsers(leagueId)),
         cachedCall(`r:${leagueId}`, LEAGUE_TTL_MS, () => getLeagueRosters(leagueId)),
         cachedCall(`m:${leagueId}:${week}`, LIVE_TTL_MS, () => getMatchups(leagueId, week)),
@@ -969,11 +997,11 @@ connectRouter.get('/sleeper/live', async (req, res) => {
         teamNameByRoster.set(r.roster_id, ownerById.get(r.owner_id) || 'Team');
         if (myRosterId == null && r.owner_id && mineIds.has(r.owner_id)) myRosterId = r.roster_id;
       });
-      if (myRosterId == null) return { leagueId, ownerResolved: false, me: null, opp: null };
+      if (myRosterId == null) return { leagueId, leagueName: (league && league.name) || null, ownerResolved: false, me: null, opp: null };
 
       const byRoster = new Map((ms || []).map((m) => [m.roster_id, m]));
       const mineM = byRoster.get(myRosterId);
-      if (!mineM) return { leagueId, ownerResolved: true, me: null, opp: null, note: 'no matchup this week' };
+      if (!mineM) return { leagueId, leagueName: (league && league.name) || null, ownerResolved: true, me: null, opp: null, note: 'no matchup this week' };
       const oppM = (ms || []).find((m) => m.matchup_id != null && m.matchup_id === mineM.matchup_id && m.roster_id !== myRosterId) || null;
 
       const entryOf = (m) => (m ? { rosterId: m.roster_id, teamName: teamNameByRoster.get(m.roster_id) || 'Team',
@@ -985,8 +1013,37 @@ connectRouter.get('/sleeper/live', async (req, res) => {
         const v = m && m.players_points ? m.players_points[String(sid)] : null;
         return v == null ? null : Number(v);
       };
-      return { leagueId, ownerResolved: true,
-        me: sideOf(entryOf(mineM), { ptsOf, stateOf }), opp: sideOf(entryOf(oppM), { ptsOf, stateOf }) };
+      /* ⚠ THE PROJECTION IS SCORED UNDER THIS LEAGUE'S RULES, not taken as a number. The same projected
+         stat line is worth different points in PPR and standard, and a forecast built from somebody else's
+         scoring would quietly disagree with the scoreboard it sits beside. Same helper the team hub uses. */
+      const projFor = (sid) => {
+        const st = projStats.get(String(sid));
+        if (!st) return null;
+        const v = scoreStatsFor(st, posById.get(String(sid)) || null, league.scoring_settings || {});
+        return v == null ? null : Math.round(v * 10) / 10;
+      };
+
+      const me = sideOf(entryOf(mineM), { ptsOf, stateOf });
+      const opp = sideOf(entryOf(oppM), { ptsOf, stateOf });
+      const forPlayers = (side) => (side ? (side.players || []).map((p) => ({
+        sid: p.sid, pts: p.pts, played: playedBy(p.sid), proj: projFor(p.sid),
+      })) : []);
+      const forecast = opp ? matchupForecast(forPlayers(me), forPlayers(opp)) : null;
+      /* Every player carries his own projection and whether he has played, so a lineup can be read row by
+         row rather than only in total — the hub's Live tab and Game Day both want that. */
+      const decorate = (side) => (side ? { ...side, players: (side.players || []).map((p) => ({
+        ...p, played: playedBy(p.sid), proj: projFor(p.sid),
+      })), yetToPlay: (side.players || []).filter((p) => !playedBy(p.sid)).length } : null);
+
+      return {
+        leagueId,
+        // ⚠ THE BLANK-NAME BUG. This row never carried a name, so every league tag on the rooting board
+        //   came out as an empty string and the sub-line rendered as ", , +2". The stub fixture supplied
+        //   one, which is exactly why no test caught it — see hubstub/mk-live.mjs.
+        leagueName: (league && league.name) || null,
+        ownerResolved: true,
+        me: decorate(me), opp: decorate(opp), forecast,
+      };
     });
 
     const leagues = out.map((r) => (r && !r.error ? r : { leagueId: null, error: String((r && r.error) || 'failed') }));
@@ -1002,6 +1059,16 @@ connectRouter.get('/sleeper/live', async (req, res) => {
     res.json({
       week, season, at: new Date().toISOString(),
       leagues, totals: dayTotals(rows), rooting: board,
+      /* ⭐⭐⭐⭐⭐ THE HONEST HEADLINE. `totals` is the live scoreboard — what is true right now — and it was
+         being presented as a record, which is what made "8-2" misleading with half the lineups yet to
+         kick off. `record` carries BOTH: what the scoreboard says and what the projections expect it to
+         settle at, so the page can lead with the second and footnote the first. */
+      record: projectedRecord(rows.map((r) => r.forecast).filter(Boolean)),
+      /* Whether we could tell who has played, and whether we had projections to forecast the rest. Without
+         the first, "yet to play" is a guess from kickoff windows; without the second there is no forecast
+         at all, and in both cases the page says so rather than printing a confident number built on air. */
+      playedKnown: statsKnown,
+      projKnown: projStats.size > 0,
       /* ⭐⭐⭐ WHERE THE WEEK IS UP TO. The home page needs this to decide between a live badge, a review
          tab, both (Sunday afternoon) or neither (Wednesday) — and it must not cost a second request to
          find out, or every home-page load pays for a question whose answer is usually "nothing is on". */
