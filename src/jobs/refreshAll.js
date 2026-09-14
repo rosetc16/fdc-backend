@@ -24,6 +24,42 @@ export async function refreshAll() {
      row at all — nothing to notice, nothing to click. Weather went dark for exactly this reason. */
   try { const { syncSchedule } = await import('./syncSchedule.js'); out.schedule = await syncSchedule(); }
   catch (e) { log.error(e, 'refreshAll: schedule'); out.schedule = { error: String((e && e.message) || e) }; }
+  /* ⭐⭐⭐⭐⭐ THE TWO JOBS THAT ONLY EVER RAN WHEN SOMEBODY REMEMBERED — b137.
+     Trey: "I also don't want to have to click all of these to update things and I hope it's just happening
+     automatically behind the scenes."
+
+     Reasonable expectation, and it was true of six of the eight jobs. Byes and defence-vs-position were the
+     exceptions: both existed only as admin buttons, so their freshness depended on a person recalling that
+     they are a thing. Both are DERIVED from data this function has just refreshed — byes come straight out
+     of the schedule two lines above, and defence ranks are recomputed from completed weeks — which makes
+     "runs after the thing it derives from" their natural home and an admin button the fallback rather than
+     the mechanism.
+
+     ⚠ ORDER MATTERS AND IT IS NOT ARBITRARY: byes read nfl_schedule, so they go directly after the sync
+       that writes it. Running them before would derive this week's byes from last week's schedule, which
+       is the kind of wrong that looks right.
+     ⚠ AND BOTH ARE WRAPPED. Neither is load-bearing enough to fail a nightly refresh that also carries
+       players, projections and ADP; a failure is recorded in the result and visible in the admin panel. */
+  try { const { syncByeWeeks } = await import('../lib/byeWeeks.js'); const { q } = await import('../lib/db.js');
+    out.byes = await syncByeWeeks(q); }
+  catch (e) { log.error(e, 'refreshAll: byes'); out.byes = { error: String((e && e.message) || e) }; }
+  try {
+    const { warmDefVsPos } = await import('../lib/defVsPos.js');
+    const { config } = await import('../lib/config.js');
+    /* In season the current year's completed weeks are the right basis; before any week has finished there
+       are none, and last season is the only honest answer. warmDefVsPos returns an empty table rather than
+       throwing when a season has no results, so falling back on an empty result is the test, not the date. */
+    const cur = Number(config.activeSeason);
+    let table = await warmDefVsPos(cur, 18);
+    let used = cur;
+    if (!table || Object.keys(table).length < 24) { table = await warmDefVsPos(cur - 1, 19); used = cur - 1; }
+    out.defVsPos = { season: used, defenses: Object.keys(table || {}).length };
+    try {
+      const { clearPlayerPackCache } = await import('../lib/packCache.js');
+      const { clearSosMemo } = await import('../lib/sosService.js');
+      clearPlayerPackCache(); clearSosMemo();
+    } catch { /* the caches expire on their own; this only makes it immediate */ }
+  } catch (e) { log.error(e, 'refreshAll: defVsPos'); out.defVsPos = { error: String((e && e.message) || e) }; }
   // Published ADP gives broad, clean veteran coverage immediately; harvested drafts refine specific
   // buckets. Both are observations the consensus step blends — published must land before consensus.
   try { out.publishedAdp = await syncPublishedAdp(); } catch (e) { out.publishedAdp = { error: e.message }; log.error(e); }

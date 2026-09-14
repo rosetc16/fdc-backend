@@ -977,7 +977,27 @@ connectRouter.get('/sleeper/live', async (req, res) => {
     }
 
     const now = Date.now();
-    const stateOf = (sid) => gameState(kickoffByTeam[String(teamById.get(String(sid)))] || null, now);
+    /* ⭐⭐⭐⭐⭐ AND RECORD WHICH TEAMS WE HAD NO TIME FOR — b137.
+       Trey: "we need to check the 'yet to play' button. Right now it's showing me that I have no one yet
+       to play… but Monday night football is tonight."
+
+       A starter whose team has no row in nfl_schedule comes back 'unknown', and 'unknown' is not a
+       harmless third value — it is the one that makes the page quietly wrong. It cannot say "yet to play"
+       and it must not say "played", so a filter built on two buckets loses him entirely and the Monday
+       night game disappears from a screen whose whole job is to tell you what is left.
+
+       ⚠ THE FIX IS TO REPORT THE GAP, NOT TO GUESS AT IT. Defaulting unknown either way would have made
+         the symptom go away and left the page confidently wrong in whichever direction we picked. The set
+         of teams we could not time is a fact the client can state plainly, name the players for, and point
+         at the job that fixes it — which is the difference between a bug he has to report and a page that
+         diagnoses itself. */
+    const missingKick = new Set();
+    const stateOf = (sid) => {
+      const team = String(teamById.get(String(sid)) || '');
+      const k = kickoffByTeam[team] || null;
+      if (!k && team) missingKick.add(team);
+      return gameState(k, now);
+    };
     /* ⚠ THE STATS FEED WINS OVER THE CLOCK. The clock is a three-and-a-half-hour window around kickoff and
        is honest about being an approximation; a stat line is a fact. Where they disagree, believe the fact. */
     const playedBy = (sid) => (statsKnown ? playedSet.has(String(sid)) : stateOf(sid) === 'done');
@@ -1075,6 +1095,24 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       weekState: weekStateFrom(Object.values(kickoffByTeam), now),
       // Whether the kickoff times were there at all. Without them "yet to play" is not a number we have.
       scheduleKnown: Object.keys(kickoffByTeam).length > 0,
+      /* ⭐⭐⭐⭐ THE KICKOFF TIMES THEMSELVES, NOT JUST WHAT WE CONCLUDED FROM THEM — b137.
+         Trey: "I think this tab could also just have more info / sections for 'game day'."
+
+         The obvious missing section on a Sunday is "which game should I put on" — and that cannot be
+         built from `state` alone, because 'pre' collapses the 1pm slate, the 4:25 window and Sunday night
+         into one indistinguishable bucket. Every one of these times was already read from the schedule
+         two hundred lines above to derive `state` and `weekState`; sending the map costs one small object
+         on a response that already carries every starter, and it is the difference between "9 still to
+         play" and "four of them are in the 4:25 window, and Jacobs is going against you in five leagues
+         at the same time".
+
+         ⚠ SENT AS THE MAP, NOT AS A PRE-BUILT SECTION. Grouping is a rendering decision that depends on
+           the reader's time zone, and a server that groups by its own clock gets it wrong for everybody
+           not sitting next to it. */
+      kickoffs: kickoffByTeam,
+      /* The teams among your actual starters that we could not put a clock on — see stateOf above. Sent
+         as the team codes rather than a count, so the page can name the players rather than say "some". */
+      scheduleMissing: [...missingKick].sort(),
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
