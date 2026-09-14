@@ -200,6 +200,32 @@ export function toTeamRows(games) {
   return rows;
 }
 
+/* ⭐⭐⭐⭐ WHICH TEAMS ARE ON BYE IN ONE WEEK — b132, and the answer the whole free-agent view turns on.
+   Trey: "Yes, I want this to be focused on bye weeks."
+   The obvious implementation — "teams with no row for week N" — is WRONG in the one case that matters, and
+   wrong in the most damaging direction: if the schedule has not been synced for week N at all, every team
+   has no row, so every team is on bye and the page tells you your entire lineup is out. So a week with no
+   rows AT ALL returns null, meaning "we do not know", and the caller degrades to saying nothing rather than
+   to saying something catastrophic. A real NFL week has at most six teams on bye; anything wilder than that
+   is a partial sync, not a schedule, and is refused the same way.
+   Returns a sorted array of team abbreviations, or null when the data cannot support an answer. */
+export function byeTeamsForWeek(rows, week) {
+  if (!Array.isArray(rows) || !rows.length || !week) return null;
+  const all = new Set();
+  const playing = new Set();
+  for (const r of rows) {
+    if (!r || !r.team) continue;
+    all.add(String(r.team));
+    if (Number(r.week) === Number(week)) playing.add(String(r.team));
+  }
+  if (!playing.size) return null;                       // that week was never synced — not "everyone is out"
+  const byes = [...all].filter((t) => !playing.has(t)).sort();
+  /* Six of thirty-two is the most the NFL has ever rested in one week, and the cap is a FRACTION rather than
+     a count so it means the same thing on a real schedule and on a small fixture: if a third of the league
+     appears to be off, the week is half-loaded, not unusual. */
+  return byes.length > all.size / 3 ? null : byes;
+}
+
 // Which weeks a team is on bye: the regular-season weeks with no game.
 export function byeWeeksFrom(rows, weeks = 18) {
   const played = {};

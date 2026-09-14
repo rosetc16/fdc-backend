@@ -1,0 +1,245 @@
+/* WHO TO ROOT FOR, ACROSS FIFTEEN LEAGUES AT ONCE — b134.
+ *
+ * Trey: "have this be my hub for what should I be rooting for (especially if you have a lot of leagues and
+ * you have stakes in a ton of players, so it would basically show you who you have the most shares in and
+ * who you have the most shares to root against."
+ *
+ * ⚠ THE FEATURE IS THE SUBTRACTION. Every fantasy site can tell you how many of your teams a player is on.
+ *   The number that decides whether to cheer is that MINUS the number of your opponents he is on, and
+ *   §2 is entirely about not losing the minus sign — including the case that proves it matters, a player
+ *   you own in three leagues and face in four, where the naive "you have 3 shares!" is advice pointing
+ *   exactly the wrong way.
+ *
+ * ⚠ AND HIS POINTS ARE NOT ONE NUMBER. Six leagues, six scoring systems, up to six totals for one
+ *   afternoon. §4 pins that the spread survives instead of being averaged into something true nowhere.
+ */
+import assert from 'assert';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../src/lib/rooting.js';
+
+let n = 0;
+const ok = (m) => { n++; console.log('  PASS  ' + m); };
+
+const NAMES = { jacobs: 'Josh Jacobs', chase: "Ja'Marr Chase", kelce: 'Travis Kelce', goff: 'Jared Goff', hill: 'Tyreek Hill' };
+const POS = { jacobs: 'RB', chase: 'WR', kelce: 'TE', goff: 'QB', hill: 'WR' };
+const TEAM = { jacobs: 'GB', chase: 'CIN', kelce: 'KC', goff: 'DET', hill: 'MIA' };
+const helpers = (stateMap = {}) => ({
+  nameOf: (s) => NAMES[s] || `Player ${s}`,
+  posOf: (s) => POS[s] || null,
+  teamOf: (s) => TEAM[s] || null,
+  stateOf: (s) => stateMap[s] || 'pre',
+  oppOf: () => null,
+});
+
+// A league row as the route builds it: my side and my opponent's side, each a list of started players.
+const side = (rosterId, teamName, players, points) => ({ rosterId, teamName, players, pts: points,
+  yetToPlay: players.filter((p) => p.state === 'pre').length,
+  playing: players.filter((p) => p.state === 'live').length,
+  played: players.filter((p) => p.state === 'done').length });
+const P = (sid, pts, state = 'pre') => ({ sid, pts, state });
+
+// 1 ── game state, the column that decides how to read a scoreline
+{
+  const KICK = '2026-09-14T17:00:00Z';
+  const t = Date.parse(KICK);
+  assert.strictEqual(gameState(KICK, t - 60000), 'pre', 'before kickoff is certain');
+  assert.strictEqual(gameState(KICK, t + 60 * 60 * 1000), 'live');
+  assert.strictEqual(gameState(KICK, t + 5 * 60 * 60 * 1000), 'done');
+  assert.strictEqual(gameState(null), 'unknown', 'no kickoff time is unknown, not "done"');
+  assert.strictEqual(gameState('not a date'), 'unknown');
+  ok('1 · ⭐⭐⭐ kickoff windows classify pre/live/done, and a missing time is unknown rather than assumed');
+}
+
+// 2 ── ⭐⭐⭐⭐⭐ THE SUBTRACTION, INCLUDING THE CASE THAT REVERSES THE ADVICE
+{
+  /* Jacobs: started by me in 3 leagues (a, b, c), faced in 4 (b, d, e, f).  net −1  → root AGAINST
+     Chase:   started by me in 4 (a, b, c, d), faced in 1 (e).               net +3  → root FOR
+     Kelce:   me in 1 (d), opponent in 1 (a).                                net  0  → indifferent */
+  const L = (id, mine, theirs) => ({ leagueId: id, leagueName: `League ${id}`,
+    me: side(1, 'Me', mine.map((s) => P(s, 10))), opp: side(2, 'Them', theirs.map((s) => P(s, 10))) });
+  const rows = [
+    L('a', ['jacobs', 'chase'], ['kelce']),
+    L('b', ['jacobs', 'chase'], ['jacobs']),      // he is on BOTH sides in league b — legal and common
+    L('c', ['jacobs', 'chase'], []),
+    L('d', ['chase', 'kelce'], ['jacobs']),
+    L('e', [], ['jacobs', 'jacobs', 'chase']),    // ⚠ the duplicate id must count as ONE league, not two
+    L('f', [], ['jacobs']),
+  ];
+  const board = rootingBoard(rows, helpers());
+  const by = Object.fromEntries(board.map((b) => [b.sid, b]));
+
+  assert.strictEqual(by.jacobs.for, 3, 'started by me in a, b, c');
+  /* ⭐⭐⭐⭐ THREE, NOT FOUR. League e lists him twice; one league is one share however many times the
+     lineup repeats him, and the alternative inflates the exact number this board exists to report. */
+  assert.strictEqual(by.jacobs.against, 4, 'faced in b, d, e and f — e counts once despite listing him twice');
+  assert.deepStrictEqual(by.jacobs.againstLeagues.map((l) => l.leagueId), ['b', 'd', 'e', 'f']);
+  assert.strictEqual(by.jacobs.net, -1);
+  assert.strictEqual(by.chase.for, 4);
+  assert.strictEqual(by.chase.against, 1);
+  assert.strictEqual(by.chase.net, 3);
+  assert.strictEqual(by.kelce.net, 0);
+  /* ⭐⭐⭐⭐⭐ The advice a raw share count would have given here is backwards: three of your teams start
+     Jacobs, so "3 shares" reads as good news, and in fact you want him to have a quiet day. */
+  assert.ok(by.jacobs.for > 0 && by.jacobs.net < 0,
+    'a player can be on several of your teams and still be someone to root against');
+  ok('2 · ⭐⭐⭐⭐⭐ net = for − against, and it correctly reverses the advice on a player you mostly own');
+}
+
+// 3 ── ⭐⭐⭐⭐ the board leads with whoever swings the most, in EITHER direction
+{
+  const L = (id, mine, theirs) => ({ leagueId: id, leagueName: id,
+    me: side(1, 'Me', mine.map((s) => P(s, 5))), opp: side(2, 'Them', theirs.map((s) => P(s, 5))) });
+  const rows = [
+    L('1', ['chase'], ['hill']), L('2', ['chase'], ['hill']), L('3', ['chase'], ['hill']),
+    L('4', ['chase'], ['hill']), L('5', ['kelce'], ['goff']),
+  ];
+  const board = rootingBoard(rows, helpers());
+  assert.strictEqual(Math.abs(board[0].net), 4);
+  assert.strictEqual(Math.abs(board[1].net), 4);
+  /* ⭐ A −4 must not sort below a +1. The player you are facing in four leagues is exactly as much of
+     your afternoon as the one you own in four. */
+  const netsTop2 = board.slice(0, 2).map((b) => b.net).sort((a, b) => a - b);
+  assert.deepStrictEqual(netsTop2, [-4, 4]);
+  assert.ok(Math.abs(board[2].net) <= 1, 'the ±1 players come after the ±4s');
+  ok('3 · ⭐⭐⭐⭐ the board ranks by absolute swing, so root-against players are not buried under root-fors');
+}
+
+// 4 ── ⭐⭐⭐⭐ SIX LEAGUES, SIX SCORING SYSTEMS, SIX DIFFERENT TOTALS
+{
+  const rows = [
+    { leagueId: 'ppr', leagueName: 'PPR', me: side(1, 'Me', [P('chase', 22.4, 'done')]), opp: side(2, 'T', []) },
+    { leagueId: 'half', leagueName: 'Half', me: side(1, 'Me', [P('chase', 18.9, 'done')]), opp: side(2, 'T', []) },
+    { leagueId: 'std', leagueName: 'Std', me: side(1, 'Me', [P('chase', 15.4, 'done')]), opp: side(2, 'T', []) },
+  ];
+  const [c] = rootingBoard(rows, helpers({ chase: 'done' }));
+  assert.strictEqual(c.pts.lo, 15.4);
+  assert.strictEqual(c.pts.hi, 22.4);
+  assert.strictEqual(c.pts.median, 18.9);
+  /* ⭐⭐⭐⭐ The flag that stops one number being printed as though it were true everywhere. */
+  assert.strictEqual(c.pts.varies, true, 'a 7-point spread across scoring systems must be declared');
+  // …and a player scored identically everywhere does NOT get the noisy range treatment.
+  const same = rootingBoard([
+    { leagueId: 'a', leagueName: 'a', me: side(1, 'Me', [P('goff', 14.2, 'done')]), opp: side(2, 'T', []) },
+    { leagueId: 'b', leagueName: 'b', me: side(1, 'Me', [P('goff', 14.2, 'done')]), opp: side(2, 'T', []) },
+  ], helpers());
+  assert.strictEqual(same[0].pts.varies, false);
+  ok('4 · ⭐⭐⭐⭐ per-league scoring differences survive as a range rather than being averaged into a fiction');
+}
+
+// 5 ── which leagues, by name, on each side
+{
+  const rows = [
+    { leagueId: 'x', leagueName: 'Work League', me: side(1, 'Me', [P('hill', 9)]), opp: side(2, 'T', []) },
+    { leagueId: 'y', leagueName: 'Dynasty', me: side(1, 'Me', []), opp: side(2, 'T', [P('hill', 9)]) },
+  ];
+  const [h] = rootingBoard(rows, helpers());
+  assert.deepStrictEqual(h.forLeagues.map((l) => l.leagueName), ['Work League']);
+  assert.deepStrictEqual(h.againstLeagues.map((l) => l.leagueName), ['Dynasty']);
+  // ⚠ Names, not ids — "you are facing him in Dynasty" is actionable; "you are facing him in 8f2a" is not.
+  ok('5 · ⭐⭐⭐ each side names the leagues it comes from');
+}
+
+// 6 ── ⭐⭐⭐⭐ YET TO PLAY — the number that says whether a deficit is real
+{
+  const rows = [{ leagueId: 'a', leagueName: 'a',
+    me: side(1, 'Me', [P('chase', 0, 'pre'), P('jacobs', 22, 'done'), P('kelce', 6, 'live')], 28),
+    opp: side(2, 'T', [P('hill', 31, 'done'), P('goff', 17, 'done')], 48) }];
+  const t = dayTotals(rows);
+  assert.strictEqual(t.losing, 1);
+  assert.strictEqual(t.yetToPlay, 1, 'one of mine has not kicked off');
+  assert.strictEqual(t.oppYetToPlay, 0, 'all of theirs are done');
+  /* ⭐⭐⭐⭐ Down 20 with a player left and none for them is a live afternoon; the totals have to carry
+     that, because the scoreline alone says the opposite. */
+  assert.strictEqual(t.pointsFor, 28);
+  assert.strictEqual(t.pointsAgainst, 48);
+  ok('6 · ⭐⭐⭐⭐ the day totals count who is still to play on each side, not just the score');
+}
+
+// 7 ── the day at a glance, including "close enough to still watch"
+{
+  const mk = (mine, theirs) => ({ leagueId: `${mine}-${theirs}`, leagueName: 'L',
+    me: side(1, 'Me', [P('chase', mine, 'done')], mine), opp: side(2, 'T', [P('hill', theirs, 'done')], theirs) });
+  const t = dayTotals([mk(120, 100), mk(100, 120), mk(110, 108), mk(90, 140), mk(105, 105)]);
+  // 120-100 W · 100-120 L · 110-108 W · 90-140 L · 105-105 T
+  assert.strictEqual(t.leagues, 5);
+  assert.strictEqual(t.winning, 2);
+  assert.strictEqual(t.losing, 2);
+  assert.strictEqual(t.tied, 1);
+  // within 15 either way: 120-100 (20, no), 100-120 (20, no), 110-108 (2, yes), 90-140 (50, no), 105-105 (0, yes)
+  assert.strictEqual(t.close, 2);
+  ok('7 · ⭐⭐⭐ the day totals separate winning/losing/tied and count the matchups still in the balance');
+}
+
+// 8 ── a side built straight from a Sleeper matchup entry
+{
+  const entry = { rosterId: 3, teamName: 'Pylon Pirates', points: 88.4,
+    starters: ['chase', null, 'jacobs', '', 'kelce'] };
+  const s = sideOf(entry, { ptsOf: (sid) => ({ chase: 20.1, jacobs: 44.3, kelce: 24 })[sid], stateOf: () => 'done' });
+  assert.strictEqual(s.players.length, 3, 'empty starter slots are dropped, not rendered as ghosts');
+  assert.strictEqual(s.pts, 88.4, "the league's own total wins over re-adding the parts");
+  assert.strictEqual(s.played, 3);
+  ok('8 · ⭐⭐ a matchup entry becomes a side, empty slots dropped and the platform total trusted');
+}
+
+// 9 ── the shapes a Sunday actually produces
+{
+  assert.deepStrictEqual(rootingBoard([], helpers()), []);
+  assert.deepStrictEqual(rootingBoard(null, helpers()), []);
+  // A league with no opponent yet (bye week in a 13-team league) must not crash the board or the totals.
+  const bye = [{ leagueId: 'a', leagueName: 'a', me: side(1, 'Me', [P('chase', 12)]), opp: null }];
+  assert.strictEqual(rootingBoard(bye, helpers())[0].for, 1);
+  assert.strictEqual(dayTotals(bye).leagues, 0, 'a matchup with no opponent is not a matchup');
+  assert.strictEqual(sideOf(null, { ptsOf: () => 0, stateOf: () => 'pre' }), null);
+  ok('9 · ⭐⭐ empty input, and a league with no opponent this week, are handled rather than thrown on');
+}
+
+// 10 ── ⭐⭐⭐⭐ WHERE THE WEEK IS UP TO — the badge, the review tab, and the one that gates advice
+{
+  const SUN = Date.parse('2026-09-20T17:00:00Z');
+  const wk = [
+    '2026-09-18T00:20:00Z',   // Thursday night
+    '2026-09-20T17:00:00Z',   // Sunday 1pm  x3
+    '2026-09-20T17:00:00Z',
+    '2026-09-20T17:00:00Z',
+    '2026-09-20T20:25:00Z',   // Sunday late
+    '2026-09-21T00:20:00Z',   // Sunday night
+    '2026-09-22T00:15:00Z',   // MONDAY NIGHT — the one that matters
+  ];
+
+  // Saturday: nothing has happened. No badge, no review tab.
+  const sat = weekStateFrom(wk, Date.parse('2026-09-19T12:00:00Z'));
+  assert.deepStrictEqual([sat.anyLive, sat.anyDone, sat.allDone], [false, true, false],
+    'Thursday night is already done by Saturday, so the review tab may appear — but nothing is live');
+  assert.ok(sat.nextKickoff, 'a quiet page can say when it stops being quiet');
+
+  // Sunday 1pm kickoff: live.
+  const live = weekStateFrom(wk, SUN + 30 * 60 * 1000);
+  assert.strictEqual(live.anyLive, true, 'the badge is on');
+  assert.strictEqual(live.allDone, false);
+
+  /* ⭐⭐⭐⭐⭐ THE ONE THAT PREVENTS BAD ADVICE. Sunday 11pm: every game is over EXCEPT Monday night.
+     `anyDone` is true, so the review tab is offered — but `allDone` must be FALSE, because a review
+     computed now would build its "best lineup" out of players who have not kicked off and tell him to
+     bench the man he is about to watch score thirty. */
+  const sundayNight = weekStateFrom(wk, Date.parse('2026-09-21T04:00:00Z'));
+  assert.strictEqual(sundayNight.anyDone, true, 'plenty has finished — the tab appears');
+  assert.strictEqual(sundayNight.allDone, false, 'but Monday night has not been played, so the week is NOT reviewable');
+  assert.strictEqual(sundayNight.live, 0, 'nothing is actually on at 4am UTC Monday');
+
+  // Tuesday: everything is done and the week can be reviewed.
+  const tue = weekStateFrom(wk, Date.parse('2026-09-23T12:00:00Z'));
+  assert.strictEqual(tue.allDone, true);
+  assert.strictEqual(tue.nextKickoff, null);
+  /* ⚠ `games` counts distinct KICKOFF SLOTS, not games: the three 1pm games collapse to one. That is the
+     right unit for "is anything on / is everything over" and the wrong one for "how many games are left",
+     so nothing prints it as a game count. Seven entries, five slots. */
+  assert.strictEqual(tue.games, 5, 'three simultaneous 1pm kickoffs are one slot');
+
+  // No schedule at all is UNKNOWN, never "the week is over".
+  const none = weekStateFrom([], SUN);
+  assert.strictEqual(none.known, false);
+  assert.strictEqual(none.allDone, false, 'an unknown week must never read as reviewable');
+  assert.strictEqual(weekStateFrom(null, SUN).known, false);
+  ok('10 · ⭐⭐⭐⭐⭐ the week state separates "something finished" from "everything finished" — the second gates the review');
+}
+
+console.log(`\n${n} passed`);

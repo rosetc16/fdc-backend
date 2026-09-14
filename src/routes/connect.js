@@ -15,6 +15,9 @@ import {
   getWeeklyProjections,
 } from '../lib/sleeper.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
+import { byeTeamsForWeek } from '../lib/nflSchedule.js';
+import { lineupMisses, verdictFor, seasonLedger, pointRanks } from '../lib/review.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../lib/rooting.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
 import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
 import { importEspnPrivate } from '../lib/espnPrivate.js';
@@ -26,30 +29,93 @@ export const connectRouter = Router();
 connectRouter.use(requireAuth);
 connectRouter.use(requirePaid); // full app data (Sleeper connect, team hub, draft) requires a pass or comp
 
-// Lazily make sure the Sleeper-link columns exist, so linking works even if a manual migration
-// hasn't been run yet (the user is non-technical; we don't want to require a shell step).
+/* ⭐⭐⭐⭐ ONE PERSON, SEVERAL FANTASY ACCOUNTS — b132.
+   ------------------------------------------------------------------------------------------------
+   Trey: "Can you make it so I can connect to multiple sleeper (or other platform) usernames at once.
+   Right now on the check my week it's not picking up on the league that I was connected to earlier but
+   not anymore."
+
+   The link used to be TWO COLUMNS ON THE USER ROW, which made "link" mean REPLACE. That is not a
+   cosmetic limit, and the second sentence above is exactly what it costs: every league imported under
+   the old account keeps working as a draft board (the board needs no identity) but goes DARK the moment
+   a screen has to answer "which of these twelve teams is yours" — because `myRosterId` was resolved by
+   comparing each roster's owner against the ONE stored id. No match, no roster, and My Week drops the
+   league silently while the home page shows it with no badge. A league you can see but that cannot see
+   you is worse than one that failed loudly.
+
+   So the link becomes a LIST, in its own table, keyed by platform so Yahoo/MFL/Fantrax can move in
+   without another migration. Three rules keep the change from breaking anything already shipped:
+     • `users.sleeper_user_id` STAYS, as the PRIMARY account. Half a dozen jobs read it (weeklyBrief,
+       harvestSleeperDrafts, the auth payload) and none of them need to care that there are now others.
+       It always points at one of the rows in the table, or nothing.
+     • Linking is ADDITIVE. Nothing that used to work stops working when a second account arrives.
+     • The table is backfilled from the columns on first touch, so an existing user's link survives the
+       deploy without a migration step. (Trey is not going to run a shell command.)
+   ------------------------------------------------------------------------------------------------ */
 let linkColsEnsured = false;
 async function ensureLinkCols() {
   if (linkColsEnsured) return;
   try {
     await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS sleeper_user_id TEXT;');
     await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS sleeper_username TEXT;');
+    await q(`CREATE TABLE IF NOT EXISTS linked_accounts (
+      user_id     INTEGER NOT NULL,
+      platform    TEXT NOT NULL,
+      account_id  TEXT NOT NULL,
+      username    TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, platform, account_id)
+    );`);
+    await q('CREATE INDEX IF NOT EXISTS linked_accounts_user_idx ON linked_accounts (user_id, platform);');
+    /* Backfill, once, from the old single-value columns. ON CONFLICT DO NOTHING makes this idempotent, so
+       it is safe to leave in the ensure path rather than gating it behind a one-shot flag we would then
+       have to store somewhere. */
+    await q(`INSERT INTO linked_accounts (user_id, platform, account_id, username)
+             SELECT id, 'sleeper', sleeper_user_id, sleeper_username FROM users
+              WHERE sleeper_user_id IS NOT NULL AND sleeper_user_id <> ''
+             ON CONFLICT DO NOTHING;`);
   } catch (e) { /* if this fails we surface a clear error at call time */ }
   linkColsEnsured = true;
 }
 
-// ---- Persistent Sleeper account link ----
-// The link is stored on the user row and stays until the user unlinks (or links a different account).
-// GET  /api/connect/sleeper/account            -> { linked, sleeperUserId, sleeperUsername }
-// POST /api/connect/sleeper/link { username }   -> resolves the username to a Sleeper id and stores it
-// POST /api/connect/sleeper/unlink              -> clears the stored link
+async function accountsFor(userId, platform = 'sleeper') {
+  const { rows } = await q(
+    'SELECT platform, account_id, username FROM linked_accounts WHERE user_id=$1 AND platform=$2 ORDER BY created_at ASC',
+    [userId, platform]
+  );
+  return rows.map((r) => ({ platform: r.platform, id: r.account_id, username: r.username || null }));
+}
+
+/* The primary is what the single-value columns hold, and it must always be one of the linked rows. Called
+   after every add and remove so the columns can never point at an account the user no longer has. */
+async function syncPrimary(userId) {
+  const list = await accountsFor(userId, 'sleeper');
+  const { rows } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [userId]);
+  const cur = rows[0] && rows[0].sleeper_user_id;
+  if (cur && list.some((a) => a.id === cur)) return list;
+  const next = list[0] || null;
+  await q('UPDATE users SET sleeper_user_id=$1, sleeper_username=$2 WHERE id=$3',
+    [next ? next.id : null, next ? next.username : null, userId]);
+  return list;
+}
+
+const accountPayload = (list) => ({
+  linked: list.length > 0,
+  accounts: list,
+  // Back-compat: every caller shipped before b132 reads these two and only these two.
+  sleeperUserId: list[0] ? list[0].id : null,
+  sleeperUsername: list[0] ? list[0].username : null,
+});
+
+// ---- Persistent Sleeper account links ----
+// GET  /api/connect/sleeper/account                      -> { linked, accounts:[{platform,id,username}], sleeperUserId, sleeperUsername }
+// POST /api/connect/sleeper/link { username }             -> ADDS an account (does not replace the others)
+// POST /api/connect/sleeper/unlink { sleeperUserId? }     -> removes one; with no id, removes them all
 
 connectRouter.get('/sleeper/account', async (req, res) => {
   try {
     await ensureLinkCols();
-    const { rows } = await q('SELECT sleeper_user_id, sleeper_username FROM users WHERE id=$1', [req.user.id]);
-    const r = rows[0] || {};
-    res.json({ linked: !!r.sleeper_user_id, sleeperUserId: r.sleeper_user_id || null, sleeperUsername: r.sleeper_username || null });
+    res.json(accountPayload(await syncPrimary(req.user.id)));
   } catch (e) {
     res.status(500).json({ error: 'Could not read Sleeper link' });
   }
@@ -62,32 +128,54 @@ connectRouter.post('/sleeper/link', async (req, res) => {
     await ensureLinkCols();
     const user = await getUser(username);
     if (!user || !user.user_id) return res.status(404).json({ error: 'No Sleeper user with that username' });
-    await q('UPDATE users SET sleeper_user_id=$1, sleeper_username=$2 WHERE id=$3', [user.user_id, user.username || username, req.user.id]);
-    res.json({ linked: true, sleeperUserId: user.user_id, sleeperUsername: user.username || username });
+    await q(`INSERT INTO linked_accounts (user_id, platform, account_id, username) VALUES ($1,'sleeper',$2,$3)
+             ON CONFLICT (user_id, platform, account_id) DO UPDATE SET username=EXCLUDED.username`,
+      [req.user.id, user.user_id, user.username || username]);
+    const list = await syncPrimary(req.user.id);
+    res.json({ ...accountPayload(list), added: { platform: 'sleeper', id: user.user_id, username: user.username || username } });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
   }
 });
 
 connectRouter.post('/sleeper/unlink', async (req, res) => {
+  const one = String((req.body && (req.body.sleeperUserId || req.body.accountId)) || '').trim();
   try {
     await ensureLinkCols();
-    await q('UPDATE users SET sleeper_user_id=NULL, sleeper_username=NULL WHERE id=$1', [req.user.id]);
-    res.json({ linked: false });
+    /* No id = the old all-or-nothing "Unlink" button, which must keep meaning what it always meant.
+       An id = "remove just this one", which is the only sane behaviour once there can be several. */
+    if (one) await q('DELETE FROM linked_accounts WHERE user_id=$1 AND platform=$2 AND account_id=$3', [req.user.id, 'sleeper', one]);
+    else await q('DELETE FROM linked_accounts WHERE user_id=$1 AND platform=$2', [req.user.id, 'sleeper']);
+    res.json(accountPayload(await syncPrimary(req.user.id)));
   } catch (e) {
     res.status(500).json({ error: 'Could not unlink' });
   }
 });
 
-// A linked user's leagues, pulled from the STORED account (no username needed at call time).
+// A linked user's leagues, across EVERY linked account.
 connectRouter.get('/sleeper/my-leagues', async (req, res) => {
   try {
     await ensureLinkCols();
-    const { rows } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
-    const sid = rows[0] && rows[0].sleeper_user_id;
-    if (!sid) return res.status(400).json({ error: 'No Sleeper account linked' });
+    const accounts = await syncPrimary(req.user.id);
+    if (!accounts.length) return res.status(400).json({ error: 'No Sleeper account linked' });
+    const sid = accounts[0].id;
     const season = Number(req.query.season || config.activeSeason);
-    const leagues = (await getUserLeagues(sid, season)) || [];
+    /* ⭐⭐⭐ ONE LIST, TAGGED BY WHO OWNS EACH ENTRY. Two accounts in the same league (it happens — a
+       work league you also commish under a second handle) would otherwise appear twice, so the first
+       account to claim a league_id keeps it and later ones are dropped. The tag rides on the league so
+       the importer can store WHICH account this team belongs to, which is what stops the whole problem
+       from coming back the next time an account is removed. */
+    const seenLeague = new Set();
+    const leagues = [];
+    for (const acct of accounts) {
+      let mine = [];
+      try { mine = (await getUserLeagues(acct.id, season)) || []; } catch { mine = []; }
+      for (const lg of mine) {
+        if (!lg || !lg.league_id || seenLeague.has(lg.league_id)) continue;
+        seenLeague.add(lg.league_id);
+        leagues.push({ ...lg, _ownerId: acct.id, _ownerUsername: acct.username });
+      }
+    }
     // Enrich each league with its draft state (pre-draft / drafting + round / complete) so the UI can show
     // where each team stands. We look up the league's draft; for an in-progress draft we derive the round
     // from the number of picks made so far and the team count.
@@ -116,9 +204,13 @@ connectRouter.get('/sleeper/my-leagues', async (req, res) => {
         season: lg.season, draft_id: draftId, draft_status: draftStatus,
         round, total_rounds: totalRounds, made_picks: madePicks,
         best_ball: !!(lg.settings && lg.settings.best_ball === 1),
+        // Which linked account this team belongs to. The importer stores it on the league so the hub can
+        // find your roster later even if this account is no longer the primary one.
+        owner_id: lg._ownerId || null,
+        owner_username: lg._ownerUsername || null,
       });
     }
-    res.json({ sleeperUserId: sid, leagues: out });
+    res.json({ sleeperUserId: sid, accounts, leagues: out });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
   }
@@ -271,7 +363,7 @@ async function getRemainingSchedule(leagueId, season, fromWeek, toWeek) {
   return Object.keys(out).length ? out : null;
 }
 
-// GET /api/connect/sleeper/team-hub?league_id=...[&week=N]
+// GET /api/connect/sleeper/team-hub?league_id=...[&week=N][&owner=username]
 //   -> { league:{cfg,name}, week, myRosterId, rostered:[ids], teams:[{rosterId,ownerName,teamName,players,
 //        starters,record,pointsFor,pointsAgainst}], matchup:{me,opp}|null, standings:[...] }
 connectRouter.get('/sleeper/team-hub', async (req, res) => {
@@ -279,8 +371,22 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
   if (!leagueId) return res.status(400).json({ error: 'league_id required' });
   try {
     await ensureLinkCols();
+    /* ⭐⭐⭐⭐ WHICH OF THESE TWELVE TEAMS IS YOURS — the question that used to have exactly one answer.
+       Now every linked account is a candidate, and on top of that the client may pass `owner`: the Sleeper
+       username the league was IMPORTED under, which the league record has been carrying all along.
+       That hint is what rescues a league whose account has since been removed — the case Trey hit — and it
+       costs nothing to trust, because it grants no access: this whole route is public Sleeper data behind
+       an auth check, and `owner` only decides which of the rosters we have ALREADY fetched gets pointed at.
+       A wrong or hostile value can highlight a different team in a league the caller can already read in
+       full. (It is also why it is safe in a query string, unlike the MFL/Fantrax secrets, which are not.) */
+    const mineIds = new Set((await accountsFor(req.user.id, 'sleeper')).map((a) => a.id));
     const { rows } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
     const sid = rows[0] && rows[0].sleeper_user_id;
+    if (sid) mineIds.add(sid);
+    const ownerHint = String(req.query.owner || '').trim();
+    if (ownerHint) {
+      try { const u = await getUser(ownerHint); if (u && u.user_id) mineIds.add(u.user_id); } catch { /* hint is best-effort */ }
+    }
 
     // Pull league, its users (owners), rosters, and NFL state in parallel.
     const [league, users, rosters, nfl] = await Promise.all([
@@ -355,7 +461,19 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
         // raw-stat scoring couldn't run.
         const custom = scoreFromSleeper(st, position);
         const pts = custom != null ? custom : (st[ptsField] != null ? st[ptsField] : (st.pts_ppr != null ? st.pts_ppr : null));
+        const pl = row.player || {};
         weekly[pid] = {
+          /* ⭐⭐⭐⭐ NAME AND POSITION RIDE ALONG — b132, and the reason the free-agent finder was empty.
+             This map is the ONLY complete list of "every NFL player with a projection this week". The
+             draft player pack is not: it is the draftable universe, and it drops anyone with neither an
+             ADP nor a season projection — which is the precise description of the waiver-wire pickup you
+             are looking for in October. My Week was intersecting the two, so its free-agent pool was the
+             draft board minus rostered players, and in a deep league that is close to nobody. Carrying
+             two extra strings here lets the page use THIS as its universe and the pack purely for
+             enrichment. Two strings on ~1,000 rows is a few tens of KB on a call that already ships the
+             whole league. */
+          name: pl.first_name || pl.last_name ? `${pl.first_name || ''} ${pl.last_name || ''}`.trim() : (pl.full_name || null),
+          pos: pl.position || null,
           pts: pts != null ? Math.round(pts * 10) / 10 : null,
           ptsPpr: st.pts_ppr != null ? Math.round(st.pts_ppr * 10) / 10 : null,
           ptsHalf: st.pts_half_ppr != null ? Math.round(st.pts_half_ppr * 10) / 10 : null,
@@ -372,6 +490,24 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
         };
       }
     } catch { weekly = {}; }
+
+    /* ⭐⭐⭐⭐ WHO IS ON BYE, FROM THE SCHEDULE RATHER THAN FROM A PLAYER COLUMN — b132.
+       Trey: "Yes, I want this to be focused on bye weeks."
+       The old bye test was `player.bye_week === week`, read off the players table, and it is the weakest
+       link in the chain: Sleeper's player feed leaves `bye_week` null for large stretches of the year, so
+       in the weeks that matter most the answer was "nobody is on bye" — stated with total confidence, in
+       every league at once. The schedule cannot be coy about it: a team either has a row for this week or
+       it does not, and a team with no row is on bye. That is a set of about six strings.
+       Null, not [], when the schedule table has nothing for the season — an empty array would read as
+       "no byes this week", which is a claim we would not be entitled to make. */
+    let byeTeams = null, byeTeamsNext = null;
+    try {
+      const { rows: sch } = await q('SELECT team, week FROM nfl_schedule WHERE season=$1', [Number(season)]);
+      byeTeams = byeTeamsForWeek(sch, week);
+      // Next week too, because a waiver claim for a bye you can already see is the one piece of advice this
+      // whole page can give you EARLY rather than at 11:55 on Sunday.
+      byeTeamsNext = week < 18 ? byeTeamsForWeek(sch, week + 1) : null;
+    } catch { byeTeams = null; byeTeamsNext = null; }
 
     // Defense-vs-position difficulty — season-to-date ACTUAL points allowed by each defense per position
     // (the method the major sites use), cached in def_vs_pos. Empty early in the season (no completed weeks).
@@ -415,7 +551,7 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       const starters = (m && Array.isArray(m.starters)) ? m.starters : (Array.isArray(r.starters) ? r.starters : []);
       (starters || []).forEach((pid) => { if (pid != null && pid !== '0') rostered.add(String(pid)); });
       const s = r.settings || {};
-      if (sid && r.owner_id === sid) myRosterId = r.roster_id;
+      if (myRosterId == null && r.owner_id && mineIds.has(r.owner_id)) myRosterId = r.roster_id;
       return {
         rosterId: r.roster_id,
         ownerId: r.owner_id,
@@ -499,6 +635,12 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       seasonType: nfl ? nfl.season_type : null,
       myRosterId,
       linked: !!sid,
+      // Whether we could point at a team at all, and if so which account it came from. The frontend uses
+      // this to say "add the Sleeper account that owns this league" instead of dropping the league.
+      ownerResolved: myRosterId != null,
+      ownerHint: ownerHint || null,
+      byeTeams,
+      byeTeamsNext,
       rostered: Array.from(rostered),
       teams,
       matchup,
@@ -511,6 +653,361 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       schedule,      // { [week]: [[rosterIdA, rosterIdB], ...] } for the rest of the regular season
       weekly,        // { [player_id]: { pts, opp, team, date, gameId, inj, ... } } for THIS week
       matchupDifficulty,  // { [defTeam]: { QB/RB/WR/TE: { rank, of, tier, pg } } } season-to-date pts allowed/game
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
+
+/* ⭐⭐⭐⭐⭐ GET /api/connect/sleeper/season-review?league_id=...[&owner=username]  — b133
+ * ================================================================================================
+ * Trey: "I also want to create a weekly review. You should be able to toggle back to every week in the
+ * past… should you have started someone else? Was there a FA? Was it good luck or bad luck that you won
+ * or lost? Give weekly trends not just for your matchup, but also compare it to the league."
+ *
+ * Returns EVERY COMPLETED WEEK of one league at once, already reduced to verdicts and totals. Three
+ * decisions shape it, and all three are about the fifteen-league case:
+ *
+ * ⭐ THE WHOLE SEASON IN ONE CALL, so the week toggle is instant and the trend lines and the ledger exist
+ *   at all. A per-week endpoint would make "toggle back to every week" fifteen more round-trips per click.
+ *
+ * ⭐ REDUCED HERE, NOT ON THE CLIENT. The raw material is twelve rosters x fourteen weeks of per-player
+ *   point maps — roughly 300KB per league, so 4.5MB across his fifteen. What he actually needs is a few
+ *   dozen numbers per week. Doing the reduction server-side turns that into ~6KB a league and means the
+ *   optimal-lineup maths lives in ONE tested place (lib/review.js) rather than in a screen.
+ *
+ * ⭐ COMPLETED WEEKS ARE IMMUTABLE, so they cache hard. Week 3 will never change again; re-fetching it
+ *   every time somebody opens the page is pure waste against a rate limit that is application-wide. The
+ *   CURRENT week is deliberately excluded entirely — a review of a week still being played is not a
+ *   review, it is a scoreboard, and the page already has one of those.
+ *
+ * ⚠ NO FREE AGENTS, AND THE RESPONSE SAYS SO. `faBasis: 'bench-only'` is not a footnote, it is the honest
+ *   answer to half of his question: who was unrostered in week 6 CANNOT be recovered from today's rosters,
+ *   because the player you should have claimed is by definition on somebody's roster now. Answering it
+ *   properly needs a replay of the league's transaction log; answering it with today's rosters would
+ *   systematically hide exactly the misses he is asking about. So the review reports what it can stand
+ *   behind — the players who were on your own bench, which Sleeper snapshots per week — and the page
+ *   prints the limitation rather than implying the wire was empty.
+ */
+const REVIEW_TTL_MS = 6 * 60 * 60 * 1000;          // a settled week never changes; this is just a memory bound
+const reviewCache = new Map();                      // `${leagueId}:${season}:${week}` -> { at, matchups }
+
+async function settledMatchups(leagueId, season, week) {
+  const key = `${leagueId}:${season}:${week}`;
+  const hit = reviewCache.get(key);
+  if (hit && Date.now() - hit.at < REVIEW_TTL_MS) return hit.matchups;
+  const ms = (await getMatchups(leagueId, week)) || [];
+  reviewCache.set(key, { at: Date.now(), matchups: ms });
+  // Cheap bound: this is one small array per league-week and the process is long-lived.
+  if (reviewCache.size > 4000) { const first = reviewCache.keys().next().value; reviewCache.delete(first); }
+  return ms;
+}
+
+connectRouter.get('/sleeper/season-review', async (req, res) => {
+  const leagueId = String(req.query.league_id || '').trim();
+  if (!leagueId) return res.status(400).json({ error: 'league_id required' });
+  try {
+    await ensureLinkCols();
+    const mineIds = new Set((await accountsFor(req.user.id, 'sleeper')).map((a) => a.id));
+    const { rows: urow } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
+    if (urow[0] && urow[0].sleeper_user_id) mineIds.add(urow[0].sleeper_user_id);
+    const ownerHint = String(req.query.owner || '').trim();
+    if (ownerHint) { try { const u = await getUser(ownerHint); if (u && u.user_id) mineIds.add(u.user_id); } catch { /* best-effort */ } }
+
+    const [league, users, rosters, nfl] = await Promise.all([
+      getLeague(leagueId), getLeagueUsers(leagueId), getLeagueRosters(leagueId), getNflState().catch(() => null),
+    ]);
+    if (!league) return res.status(404).json({ error: 'League not found on Sleeper' });
+
+    const season = (nfl && nfl.season) || String(config.activeSeason);
+    /* WHICH WEEKS ARE OVER. `display_week` is the week Sleeper is currently showing, i.e. the one in
+       progress — so the last COMPLETED week is the one before it. In the preseason nothing is complete,
+       and the response says that plainly instead of returning an empty list that reads like a failure. */
+    const seasonType = nfl && nfl.season_type;
+    const cur = (nfl && (nfl.display_week || nfl.week)) || 1;
+    let lastDone = (seasonType && seasonType !== 'regular' && seasonType !== 'post') ? 0 : Math.max(0, Math.min(18, cur) - 1);
+
+    /* ⭐⭐⭐⭐ SUNDAY NIGHT IS REVIEWABLE — b135.
+       Trey: "once games have finished… There should be a review tab next to live where you can dive into
+       these." This used to stop dead at `cur - 1`, which meant the most interesting review in the world —
+       the one for the games you just watched — did not exist until Sleeper rolled the week over on
+       Tuesday. So the CURRENT week is included too, but only once EVERY game in it is finished.
+       ⚠ AND "EVERY" IS NOT PEDANTRY. A review of a week with the Monday-night game still to come computes
+         its optimal lineup from players who have not played, so it would tell you to bench the man you
+         are about to watch score thirty. One game short is not done; the page says so instead. */
+    let currentWeekOpen = false;
+    if (lastDone < 18 && cur >= 1) {
+      try {
+        const { rows: sch } = await q(
+          'SELECT kickoff FROM nfl_schedule WHERE season=$1 AND week=$2', [Number(season), Math.min(18, cur)]);
+        const ws = weekStateFrom(sch.map((r) => (r.kickoff ? new Date(r.kickoff).toISOString() : null)));
+        if (ws.known && ws.allDone) { lastDone = Math.min(18, cur); currentWeekOpen = true; }
+      } catch { /* no schedule: fall back to completed weeks only, which is the safe direction */ }
+    }
+
+    let myRosterId = null;
+    const ownerById = new Map();
+    (users || []).forEach((u) => {
+      const teamName = (u.metadata && u.metadata.team_name) ? u.metadata.team_name : null;
+      ownerById.set(u.user_id, { ownerName: u.display_name || 'Unknown', teamName: teamName || u.display_name || 'Team' });
+    });
+    const teams = (rosters || []).map((r) => {
+      if (myRosterId == null && r.owner_id && mineIds.has(r.owner_id)) myRosterId = r.roster_id;
+      const o = ownerById.get(r.owner_id) || { ownerName: 'Unknown', teamName: 'Team' };
+      return { rosterId: r.roster_id, ownerName: o.ownerName, teamName: o.teamName };
+    });
+
+    const rosterPositions = (league.roster_positions || []).filter(Boolean);
+
+    if (!lastDone || myRosterId == null) {
+      return res.json({ leagueId, leagueName: league.name, season, teams, myRosterId,
+        ownerResolved: myRosterId != null, rosterPositions, lastCompletedWeek: lastDone,
+        currentWeek: cur, currentWeekOpen,
+        weeks: [], ledger: null, ranks: null, faBasis: 'bench-only',
+        note: !lastDone ? 'No completed weeks yet this season.' : null });
+    }
+
+    // One fetch per completed week, cached; weeks in parallel but paced by the same pool used elsewhere.
+    const weekNums = Array.from({ length: lastDone }, (_, i) => i + 1);
+    const raw = await Promise.all(weekNums.map(async (w) => {
+      try { return [w, await settledMatchups(leagueId, season, w)]; } catch { return [w, null]; }
+    }));
+
+    /* Names and positions for the miss list. The players table is the same source the draft board uses, so
+       a name printed here matches the name printed everywhere else in the app. */
+    const nameById = new Map(), posById = new Map();
+    try {
+      const { rows: pl } = await q(
+        `SELECT player_id, full_name, position FROM players WHERE position IS NOT NULL`);
+      pl.forEach((p) => { nameById.set(String(p.player_id), p.full_name); posById.set(String(p.player_id), p.position); });
+    } catch { /* the review still works, with ids where names would be */ }
+
+    const weeks = [];
+    for (const [week, ms] of raw) {
+      if (!ms || !ms.length) continue;
+      const byRoster = new Map(ms.map((m) => [m.roster_id, m]));
+      const pointsByRoster = {}, opponentByRoster = {};
+      ms.forEach((m) => {
+        if (Number.isFinite(m.points)) pointsByRoster[String(m.roster_id)] = Math.round(m.points * 100) / 100;
+        const opp = ms.find((x) => x.matchup_id != null && x.matchup_id === m.matchup_id && x.roster_id !== m.roster_id);
+        if (opp) opponentByRoster[String(m.roster_id)] = String(opp.roster_id);
+      });
+      const mine = byRoster.get(myRosterId);
+      if (!mine) { weeks.push({ week, pointsByRoster, opponentByRoster, me: null }); continue; }
+
+      const pp = mine.players_points || {};
+      // ⚠ A player with no entry has NO recorded score. Null, not zero — see review.js and its test 7.
+      const ptsOf = (sid) => (pp[String(sid)] == null ? null : Number(pp[String(sid)]));
+      const posOf = (sid) => posById.get(String(sid)) || null;
+      const nameOf = (sid) => nameById.get(String(sid)) || `Player ${sid}`;
+      const roster = [...new Set([...(mine.players || []), ...(mine.starters || [])].filter(Boolean).map(String))];
+
+      const lm = lineupMisses(rosterPositions, mine.starters, roster, ptsOf, posOf, nameOf);
+      const oppId = opponentByRoster[String(myRosterId)];
+      const oppPts = oppId != null ? pointsByRoster[oppId] : null;
+      const myPts = pointsByRoster[String(myRosterId)];
+      const result = !Number.isFinite(oppPts) ? null : myPts > oppPts ? 'W' : myPts < oppPts ? 'L' : 'T';
+
+      weeks.push({ week, pointsByRoster, opponentByRoster,
+        me: { pts: myPts, oppRosterId: oppId || null, oppPts: Number.isFinite(oppPts) ? oppPts : null, result,
+          optimal: lm.optimal, actual: lm.actual, left: lm.left, exact: lm.exact, misses: lm.misses.slice(0, 6) } });
+    }
+
+    /* The opponent's own average has to be computed across the WHOLE season before any week's verdict can
+       use it — "they beat their average" is a season fact, not a week fact. So verdicts are a second pass. */
+    const avgByRoster = {};
+    for (const t of teams) {
+      const vals = weeks.map((w) => w.pointsByRoster[String(t.rosterId)]).filter(Number.isFinite);
+      if (vals.length) avgByRoster[String(t.rosterId)] = Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100;
+    }
+    for (const w of weeks) {
+      if (!w.me) continue;
+      const field = Object.values(w.pointsByRoster);
+      const v = verdictFor({ won: w.me.result === 'W', myPts: w.me.pts, allPtsThisWeek: field,
+        optimalPts: w.me.optimal, oppPts: w.me.oppPts, oppAvg: w.me.oppRosterId ? avgByRoster[w.me.oppRosterId] : null });
+      w.me.verdict = { key: v.key, text: v.text };
+      w.me.allPlay = v.allPlay;
+      w.me.median = v.median;
+      w.me.oppSwing = v.oppSwing;
+      w.me.optimalWins = v.optimalWins;
+    }
+
+    res.json({
+      leagueId, leagueName: league.name, season, teams, myRosterId, ownerResolved: true,
+      rosterPositions, lastCompletedWeek: lastDone,
+      // Whether the newest reviewable week is the one just played (every game final) or the last full one.
+      currentWeek: cur, currentWeekOpen,
+      weeks, ledger: seasonLedger(weeks), ranks: pointRanks(weeks, teams.map((t) => t.rosterId)),
+      averages: avgByRoster,
+      // Not a footnote. See the header: this is the honest scope of the "was there a FA?" answer.
+      faBasis: 'bench-only',
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
+
+/* ⭐⭐⭐⭐⭐ GET /api/connect/sleeper/live?league_ids=a,b,c[&week=N][&owner=username]  — b134
+ * ================================================================================================
+ * Trey: "I also want to be able to track all leagues live during games to see scores, trends, etc.
+ * basically have this be my hub for what should I be rooting for."
+ *
+ * ⭐ ONE REQUEST FOR THE WHOLE SUNDAY, and that is the entire design. The obvious build — call team-hub
+ *   once per league from the client — is unusable here: team-hub makes SEVEN upstream calls per league
+ *   (league, users, rosters, NFL state, weekly projections, defence-vs-position, schedule) because it is
+ *   built to answer everything about one league once. Polling that for fifteen leagues every minute is
+ *   105 upstream calls a minute FOR ONE USER, against an app-wide ceiling of about a thousand. Two people
+ *   watching football would degrade live draft sync for everybody.
+ *
+ *   So this route asks each league only what changes during a game: the matchups. League rosters and user
+ *   names change roughly never, so they are cached for an hour; matchups get a short TTL with single-flight,
+ *   which also means twelve people in the same league cost one upstream call between them rather than
+ *   twelve. Fifteen leagues then cost fifteen short-lived calls per refresh, shared across every viewer.
+ *
+ * ⚠ AND THE ANSWER IS ASSEMBLED HERE, not shipped raw. The rooting board is a cross-league reduction —
+ *   who is on your side in which leagues, minus whose side he is on against you — and doing it on the
+ *   server means one tested implementation (lib/rooting.js) rather than one per screen.
+ *
+ * ⚠ GAME STATE IS A WINDOW, NOT A CLOCK. Nothing this app talks to reports whether a game is in the third
+ *   quarter. What we do have is kickoff times from nfl_schedule, which gives certainty on the only state
+ *   that carries real meaning — "has not kicked off yet" — and an honest approximation of the rest. See
+ *   lib/rooting.js `gameState`.
+ */
+const LIVE_TTL_MS = 20 * 1000;            // matchups during a game; short, and shared across all viewers
+const LEAGUE_TTL_MS = 60 * 60 * 1000;     // rosters and display names, which do not move on a Sunday
+const liveCache = new Map();              // key -> { at, value }
+const liveFlight = new Map();             // key -> promise (single-flight: concurrent viewers share one call)
+
+/* A few leagues at a time. Firing fifteen fan-outs at once is how you get the app rate-limited into a
+   half-loaded board — the same reason the client paces its own calls. Never throws: a league that fails
+   comes back as an error row so the other fourteen still render. */
+async function pool(items, n, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    for (;;) {
+      const k = i++;
+      if (k >= items.length) return;
+      try { out[k] = await fn(items[k], k); } catch (e) { out[k] = { error: String((e && e.message) || e) }; }
+    }
+  }));
+  return out;
+}
+
+async function cachedCall(key, ttl, fn) {
+  const hit = liveCache.get(key);
+  if (hit && Date.now() - hit.at < ttl) return hit.value;
+  if (liveFlight.has(key)) return liveFlight.get(key);
+  const p = (async () => {
+    try {
+      const value = await fn();
+      liveCache.set(key, { at: Date.now(), value });
+      if (liveCache.size > 5000) liveCache.delete(liveCache.keys().next().value);
+      return value;
+    } finally { liveFlight.delete(key); }
+  })();
+  liveFlight.set(key, p);
+  return p;
+}
+
+connectRouter.get('/sleeper/live', async (req, res) => {
+  const ids = String(req.query.league_ids || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 40);
+  if (!ids.length) return res.status(400).json({ error: 'league_ids required' });
+  try {
+    await ensureLinkCols();
+    const mineIds = new Set((await accountsFor(req.user.id, 'sleeper')).map((a) => a.id));
+    const { rows: urow } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
+    if (urow[0] && urow[0].sleeper_user_id) mineIds.add(urow[0].sleeper_user_id);
+    /* `owner` may be a comma-separated list, positionally matched to league_ids — the same hint team-hub
+       takes, batched. A league whose account has been unlinked is still readable because of it. */
+    const hints = String(req.query.owner || '').split(',').map((s) => s.trim()).filter(Boolean);
+    for (const h of [...new Set(hints)]) {
+      try { const u = await getUser(h); if (u && u.user_id) mineIds.add(u.user_id); } catch { /* best-effort */ }
+    }
+
+    const nfl = await getNflState().catch(() => null);
+    const season = (nfl && nfl.season) || String(config.activeSeason);
+    let week = Number(req.query.week || 0);
+    if (!week || Number.isNaN(week)) {
+      const st = nfl && nfl.season_type;
+      week = (st && st !== 'regular' && st !== 'post') ? 1 : ((nfl && (nfl.display_week || nfl.week)) || 1);
+    }
+    week = Math.min(18, Math.max(1, week));
+
+    // Kickoff times for the week — the only thing that lets a scoreline say "with four still to play".
+    const kickoffByTeam = {};
+    try {
+      const { rows: sch } = await q(
+        'SELECT team, kickoff FROM nfl_schedule WHERE season=$1 AND week=$2', [Number(season), week]);
+      sch.forEach((r) => { if (r.kickoff) kickoffByTeam[String(r.team)] = new Date(r.kickoff).toISOString(); });
+    } catch { /* no schedule loaded: every player reads as unknown, which the UI states rather than guesses */ }
+
+    const nameById = new Map(), posById = new Map(), teamById = new Map();
+    try {
+      const { rows: pl } = await q('SELECT player_id, full_name, position, team FROM players WHERE position IS NOT NULL');
+      pl.forEach((p) => {
+        nameById.set(String(p.player_id), p.full_name);
+        posById.set(String(p.player_id), p.position);
+        teamById.set(String(p.player_id), p.team);
+      });
+    } catch { /* ids will stand in for names rather than the whole board failing */ }
+
+    const now = Date.now();
+    const stateOf = (sid) => gameState(kickoffByTeam[String(teamById.get(String(sid)))] || null, now);
+
+    const out = await pool(ids, 5, async (leagueId) => {
+      const [users, rosters, ms] = await Promise.all([
+        cachedCall(`u:${leagueId}`, LEAGUE_TTL_MS, () => getLeagueUsers(leagueId)),
+        cachedCall(`r:${leagueId}`, LEAGUE_TTL_MS, () => getLeagueRosters(leagueId)),
+        cachedCall(`m:${leagueId}:${week}`, LIVE_TTL_MS, () => getMatchups(leagueId, week)),
+      ]);
+      const ownerById = new Map();
+      (users || []).forEach((u) => ownerById.set(u.user_id, (u.metadata && u.metadata.team_name) || u.display_name || 'Team'));
+      let myRosterId = null;
+      const teamNameByRoster = new Map();
+      (rosters || []).forEach((r) => {
+        teamNameByRoster.set(r.roster_id, ownerById.get(r.owner_id) || 'Team');
+        if (myRosterId == null && r.owner_id && mineIds.has(r.owner_id)) myRosterId = r.roster_id;
+      });
+      if (myRosterId == null) return { leagueId, ownerResolved: false, me: null, opp: null };
+
+      const byRoster = new Map((ms || []).map((m) => [m.roster_id, m]));
+      const mineM = byRoster.get(myRosterId);
+      if (!mineM) return { leagueId, ownerResolved: true, me: null, opp: null, note: 'no matchup this week' };
+      const oppM = (ms || []).find((m) => m.matchup_id != null && m.matchup_id === mineM.matchup_id && m.roster_id !== myRosterId) || null;
+
+      const entryOf = (m) => (m ? { rosterId: m.roster_id, teamName: teamNameByRoster.get(m.roster_id) || 'Team',
+        points: Number.isFinite(m.points) ? m.points : null, starters: m.starters || [] } : null);
+      // ⚠ Points come from the league's OWN scoring, per player, as Sleeper already settled them. We never
+      //   recompute: a scoreboard that disagrees with the platform's scoreboard is worse than no scoreboard.
+      const ptsOf = (sid, entry) => {
+        const m = byRoster.get(entry.rosterId);
+        const v = m && m.players_points ? m.players_points[String(sid)] : null;
+        return v == null ? null : Number(v);
+      };
+      return { leagueId, ownerResolved: true,
+        me: sideOf(entryOf(mineM), { ptsOf, stateOf }), opp: sideOf(entryOf(oppM), { ptsOf, stateOf }) };
+    });
+
+    const leagues = out.map((r) => (r && !r.error ? r : { leagueId: null, error: String((r && r.error) || 'failed') }));
+    const rows = leagues.filter((r) => r && r.me);
+    const board = rootingBoard(rows, {
+      nameOf: (sid) => nameById.get(sid) || `Player ${sid}`,
+      posOf: (sid) => posById.get(sid) || null,
+      teamOf: (sid) => teamById.get(sid) || null,
+      stateOf,
+      oppOf: () => null,
+    });
+
+    res.json({
+      week, season, at: new Date().toISOString(),
+      leagues, totals: dayTotals(rows), rooting: board,
+      /* ⭐⭐⭐ WHERE THE WEEK IS UP TO. The home page needs this to decide between a live badge, a review
+         tab, both (Sunday afternoon) or neither (Wednesday) — and it must not cost a second request to
+         find out, or every home-page load pays for a question whose answer is usually "nothing is on". */
+      weekState: weekStateFrom(Object.values(kickoffByTeam), now),
+      // Whether the kickoff times were there at all. Without them "yet to play" is not a number we have.
+      scheduleKnown: Object.keys(kickoffByTeam).length > 0,
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
