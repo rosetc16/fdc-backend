@@ -80,7 +80,16 @@ export function sideOf(entry, { ptsOf, stateOf }) {
     teamName: entry.teamName || null,
     pts: r2(Number.isFinite(entry.points) ? entry.points : players.reduce((s, p) => s + (p.pts || 0), 0)),
     players,
-    yetToPlay: count('pre'),
+    /* ⚠ "YET TO PLAY" MEANS UNDECIDED, AND IT HAS TO MEAN THAT EVERYWHERE — 29u.
+       This counted ONLY `pre` while the live route's own decorate step counts everything that is not
+       `done`, so one field name carried two different definitions depending on which function built the
+       row. Nothing was visibly wrong today, because every caller happens to decorate afterwards and the
+       decorated value wins — which is exactly what makes it dangerous: the next caller to use `sideOf`
+       directly inherits the pre-b140 semantics with nothing to warn it, and the symptom would be a
+       "left" column that goes quiet during the only games anyone is watching.
+       `notStarted` is the pre-only count for anywhere that genuinely wants "has not kicked off". */
+    yetToPlay: players.length - count('done'),
+    notStarted: count('pre'),
     playing: count('live'),
     played: count('done'),
   };

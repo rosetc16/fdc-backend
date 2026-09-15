@@ -12,8 +12,9 @@ import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
-  getWeeklyProjections, getWeeklyStats,
+  getWeeklyProjections, getWeeklyStats, getTrendingAdds,
 } from '../lib/sleeper.js';
+import { trendFor, auditFields } from '../lib/trending.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
 import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
@@ -641,6 +642,93 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       cfg = cfgFromLeague(league, d);
     } catch { cfg = cfgFromLeague(league, null); }
 
+    /* ⭐⭐⭐⭐⭐ WHO IS ABOUT TO BE GOOD — b142.
+       ================================================================================================
+       Trey: "targets, yards, points… are certainly an indication of value. Also, what that doesn't
+       capture is like if there was an injury and someone's taking over as the starter type of deal.
+       Maybe we can pull data from other sources to suggest there's new roster, like… percentage owned."
+
+       Four signals, computed here rather than in the browser for one reason each: the usage and role
+       trends need several weeks of stat lines (four extra Sleeper calls, shared across every user by the
+       cache), the opportunity signal needs the whole player table to see who is ahead of a man on his own
+       depth chart, and the ownership feed is a single league-wide call that would otherwise be made once
+       per open tab. The browser gets the answers, keyed by player id.
+
+       ⚠ ONLY FOR PLAYERS WHO ARE ACTUALLY AVAILABLE. The ownership signal in particular only means
+         anything about YOUR wire — "being added everywhere and still free in your league" is the whole
+         point of it — and computing trends for 800 rostered players would be several hundred milliseconds
+         spent on rows nobody can act on.
+       ⚠ AND THE WHOLE BLOCK IS BEST-EFFORT. Every input is optional, every signal reports UNKNOWN rather
+         than false when its field is missing, and a total failure here must leave the hub exactly as it
+         was — this is a decoration on the free-agent list, not a load-bearing part of it. */
+    let trending = null;
+    let trendAudit = null;
+    try {
+      const TREND_WEEKS = 4;
+      const wks = [];
+      for (let w = Math.max(1, week - TREND_WEEKS); w < week; w++) wks.push(w);
+      /* ⚠ `players` INSIDE THIS HANDLER IS A ROSTER'S ID ARRAY, NOT THE MASTER PLAYER TABLE — it is
+         declared per-roster inside the team loop above. Reaching for it here would have been a
+         ReferenceError at request time on a route that builds perfectly cleanly, which is the same shape
+         as the 29q Rosters-panel bug the error boundary swallowed. The master table has its own name. */
+      const [statWeeks, adds, allPlayers] = await Promise.all([
+        Promise.all(wks.map((w) => cachedCall(`stats:${season}:${w}`, LEAGUE_TTL_MS,
+          () => getWeeklyStats(season, w, { positions: ['QB', 'RB', 'WR', 'TE'] })).catch(() => []))),
+        getTrendingAdds().catch(() => new Map()),
+        getAllPlayers().catch(() => ({})),
+      ]);
+      // sid -> [week1 stats, week2 stats, …] oldest first, with gaps preserved as undefined so a man who
+      // missed a week does not have his history silently compacted into a false continuity.
+      const byPlayer = new Map();
+      statWeeks.forEach((rows, i) => {
+        (rows || []).forEach((r) => {
+          if (!r || r.player_id == null) return;
+          const k = String(r.player_id);
+          if (!byPlayer.has(k)) byPlayer.set(k, new Array(statWeeks.length).fill(undefined));
+          byPlayer.get(k)[i] = r.stats || r;
+        });
+      });
+      /* Teammates, grouped once. The opportunity signal asks "who is ahead of him at his position on his
+         own team", which is a per-team question and would otherwise be a scan of the full player table
+         for every free agent on the page. */
+      const byTeam = new Map();
+      for (const pid in allPlayers) {
+        const pl = allPlayers[pid];
+        if (!pl || !pl.team) continue;
+        if (!byTeam.has(pl.team)) byTeam.set(pl.team, []);
+        byTeam.get(pl.team).push(pl);
+      }
+      const out = {};
+      const FANTASY_POS = new Set(['QB', 'RB', 'WR', 'TE']);
+      for (const pid in allPlayers) {
+        if (rostered.has(String(pid))) continue;              // rostered somewhere: not an add
+        const pl = allPlayers[pid];
+        if (!pl || !FANTASY_POS.has(pl.position) || !pl.team) continue;
+        const t = trendFor({
+          player: pl,
+          teammates: byTeam.get(pl.team) || [],
+          weeks: byPlayer.get(String(pid)) || [],
+          addsByPlayer: adds,
+        });
+        // Only players with something to say travel over the wire; the rest would be 700 empty objects.
+        if (t.fired.length) {
+          out[String(pid)] = {
+            top: t.top.kind,
+            why: t.top.why,
+            rank: Math.round(t.rank * 100) / 100,
+            all: t.fired.map((x) => ({ kind: x.kind, why: x.why })),
+          };
+        }
+      }
+      trending = out;
+      // The instrument, always, whether or not anything fired — see auditFields in trending.js.
+      trendAudit = auditFields(
+        statWeeks.flat(),
+        Object.keys(allPlayers).slice(0, 4000).map((k) => allPlayers[k]),
+        adds,
+      );
+    } catch { trending = null; trendAudit = null; }
+
     res.json({
       leagueName: league.name,
       cfg,
@@ -660,6 +748,8 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       byeTeams,
       byeTeamsNext,
       rostered: Array.from(rostered),
+      trending,
+      trendAudit,
       teams,
       matchup,
       medianScoring: medianOnHub, medianProjected: medianProj,

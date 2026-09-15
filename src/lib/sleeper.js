@@ -56,6 +56,42 @@ export async function getAllPlayers({ force = false } = {}) {
   return _playerCache;
 }
 
+/* ⭐⭐⭐⭐ WHAT THE REST OF THE WORLD IS PICKING UP — b142.
+   Trey: "maybe we can pull data from other sources to suggest there's new roster, like… percentage owned."
+
+   Sleeper publishes adds and drops aggregated across every league it hosts. It is the closest thing to a
+   free ownership feed that exists, it needs NO API KEY (the same reason Open-Meteo was chosen for weather),
+   and it is a rate of change rather than a level — which is arguably the better signal for "who is about to
+   matter", but must never be labelled "percent owned" on screen, because it is not that.
+
+   ⚠ FAILURE IS AN EMPTY MAP, NEVER AN EXCEPTION AND NEVER A PARTIAL ONE. The ownership signal treats an
+     empty feed as UNKNOWN and says so rather than reporting that nobody in the world wants anybody — see
+     ownershipSurge in trending.js. So every error path here returns the same empty map.
+   ⚠ AND IT IS CACHED FOR AN HOUR. The window asked for is 24 hours, so the answer genuinely does not move
+     minute to minute, and this is called once per hub load across every user. */
+let _trendCache = null;
+let _trendCacheAt = 0;
+export async function getTrendingAdds({ hours = 24, limit = 200, force = false } = {}) {
+  const ttl = 36e5;
+  if (!force && _trendCache && Date.now() - _trendCacheAt < ttl) return _trendCache;
+  const out = new Map();
+  try {
+    await pace();
+    const rows = await getJson(`/players/nfl/trending/add?lookback_hours=${hours}&limit=${limit}`);
+    // Documented shape is [{ player_id, count }]. Anything else is treated as no feed rather than guessed at.
+    if (Array.isArray(rows)) {
+      for (const r of rows) {
+        if (!r || r.player_id == null) continue;
+        const c = Number(r.count);
+        if (Number.isFinite(c)) out.set(String(r.player_id), c);
+      }
+    }
+  } catch { /* no feed: an empty map, which every caller reads as UNKNOWN */ }
+  // Only cache a real answer, so a transient failure does not blank the signal for an hour.
+  if (out.size) { _trendCache = out; _trendCacheAt = Date.now(); return out; }
+  return _trendCache && Date.now() - _trendCacheAt < ttl ? _trendCache : out;
+}
+
 // ---- Projections (season). Sleeper stats API host differs from the v1 base. ----
 const STATS_BASE = config.sleeperStatsBase;
 export async function getSeasonProjections(season, { positions } = {}) {

@@ -178,6 +178,32 @@ const P = (sid, pts, state = 'pre') => ({ sid, pts, state });
   assert.strictEqual(s.pts, 88.4, "the league's own total wins over re-adding the parts");
   assert.strictEqual(s.played, 3);
   ok('8 · ⭐⭐ a matchup entry becomes a side, empty slots dropped and the platform total trusted');
+
+  /* ⭐⭐⭐⭐⭐ 8b ── "YET TO PLAY" MEANS UNDECIDED HERE TOO — 29u.
+     `sideOf` counted only `pre` while the live route's own decorate step counts everything that is not
+     `done`, so ONE FIELD NAME carried two definitions depending on which function happened to build the
+     row. Nothing was visibly broken, because every caller decorates afterwards and the decorated value
+     wins — which is precisely what made it worth fixing rather than leaving: the next caller to use
+     `sideOf` on its own would inherit the pre-b140 meaning silently, and the symptom would be a "left"
+     column that reads zero during the only games anyone is watching. That is the bug Trey reported, and
+     it must not be reachable by a second route.
+     `notStarted` is the pre-only count, kept for anywhere that genuinely wants "has not kicked off". */
+  const mixed = sideOf(
+    { rosterId: 4, teamName: 'Mixed', points: 40, starters: ['chase', 'jacobs', 'kelce', 'goff'] },
+    { ptsOf: () => 5, stateOf: (sid) => ({ chase: 'live', jacobs: 'done', kelce: 'pre', goff: 'live' })[sid] });
+  assert.strictEqual(mixed.played, 1, 'only the finished game counts as played');
+  assert.strictEqual(mixed.playing, 2);
+  assert.strictEqual(mixed.notStarted, 1, 'the pre-only count is still available under its own name');
+  assert.strictEqual(mixed.yetToPlay, 3, 'two men mid-game plus one yet to kick off are all undecided');
+  /* ⚠ AND IT AGREES WITH THE ROUTE'S OWN RULE — `players.filter(p => p.phase !== 'done').length` — for
+     every shape, including a player whose state we could not determine at all. An untimed starter is the
+     one the Monday night schedule gap produces, and he is emphatically not finished. */
+  const unknown = sideOf(
+    { rosterId: 5, teamName: 'Untimed', points: 0, starters: ['chase', 'jacobs'] },
+    { ptsOf: () => 0, stateOf: (sid) => (sid === 'chase' ? 'unknown' : 'done') });
+  assert.strictEqual(unknown.yetToPlay, 1, 'a player we cannot time is undecided, never finished');
+  assert.strictEqual(unknown.notStarted, 0, '…but he has not been observed sitting in the pre bucket either');
+  ok('8b · ⭐⭐⭐⭐⭐ one definition of "yet to play" — undecided — however the side was built');
 }
 
 // 9 ── the shapes a Sunday actually produces

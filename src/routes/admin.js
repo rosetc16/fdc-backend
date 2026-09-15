@@ -114,6 +114,49 @@ adminRouter.post('/run-job', async (req, res) => {
       const { projDiagnose } = await import('../lib/projDiag.js');
       const { mapStatsForDiag } = await import('./playerPack.js');
       detail = await projDiagnose(Number(req.body.season) || config.activeSeason, mapStatsForDiag);
+    } else if (job === 'trend-check') {
+      /* ⭐⭐⭐⭐⭐ THE INSTRUMENT FOR THE FREE-AGENT TRENDING SIGNALS — b142, shipped in the same build as
+         the feature rather than after the first report, which is the rule this project learned three
+         times (112, 116, 28c: a job that needs a manual trigger ships its button with it).
+
+         Four signals ride on field names — `rec_tgt`, `rush_att`, `off_snp`, `tm_off_snp`,
+         `depth_chart_order` — that could not be verified when they were written, because Sleeper is
+         unreachable from the sandbox. `rec_tgt` is certain (playerPack already maps it) and `tm_off_snp`
+         is near-certain (scoring.js already knows it); `off_snp` is a well-reasoned guess and nothing
+         more.
+
+         ⚠ THE FAILURE THIS PREVENTS IS SILENCE. A wrong key makes its signal return null for every player
+           forever — the page shows three reasons instead of four and looks entirely healthy. This prints,
+           per field, HOW MANY PLAYERS ACTUALLY CARRIED IT, plus which signals are outright dead. A line
+           reading `off_snp: 0 / 1,184` is a one-line fix and an obvious one; `off_snp: 1,102 / 1,184` is
+           proof the thing is live. Either way somebody knows, which is the whole point. */
+      const { getWeeklyStats, getAllPlayers, getNflState, getTrendingAdds } = await import('../lib/sleeper.js');
+      const { auditFields } = await import('../lib/trending.js');
+      const nfl = await getNflState().catch(() => null);
+      const season = String(req.body.season || (nfl && nfl.season) || config.activeSeason);
+      const week = Number(req.body.week || (nfl && (nfl.display_week || nfl.week)) || 1);
+      const wks = [];
+      for (let w = Math.max(1, week - 4); w < Math.max(2, week); w++) wks.push(w);
+      const statWeeks = await Promise.all(wks.map((w) =>
+        getWeeklyStats(season, w, { positions: ['QB', 'RB', 'WR', 'TE'] }).catch(() => [])));
+      const players = await getAllPlayers().catch(() => ({}));
+      const adds = await getTrendingAdds({ force: true }).catch(() => new Map());
+      const rows = Object.keys(players).map((k) => players[k]);
+      const audit = auditFields(statWeeks.flat(), rows, adds);
+      detail = {
+        season, week, weeksRead: wks,
+        ...audit,
+        // A sample of the raw keys one stat line actually carries — the fastest way to spot a renamed field.
+        sampleStatKeys: (() => {
+          const first = statWeeks.flat().find((r) => r && (r.stats || r));
+          return first ? Object.keys(first.stats || first).slice(0, 40) : [];
+        })(),
+        topAdds: [...adds.entries()].slice(0, 5)
+          .map(([pid, c]) => `${(players[pid] && players[pid].full_name) || pid}: ${c}`),
+        note: audit.dead.length
+          ? `DEAD SIGNALS: ${audit.dead.join(', ')} — the fields they need arrived for NOBODY. Check sampleStatKeys for the real spelling.`
+          : 'All four signals have their inputs.',
+      };
     } else if (job === 'injuries') {
       // Detailed injury reports: 32 ESPN team calls merged over Sleeper's designations. Safe to run any
       // time — it only ever writes detail columns, never the designation the leagues actually see.
