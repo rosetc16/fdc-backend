@@ -15,6 +15,7 @@ import {
   getWeeklyProjections, getWeeklyStats, getTrendingAdds,
 } from '../lib/sleeper.js';
 import { trendFor, auditFields } from '../lib/trending.js';
+import { defaultWeek } from '../lib/weekpick.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
 import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
@@ -407,7 +408,8 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     // fall back to week. Always clamp to a real regular-season week (1..18) so the hub never opens on a phantom
     // "week 2" before week 1 has even happened.
     let week = Number(req.query.week || 0);
-    if (!week || Number.isNaN(week)) {
+    const weekAsked = !!(week && !Number.isNaN(week));
+    if (!weekAsked) {
       const seasonType = nfl && nfl.season_type;
       if (seasonType && seasonType !== 'regular' && seasonType !== 'post') {
         week = 1; // preseason / offseason → the upcoming games are regular-season week 1
@@ -417,6 +419,24 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     }
     week = Math.min(18, Math.max(1, week));
     const season = (nfl && nfl.season) || String(config.activeSeason);
+
+    /* ⭐⭐⭐⭐⭐ ONCE THE WEEK IS OVER, OPEN ON THE NEXT ONE — b143.
+       Trey: "it's still defaulted to week 1 with all games done. I do want flip it to the next week (week 2)
+       starting on Tuesday. You can still flip back and forth."
+       Sleeper's `display_week` keeps pointing at a finished week, so My Week opened on a week where nothing
+       could be fixed — and every panel on it (availability, lineup changes, free agents, weather) is empty
+       by definition once the games are played. That is exactly the screen he was looking at.
+       ⚠ ONLY WHEN NO WEEK WAS ASKED FOR. An explicit `?week=` is the user driving the toggle and must be
+         obeyed exactly, or stepping back to a finished week would bounce him forward again.
+       ⚠ AND ONLY ON EVIDENCE — see weekpick.js: no schedule rows means no roll. */
+    if (!weekAsked) {
+      try {
+        const { rows: kick } = await q(
+          'SELECT DISTINCT kickoff FROM nfl_schedule WHERE season=$1 AND week=$2 AND kickoff IS NOT NULL',
+          [Number(season), week]);
+        week = defaultWeek(week, kick.map((r) => r.kickoff));
+      } catch { /* no schedule: the platform's week stands, which is the pre-b143 behaviour */ }
+    }
 
     // Which scoring field to use as a FALLBACK only (if a player has no raw stats to score).
     const recPts = (league.scoring_settings && Number(league.scoring_settings.rec)) || 0;
