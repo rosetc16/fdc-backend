@@ -175,7 +175,8 @@ const P = (id, extra = {}) => ({ player_id: String(id), full_name: `Player ${id}
        field as a must-NOT-fire case so the floor can never quietly drift back down. */
     { id: 'j', weeks: [W(1, 1), W(2, 1), W(2, 2), W(3, 2)], mates: [], want: [] },
   ];
-  const adds = new Map([['d', 14000]]);
+  // Ranked feed (29x): player 'd' is 5th most added in the country; the others are far down it.
+  const adds = new Map([['d', { count: 14000, rank: 5 }]]);
   const results = field.map((f) => {
     const player = f.kind ? mk(f.id, f.kind) : P(f.id);
     const t = trendFor({ player, teammates: f.mates, weeks: f.weeks, addsByPlayer: adds });
@@ -212,15 +213,24 @@ const P = (id, extra = {}) => ({ player_id: String(id), full_name: `Player ${id}
 
 // 6 ── ownership, and the inversion that makes it worth shipping
 {
-  const adds = new Map([['x', 22000], ['y', 40]]);
-  assert.strictEqual(ownershipSurge('x', adds).fired, true);
+  /* ⚠ RANK, NOT COUNT — 29x. This used to be `count >= 1000`, and Sleeper hosts millions of leagues, so a
+     thousand adds is an ordinary week for anyone mildly interesting: dozens of players fired and the
+     free-agent list came back with 60+ names. Rank self-normalises across a quiet week and a wild one. */
+  const adds = new Map([['x', { count: 22000, rank: 3 }], ['y', { count: 9000, rank: 90 }]]);
+  assert.strictEqual(ownershipSurge('x', adds).fired, true, 'third most added in the country is a real signal');
   assert.ok(/still free in yours/.test(ownershipSurge('x', adds).why),
     'the sentence carries the inversion: the world wants him and your league has not noticed');
-  assert.strictEqual(ownershipSurge('y', adds).fired, false, 'forty adds across all of Sleeper is a rounding error');
+  /* ⭐⭐⭐⭐⭐ THE CASE THAT CAUSED THE BUG: a big-looking number that means nothing. Nine thousand adds
+     would have sailed past the old threshold; ranked 90th in the country, he is background noise. */
+  assert.strictEqual(ownershipSurge('y', adds).fired, false,
+    'nine thousand adds is still nothing if ninety players are ahead of him');
   // Not on the list at all is a real answer — the crowd is not moving on him.
   const absent = ownershipSurge('zzz', adds);
   assert.strictEqual(absent.fired, false);
   assert.strictEqual(absent.adds, 0);
+  // A bare count from an older cached feed must still be readable rather than throwing.
+  const legacy = new Map([['x', 22000]]);
+  assert.strictEqual(ownershipSurge('x', legacy).fired, false, 'no rank means no claim, not a false one');
   /* ⚠ BUT NO FEED AT ALL IS NOT "NOBODY IS ADDING HIM". If the endpoint 403s in production — which is
      exactly what it does from the sandbox this was written in — every player must read UNKNOWN, or the
      page quietly asserts that the entire league is uninterested in everybody. */

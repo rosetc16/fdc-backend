@@ -79,12 +79,18 @@ export async function getTrendingAdds({ hours = 24, limit = 200, force = false }
     await pace();
     const rows = await getJson(`/players/nfl/trending/add?lookback_hours=${hours}&limit=${limit}`);
     // Documented shape is [{ player_id, count }]. Anything else is treated as no feed rather than guessed at.
+    /* ⚠ RANK AS WELL AS COUNT — 29x. The signal used to fire on a raw threshold (1,000 adds), and in a
+       real week dozens of players clear that: Sleeper hosts millions of leagues, so a thousand adds is an
+       ordinary Tuesday for anyone mildly interesting. Trey's free-agent list came back with 60+ names.
+       Rank self-normalises — being the 8th most added player in the country means the same thing whether
+       the week's leader had 5,000 or 50,000 — so the feed is stored in order and the consumer asks for a
+       position rather than an absolute. */
     if (Array.isArray(rows)) {
-      for (const r of rows) {
-        if (!r || r.player_id == null) continue;
-        const c = Number(r.count);
-        if (Number.isFinite(c)) out.set(String(r.player_id), c);
-      }
+      const clean = rows
+        .filter((r) => r && r.player_id != null && Number.isFinite(Number(r.count)))
+        .map((r) => ({ id: String(r.player_id), count: Number(r.count) }))
+        .sort((a, b) => b.count - a.count);
+      clean.forEach((r, i) => out.set(r.id, { count: r.count, rank: i + 1 }));
     }
   } catch { /* no feed: an empty map, which every caller reads as UNKNOWN */ }
   // Only cache a real answer, so a transient failure does not blank the signal for an hour.

@@ -38,6 +38,44 @@ import { config } from '../lib/config.js';
 export const weatherRouter = express.Router();
 
 const FORECAST_HORIZON_DAYS = 9;
+
+/* WHICH GAMES ARE EVEN WORTH A FORECAST — everything the route decides BEFORE it touches the network.
+ *
+ * ⚠⚠ THIS IS A SEPARATE FUNCTION BECAUSE THE RULE IT CARRIES HAD NO REAL TEST. Inline in the route, the
+ *   only things a test could reach were the VENUES table ("HOU is recorded as retractable") and a stub's
+ *   hand-written response ("the fixture contains no roofed games") — and BOTH of those stay green when the
+ *   filter itself is deleted. That is the unfailable-assertion failure this project has now produced five
+ *   times, and the fix is the same one every time: put the decision somewhere a test can call it and hand
+ *   it an input that must come back changed.
+ *
+ * ⭐⭐⭐⭐⭐ ANY ROOF AT ALL, NOT JUST A FIXED ONE — 29x, and this REVERSES a deliberate earlier call.
+ *   Trey: "that one is in HOU and it says 'roof can close' — if it has a roof, they should just never hit
+ *   the report."
+ *
+ *   The old rule treated retractable as open, reasoning that we cannot know whether they closed it and a
+ *   missed snow game costs more than a flag you dismiss in a second. That argument is about the COST OF
+ *   BEING WRONG; his is about whether the row is ACTIONABLE, and on this page his wins. A weather flag
+ *   exists to change a lineup decision. "It might rain, unless they shut the roof, which they probably
+ *   will, and we have no way to find out" changes nothing — it is a row you read, shrug at, and learn to
+ *   skip, and rows like that are what stop anybody reading the ones that matter.
+ * ⚠ THE COUNT STILL SEES THEM, so "12 games, 3 indoors" continues to add up and the omission is visible
+ *   rather than silent.
+ */
+export function reportableGames(rows, { now = Date.now(), venues = VENUES, horizonDays = FORECAST_HORIZON_DAYS } = {}) {
+  const candidates = [];
+  let indoors = 0, noTime = 0, tooFar = 0, unknownVenue = 0;
+  for (const g of rows || []) {
+    const home = String((g && g.team) || '').toUpperCase();
+    const v = venues[home];
+    if (!v) { unknownVenue++; continue; }
+    if (v.roof === 'dome' || v.roof === 'retractable') { indoors++; continue; }
+    if (!g.kickoff) { noTime++; continue; }
+    const kickIso = new Date(g.kickoff).toISOString();
+    if ((new Date(kickIso).getTime() - now) / 86400000 > horizonDays) { tooFar++; continue; }
+    candidates.push({ game: g, home, venue: v, kickIso });
+  }
+  return { candidates, counts: { indoors, noTime, tooFar, unknownVenue } };
+}
 const CACHE_TTL_MS = 30 * 60 * 1000;         // forecasts do not move fast enough to justify less
 const cache = new Map();                      // key -> { at, value }
 
@@ -131,19 +169,11 @@ weatherRouter.get('/week', async (req, res) => {
 
   const now = Date.now();
   const out = [];
-  let indoors = 0, noTime = 0, tooFar = 0, checked = 0;
+  const { candidates, counts: preCounts } = reportableGames(rows, { now });
+  let { indoors, noTime, tooFar } = preCounts;
+  let checked = 0;
 
-  for (const g of rows) {
-    const home = String(g.team || '').toUpperCase();
-    const v = VENUES[home];
-    if (!v) continue;
-    // Dome: the answer is "it does not matter", and that answer belongs in the counts, not the list.
-    if (v.roof === 'dome') { indoors++; continue; }
-    if (!g.kickoff) { noTime++; continue; }
-    const kickIso = new Date(g.kickoff).toISOString();
-    const days = (new Date(kickIso).getTime() - now) / 86400000;
-    if (days > FORECAST_HORIZON_DAYS) { tooFar++; continue; }
-
+  for (const { game: g, home, venue: v, kickIso } of candidates) {
     checked++;
     const w = await forecastFor(v.lat, v.lon, kickIso);
     if (!w) continue;
@@ -151,9 +181,10 @@ weatherRouter.get('/week', async (req, res) => {
     if (!concern) continue;                       // sunny, or light rain — exactly what he asked us not to list
     out.push({
       home, away: String(g.opponent || '').toUpperCase(), kickoff: kickIso,
+      /* `roof` is always 'open' here now, and is kept because the venue name reads better with it and a
+         future rule (a cold-weather open stadium, say) will want it. There is NO `mayClose` any more: the
+         only value it could ever have carried was `true`, on games this function no longer returns. */
       venue: v.name, roof: v.roof,
-      // A retractable roof is treated as open (we cannot know the call), and says so, so the read is honest.
-      mayClose: v.roof === 'retractable',
       severity: concern.severity, label: concern.label, text: concern.text,
       temp: w.tempF, wind: w.wind, gust: w.windGust, rain: w.rain, snow: w.snow,
       teams: [home, String(g.opponent || '').toUpperCase()],

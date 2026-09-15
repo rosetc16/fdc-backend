@@ -12,6 +12,7 @@
  * Run: node scripts/weather.test.js
  */
 import { VENUES, isIndoors, weatherConcern } from '../src/lib/venues.js';
+import { reportableGames } from '../src/routes/weather.js';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x = '') => { if (c) { console.log('  PASS  ' + n + (x ? `   [${x}]` : '')); pass++; } else { console.log('  FAIL  ' + n + (x ? `   [${x}]` : '')); fail++; } };
@@ -33,10 +34,17 @@ console.log('\n== the venue table ==');
   ok('the Giants and Jets share one set of coordinates', VENUES.NYG.lat === VENUES.NYJ.lat && VENUES.NYG.lon === VENUES.NYJ.lon);
   ok('the known indoor teams read as indoors',
     ['DET', 'MIN', 'NO', 'LV', 'LAR', 'LAC'].every(isIndoors), 'DET MIN NO LV LAR LAC');
-  /* ⭐⭐ RETRACTABLE IS NOT A DOME. We cannot know whether they closed it, and a missed snow game costs more
-     than a flag you dismiss in one second — so these are treated as open and labelled as closable. */
-  ok('retractable roofs are NOT treated as domes',
-    !isIndoors('DAL') && !isIndoors('ATL') && !isIndoors('HOU') && !isIndoors('IND') && !isIndoors('ARI'));
+  /* ⚠⚠ THIS ASSERTION IS REVERSED — 29x, on Trey's instruction, and the reasoning is worth keeping.
+     It used to read "retractable roofs are NOT treated as domes": we cannot know whether they closed the
+     roof, and a missed snow game costs more than a flag you dismiss in a second. That is an argument about
+     the cost of being WRONG. His is about whether the row is ACTIONABLE — "it might rain, unless they shut
+     the roof, which they probably will, and we cannot find out" changes no lineup decision, and rows like
+     that are what teach people to skip the ones that matter. The venue DATA still records the difference
+     (a retractable roof is not a dome, and the table says so); what changed is that the weather report
+     excludes both. */
+  ok('retractable venues are recorded as retractable, not as domes',
+    ['DAL', 'ATL', 'HOU', 'IND', 'ARI'].every((t) => VENUES[t].roof === 'retractable'),
+    'the DATA keeps the distinction; the REPORT is what stopped caring — asserted below, on the filter');
   ok('the cold-weather outdoor stadiums are outdoors',
     ['GB', 'BUF', 'CHI', 'NE', 'PIT', 'CLE', 'DEN', 'KC'].every((t) => !isIndoors(t)));
 }
@@ -85,6 +93,47 @@ console.log('\n== worth a manager\'s attention ==');
     a && b && c && a.severity < b.severity && b.severity < c.severity, `${a && a.severity}/${b && b.severity}/${c && c.severity}`);
   ok('⭐⭐ …and each carries a label a person can read', a.label === 'Watch' && b.label === 'Concern' && c.label === 'Severe',
     `${a.label} · ${b.label} · ${c.label}`);
+}
+
+/* ⚠⚠⚠ THE SECTION THAT ACTUALLY EXERCISES THE ROOF RULE — 29x.
+ *
+ *   Before this existed the rule had TWO tests and neither could fail. One read the venue table ("HOU is
+ *   recorded as retractable"), which stays true whatever the route does with it. The other was a browser
+ *   assertion over a stub whose weather response is HAND-WRITTEN and contains only open-air games, so it
+ *   was checking that a fixture I wrote says what I wrote in it. Delete the filter from the route and both
+ *   go green.
+ *
+ *   These call the filter, hand it a Houston game, and require it back out. That is the difference between
+ *   a test and a description of a test.
+ */
+console.log('\n== which games are even worth a forecast ==');
+{
+  const soon = new Date(Date.now() + 2 * 86400000).toISOString();
+  const rows = [
+    { team: 'HOU', opponent: 'TEN', kickoff: soon },   // retractable — Trey's actual example
+    { team: 'DAL', opponent: 'PHI', kickoff: soon },   // retractable
+    { team: 'DET', opponent: 'CHI', kickoff: soon },   // fixed dome
+    { team: 'GB',  opponent: 'MIN', kickoff: soon },   // open air — the only one that should survive
+    { team: 'BUF', opponent: 'NYJ', kickoff: null },   // open air but no kickoff time
+    { team: 'PIT', opponent: 'CLE', kickoff: new Date(Date.now() + 30 * 86400000).toISOString() },
+    { team: 'ZZZ', opponent: 'GB',  kickoff: soon },   // not a team we have a venue for
+  ];
+  const { candidates, counts } = reportableGames(rows);
+  const homes = candidates.map((c) => c.home);
+  ok('⭐⭐⭐⭐⭐ a retractable-roof game never reaches the forecast — Trey\'s Houston case',
+    !homes.includes('HOU'), homes.join(',') || 'nothing survived');
+  ok('⭐⭐⭐⭐ …nor any other roof, fixed or not',
+    !homes.some((h) => ['DAL', 'DET', 'ATL', 'IND', 'ARI'].includes(h)), `survivors: ${homes.join(',')}`);
+  ok('⭐⭐⭐⭐⭐ …while an open-air game in the window still does',
+    homes.includes('GB'), `survivors: ${homes.join(',')}`);
+  ok('⭐⭐⭐⭐ …and the roofed games are COUNTED, so "14 games, 4 indoors" still adds up',
+    counts.indoors === 3, `indoors=${counts.indoors} (HOU, DAL, DET)`);
+  ok('⭐⭐⭐ a game with no kickoff hour is skipped and counted separately',
+    !homes.includes('BUF') && counts.noTime === 1, `noTime=${counts.noTime}`);
+  ok('⭐⭐⭐ a game past the forecast horizon is skipped and counted separately',
+    !homes.includes('PIT') && counts.tooFar === 1, `tooFar=${counts.tooFar}`);
+  ok('⭐⭐ an unknown team is dropped without throwing',
+    counts.unknownVenue === 1 && candidates.length === 1, `${candidates.length} candidate(s)`);
 }
 
 console.log(`\n${pass}/${pass + fail} weather checks passed`);

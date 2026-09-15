@@ -49,7 +49,11 @@ const USAGE_RATIO = 1.5;          // recent must be half again the baseline
 const USAGE_MIN_GAIN = 2.0;       // …and at least two real opportunities more
 const SNAP_MIN_RECENT = 0.55;     // he is on the field for most of the offence
 const SNAP_MIN_JUMP = 0.15;       // …and that is a real change, not week-to-week wobble
-const OWN_MIN_COUNT = 1000;       // adds across Sleeper; below this it is a rounding error on a huge base
+/* ⚠ A RANK, NOT A COUNT — 29x. This was `count >= 1000`, and Sleeper hosts millions of leagues: a
+   thousand adds is an ordinary week for anyone mildly interesting, so dozens of players fired and Trey's
+   free-agent list came back with 60+ names. "Top 25 most added in the country" means the same thing every
+   week regardless of how busy it was, which an absolute threshold cannot. */
+const OWN_MAX_RANK = 25;
 
 const num = (v) => (v == null || v === '' ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
 const r2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : v);
@@ -198,18 +202,21 @@ export function opportunityChange(player, teammates) {
 export function ownershipSurge(playerId, addsByPlayer) {
   if (!addsByPlayer || typeof addsByPlayer.get !== 'function') return null;   // no feed — NO DATA
   if (!addsByPlayer.size) return null;
-  const count = num(addsByPlayer.get(String(playerId)));
-  if (count == null) {
+  const entry = addsByPlayer.get(String(playerId));
+  if (entry == null) {
     // He is simply not on the trending list. That IS an answer: the crowd is not moving on him.
-    return { kind: 'ownership', fired: false, adds: 0, why: 'not being widely added', strength: 0 };
+    return { kind: 'ownership', fired: false, adds: 0, rank: null, why: 'not being widely added', strength: 0 };
   }
-  const fired = count >= OWN_MIN_COUNT;
+  // Older callers passed a bare count; accept both so a stale cache cannot throw.
+  const count = num(typeof entry === 'object' ? entry.count : entry);
+  const rank = typeof entry === 'object' && Number.isFinite(entry.rank) ? entry.rank : null;
+  const fired = rank != null && rank <= OWN_MAX_RANK;
   return {
-    kind: 'ownership', fired, adds: count,
+    kind: 'ownership', fired, adds: count == null ? 0 : count, rank,
     why: fired
-      ? `added in ${count.toLocaleString('en-US')} leagues in the last day — and still free in yours`
-      : `added in ${count.toLocaleString('en-US')} leagues`,
-    strength: fired ? Math.min(1, count / 20000) : 0,
+      ? `one of the most added players in the country right now (#${rank})${count != null ? `, ${count.toLocaleString('en-US')} leagues in a day` : ''} — and still free in yours`
+      : `being added, but well down the list${rank != null ? ` (#${rank})` : ''}`,
+    strength: fired ? Math.max(0.2, 1 - (rank - 1) / OWN_MAX_RANK) : 0,
   };
 }
 
