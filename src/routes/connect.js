@@ -18,7 +18,7 @@ import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
 import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
 import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../lib/rooting.js';
-import { matchupForecast, projectedRecord } from '../lib/winprob.js';
+import { matchupForecast, projectedRecord, projectSide, normalCdf } from '../lib/winprob.js';
 import { scoreStatsFor } from '../lib/scoring.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
 import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
@@ -558,15 +558,47 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       };
     });
 
+    /* ⭐⭐⭐⭐ THE PROJECTED TOTAL FOR A SIDE — b140.
+       Trey, on the future-week view: "I also want to see the projected scores and such."
+       A week that has not happened has `weekPoints: 0` for everybody, so the home page could show who you
+       play and nothing else. The per-player projections are already loaded above (`weekly`), in THIS
+       league's scoring — so the side total is a sum, not a new model, and it cannot disagree with the
+       numbers the hub prints on the same players.
+       ⚠ SUMS THE LINEUP THEY HAVE ACTUALLY SET, not their best possible one. Before kickoff that is what
+         Sleeper shows and what they are going to score with; treating everyone as optimally deployed would
+         flatter every opponent in the league. */
+    const projTotalFor = (t) => {
+      if (!t || !Array.isArray(t.starters)) return null;
+      let sum = 0, known = 0;
+      for (const sid of t.starters) {
+        if (!sid) continue;
+        const w = weekly[String(sid)];
+        if (w && Number.isFinite(w.pts)) { sum += w.pts; known++; }
+      }
+      return known ? { pts: Math.round(sum * 10) / 10, known, of: t.starters.filter(Boolean).length } : null;
+    };
+
     // My matchup this week: find my team, then the opponent sharing my matchup_id.
     let matchup = null;
     if (myRosterId != null) {
       const me = teams.find((t) => t.rosterId === myRosterId);
       if (me && me.matchupId != null) {
         const opp = teams.find((t) => t.rosterId !== myRosterId && t.matchupId === me.matchupId);
-        matchup = { me, opp: opp || null };
+        matchup = { me, opp: opp || null, meProj: projTotalFor(me), oppProj: projTotalFor(opp) };
       } else if (me) {
-        matchup = { me, opp: null };
+        matchup = { me, opp: null, meProj: projTotalFor(me), oppProj: null };
+      }
+    }
+    /* ⭐⭐⭐ AND THE PROJECTED LEAGUE MEDIAN, for leagues that play it — see the median note in the live
+       route. On a future week this is the only way to answer "am I on the right side of the median",
+       which in a median league is half the result. */
+    const medianOnHub = !!(league && league.settings && Number(league.settings.league_average_match) === 1);
+    let medianProj = null;
+    if (medianOnHub) {
+      const all = teams.map(projTotalFor).filter(Boolean).map((x) => x.pts).sort((a2, b2) => a2 - b2);
+      if (all.length >= 3) {
+        const h = Math.floor(all.length / 2);
+        medianProj = all.length % 2 ? all[h] : Math.round(((all[h - 1] + all[h]) / 2) * 10) / 10;
       }
     }
 
@@ -630,6 +662,7 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       rostered: Array.from(rostered),
       teams,
       matchup,
+      medianScoring: medianOnHub, medianProjected: medianProj,
       standings,
       playoffStartWeek,
       regularSeasonWeeks,
@@ -768,6 +801,9 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
       pl.forEach((p) => { nameById.set(String(p.player_id), p.full_name); posById.set(String(p.player_id), p.position); });
     } catch { /* the review still works, with ids where names would be */ }
 
+    // Does this league play the median as a second weekly opponent? See the median notes elsewhere.
+    const medianOnReview = !!(league && league.settings && Number(league.settings.league_average_match) === 1);
+
     /* ⭐⭐⭐⭐⭐ WHO ACTUALLY PLAYED, PER WEEK — b138.
        Trey: "In the weekly review, it says 'Worst Call - Started Kenneth Walker 0 over Chubba Hubbard 22.2'
        — Kenneth Walker hasn't played yet."
@@ -837,8 +873,27 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
          calling it one is what produced "8–2 across 10 leagues" for an afternoon that was closer to 5–5. */
       const result = !complete || !Number.isFinite(oppPts) ? null : myPts > oppPts ? 'W' : myPts < oppPts ? 'L' : 'T';
 
+      /* ⭐⭐⭐⭐ THE MEDIAN HALF OF A COMPLETED WEEK — b140.
+         Trey: "Throughout the review and on the 'this week' hub… if your league has median scoring, you
+         need to show how we relate to that as well."
+         Every team's score for the week is already in hand, so the median is a sort and a midpoint — no
+         new data and no second source to disagree with. Only computed where the league actually plays it;
+         elsewhere the field stays absent so the UI can tell "does not apply" from "zero". */
+      let medianPts = null, medianMargin = null, medianResult = null;
+      if (medianOnReview) {
+        const field = Object.values(pointsByRoster).filter(Number.isFinite).sort((a2, b2) => a2 - b2);
+        if (field.length >= 3) {
+          const h = Math.floor(field.length / 2);
+          medianPts = field.length % 2 ? field[h] : Math.round(((field[h - 1] + field[h]) / 2) * 100) / 100;
+          if (Number.isFinite(myPts) && complete) {
+            medianMargin = Math.round((myPts - medianPts) * 100) / 100;
+            medianResult = medianMargin > 0 ? 'W' : medianMargin < 0 ? 'L' : 'T';
+          }
+        }
+      }
       weeks.push({ week, pointsByRoster, opponentByRoster, complete,
         me: { pts: myPts, oppRosterId: oppId || null, oppPts: Number.isFinite(oppPts) ? oppPts : null, result,
+          medianPts, medianMargin, medianResult,
           complete, yetToPlay: C.yetToPlay, oppYetToPlay: C.oppYetToPlay,
           // Named, so the page can say WHO it is waiting on rather than just that it is waiting.
           waitingOn: C.waitingOn,
@@ -877,6 +932,7 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
       rosterPositions, lastCompletedWeek: lastDone,
       // Whether the newest reviewable week is the one just played (every game final) or the last full one.
       currentWeek: cur, currentWeekOpen,
+      medianScoring: medianOnReview,
       weeks, ledger: seasonLedger(weeks), ranks: pointRanks(weeks, teams.map((t) => t.rosterId)),
       averages: avgByRoster,
       // Not a footnote. See the header: this is the honest scope of the "was there a FA?" answer.
@@ -1056,6 +1112,44 @@ connectRouter.get('/sleeper/live', async (req, res) => {
        is honest about being an approximation; a stat line is a fact. Where they disagree, believe the fact. */
     const playedBy = (sid) => (statsKnown ? playedSet.has(String(sid)) : stateOf(sid) === 'done');
 
+    /* ⭐⭐⭐⭐⭐ THREE PHASES, NOT TWO — b140.
+       Trey, on a Monday night: "something isn't working right for games that are currently LIVE… it's
+       showing that there is no one left AND the scores are static."
+
+       `playedBy` is exactly right for the question it was written to answer and exactly wrong for this one.
+       A man in the second quarter HAS a stat line, so he read as finished: his eleven points so far became
+       his final score and the thirteen still to come vanished out of every projection on the site. The
+       clock is the only thing that knows the difference between "has played" and "is playing", so the two
+       signals are combined rather than one trusted alone:
+
+         stats say he played + clock says the game is on   → LIVE   (partial score, more to come)
+         stats say he played + clock says it is over       → DONE
+         no stat line       + clock says the game is on    → LIVE   (he can still score; kickers often do)
+         no stat line       + clock says it is over        → DONE   (he was inactive, or scored nothing)
+         no stat line       + clock has not started        → PRE
+
+       ⚠ AND `remain` IS HOW MUCH OF HIS GAME IS LEFT, derived from elapsed time against a nominal game
+         length. No feed here reports a game clock, so this is an approximation and it is worth being
+         explicit that it is a crude one: a blowout empties in the fourth quarter, a two-minute drill is
+         worth more than its two minutes, and neither is visible from a kickoff timestamp. It is still
+         vastly closer than the two values it replaces, which were "all of his projection" and "none of
+         it". Everything downstream treats it as an estimate and says so. */
+    const GAME_LEN_MS = 3.5 * 60 * 60 * 1000;
+    const phaseOf = (sid) => {
+      const st = stateOf(sid);
+      if (st === 'live') return 'live';
+      if (playedBy(sid) || st === 'done') return 'done';
+      return 'pre';
+    };
+    const remainOf = (sid) => {
+      const team = String(teamById.get(String(sid)) || '');
+      const k = kickoffByTeam[team] || null;
+      if (!k) return 0.5;                       // no clock for his game: the least-wrong single guess
+      const elapsed = now - Date.parse(k);
+      if (!Number.isFinite(elapsed)) return 0.5;
+      return Math.max(0, Math.min(1, 1 - elapsed / GAME_LEN_MS));
+    };
+
     const out = await pool(ids, 5, async (leagueId) => {
       const [league, users, rosters, ms] = await Promise.all([
         cachedCall(`l:${leagueId}`, LEAGUE_TTL_MS, () => getLeague(leagueId)),
@@ -1100,14 +1194,84 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       const me = sideOf(entryOf(mineM), { ptsOf, stateOf });
       const opp = sideOf(entryOf(oppM), { ptsOf, stateOf });
       const forPlayers = (side) => (side ? (side.players || []).map((p) => ({
-        sid: p.sid, pts: p.pts, played: playedBy(p.sid), proj: projFor(p.sid),
+        sid: p.sid, pts: p.pts, phase: phaseOf(p.sid), remain: remainOf(p.sid),
+        played: phaseOf(p.sid) === 'done', proj: projFor(p.sid),
       })) : []);
       const forecast = opp ? matchupForecast(forPlayers(me), forPlayers(opp)) : null;
-      /* Every player carries his own projection and whether he has played, so a lineup can be read row by
-         row rather than only in total — the hub's Live tab and Game Day both want that. */
-      const decorate = (side) => (side ? { ...side, players: (side.players || []).map((p) => ({
-        ...p, played: playedBy(p.sid), proj: projFor(p.sid),
-      })), yetToPlay: (side.players || []).filter((p) => !playedBy(p.sid)).length } : null);
+      /* Every player carries his own projection, his phase and how much of his game is left, so a lineup
+         can be read row by row rather than only in total — Game Day, the hub matchup and the home hover
+         all want that, and all three must agree about who is still playing. */
+      const decorate = (side) => {
+        if (!side) return null;
+        const players = (side.players || []).map((p) => {
+          const ph = phaseOf(p.sid);
+          const rem = ph === 'live' ? remainOf(p.sid) : (ph === 'pre' ? 1 : 0);
+          const proj = projFor(p.sid);
+          return { ...p, phase: ph, played: ph === 'done', remain: Math.round(rem * 100) / 100, proj,
+            /* What he is expected to FINISH on: what he has plus what is still ahead of him. The number
+               Sleeper shows beside a live player, and the one a person actually wants. */
+            projFinal: Number.isFinite(proj)
+              ? Math.round(((Number.isFinite(p.pts) ? p.pts : 0) + proj * rem) * 10) / 10
+              : null };
+        });
+        return { ...side, players,
+          // ⚠ INCLUDES MEN CURRENTLY PLAYING — see the note in winprob.js. "Left" means undecided.
+          yetToPlay: players.filter((p) => p.phase !== 'done').length,
+          playing: players.filter((p) => p.phase === 'live').length };
+      };
+
+      /* ⭐⭐⭐⭐⭐ MEDIAN SCORING — b140.
+         Trey: "if your league has median scoring, you need to show how we relate to that as well (based on
+         projected scoring and projected median). This is in sleeper when you look at leagues."
+
+         In a median league every team plays TWO opponents each week: the one on the schedule, and the
+         league median. So a week is 2-0, 1-1 or 0-2, and a page that only ever shows the head-to-head is
+         reporting half the result — you can beat your opponent and still take a loss, or lose and salvage
+         a split. Sleeper flags it as `league_average_match` in the league settings.
+
+         ⚠ THE MEDIAN IS PROJECTED THE SAME WAY EVERY OTHER TOTAL IS, from every team's lineup, so it moves
+           with the afternoon exactly as the scoreboard does. A median computed from live scores alone would
+           sit far too low all Sunday and make everyone look like they were beating it.
+         ⚠ AND IT IS THE MEDIAN OF EVERY TEAM INCLUDING YOU, which is what Sleeper does — with an even
+           number of teams that is the midpoint of the two middle scores. */
+      const medianOn = !!(league && league.settings && Number(league.settings.league_average_match) === 1);
+      let medianGame = null;
+      if (medianOn && (ms || []).length >= 3) {
+        const totalsFor = (m) => {
+          const side2 = sideOf(entryOf(m), { ptsOf, stateOf });
+          if (!side2) return null;
+          const proj = projectSide((side2.players || []).map((p) => ({
+            sid: p.sid, pts: p.pts, phase: phaseOf(p.sid), remain: remainOf(p.sid), proj: projFor(p.sid),
+          })));
+          return { now: side2.pts, projected: proj.projected };
+        };
+        const all = (ms || []).map(totalsFor).filter(Boolean);
+        const mid = (arr) => {
+          const v = arr.slice().sort((x, y) => x - y);
+          if (!v.length) return null;
+          const h = Math.floor(v.length / 2);
+          return v.length % 2 ? v[h] : Math.round(((v[h - 1] + v[h]) / 2) * 100) / 100;
+        };
+        const nowMed = mid(all.map((x) => x.now).filter(Number.isFinite));
+        const projMed = mid(all.map((x) => x.projected).filter(Number.isFinite));
+        const myTot = totalsFor(mineM);
+        /* The median half of the week as its own forecast, so it gets the same treatment as the head-to-
+           head: a probability rather than a bare comparison, using the same uncertainty already computed
+           for my side. A median is steadier than any one opponent — it is an average of the field — so it
+           carries roughly half a single team's variance. */
+        const myVar = forecast && forecast.me ? forecast.me.variance : 0;
+        const margin = myTot && Number.isFinite(projMed) ? Math.round((myTot.projected - projMed) * 100) / 100 : null;
+        const sd = Math.sqrt(myVar + myVar * 0.5) || 0;
+        let winMed = null;
+        if (margin != null) {
+          winMed = sd > 0 ? normalCdf(margin / sd) : (margin > 0 ? 1 : margin < 0 ? 0 : 0.5);
+          if (!forecast || !forecast.settled) winMed = Math.min(0.99, Math.max(0.01, winMed));
+        }
+        medianGame = { on: true, median: nowMed, projMedian: projMed,
+          myNow: myTot ? myTot.now : null, myProjected: myTot ? myTot.projected : null,
+          beatNow: myTot && Number.isFinite(nowMed) ? myTot.now > nowMed : null,
+          margin, win: winMed, teams: all.length };
+      }
 
       return {
         leagueId,
@@ -1116,7 +1280,7 @@ connectRouter.get('/sleeper/live', async (req, res) => {
         //   one, which is exactly why no test caught it — see hubstub/mk-live.mjs.
         leagueName: (league && league.name) || null,
         ownerResolved: true,
-        me: decorate(me), opp: decorate(opp), forecast,
+        me: decorate(me), opp: decorate(opp), forecast, medianGame,
       };
     });
 
@@ -1127,6 +1291,8 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       posOf: (sid) => posById.get(sid) || null,
       teamOf: (sid) => teamById.get(sid) || null,
       stateOf,
+      // The same fraction the forecast uses, so the board's colour and the projection agree by construction.
+      remainOf,
       oppOf: () => null,
     });
 
@@ -1137,7 +1303,8 @@ connectRouter.get('/sleeper/live', async (req, res) => {
          being presented as a record, which is what made "8-2" misleading with half the lineups yet to
          kick off. `record` carries BOTH: what the scoreboard says and what the projections expect it to
          settle at, so the page can lead with the second and footnote the first. */
-      record: projectedRecord(rows.map((r) => r.forecast).filter(Boolean)),
+      record: projectedRecord(rows.map((r) => r.forecast).filter(Boolean),
+        rows.map((r) => r.medianGame).filter(Boolean)),
       /* Whether we could tell who has played, and whether we had projections to forecast the rest. Without
          the first, "yet to play" is a guess from kickoff windows; without the second there is no forecast
          at all, and in both cases the page says so rather than printing a confident number built on air. */

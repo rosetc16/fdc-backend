@@ -89,13 +89,28 @@ export function sideOf(entry, { ptsOf, stateOf }) {
 /* ⭐⭐⭐⭐⭐ THE BOARD. Every player you have a stake in this week, with which side of it you are on.
    `rows` is one entry per league: { leagueId, leagueName, me:{starters,points...}, opp:{...} }.
    A player appears once, carrying the leagues that put him on each side of you. */
-export function rootingBoard(rows, { nameOf, posOf, teamOf, stateOf, oppOf }) {
+/* ⭐⭐⭐⭐ `remainOf` IS OPTIONAL AND THE BOARD CARRIES WHAT IT RETURNS — 29t.
+   Game Day colours each points cell by how unusual the day is for the position, and while a game is on
+   that judgement needs to know how much of the game has been played: 7.4 points is a poor week for a
+   quarterback and a fine first half. The client used to derive that from the payload's `at` stamp minus
+   the kickoff map — arithmetic on two fields that are only guaranteed to share a clock in production, and
+   which the stub stamps from the real one, so the screen was tinting live players toward failure and no
+   fixture could show it. The share belongs on the row, from the SAME function the forecast uses, so the
+   colour and the projection can never tell different stories about the same player. */
+export function rootingBoard(rows, { nameOf, posOf, teamOf, stateOf, oppOf, remainOf }) {
   const byPlayer = new Map();
   const touch = (sid) => {
     const k = String(sid);
     if (!byPlayer.has(k)) {
+      const st = stateOf(k);
+      // Played share: none before kickoff, all after the whistle, and 1 − remaining while it is on.
+      let elapsed = st === 'done' ? 1 : st === 'live' ? 0.5 : null;
+      if (st === 'live' && typeof remainOf === 'function') {
+        const r = Number(remainOf(k));
+        if (Number.isFinite(r)) elapsed = Math.max(0, Math.min(1, 1 - r));
+      }
       byPlayer.set(k, { sid: k, name: nameOf(k), pos: posOf(k), team: teamOf(k), opp: oppOf ? oppOf(k) : null,
-        state: stateOf(k), forLeagues: [], againstLeagues: [], ptsByLeague: {} });
+        state: st, elapsed, forLeagues: [], againstLeagues: [], ptsByLeague: {} });
     }
     return byPlayer.get(k);
   };

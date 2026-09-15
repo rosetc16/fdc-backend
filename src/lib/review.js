@@ -294,20 +294,27 @@ export function seasonLedger(weeks) {
      check, and those weeks were all genuinely complete, so undefined counts. */
   const done = (weeks || []).filter((w) => w && w.me && Number.isFinite(w.me.pts) && w.me.complete !== false);
   if (!done.length) return null;
-  let actualW = 0, actualL = 0, actualT = 0, apW = 0, apL = 0, pf = 0, pa = 0, left = 0;
+  let actualW = 0, actualL = 0, actualT = 0, apW = 0, apL = 0, pf = 0, pa = 0, left = 0, medW = 0, medL = 0;
   for (const w of done) {
     const m = w.me;
     if (m.result === 'W') actualW++; else if (m.result === 'L') actualL++; else if (m.result === 'T') actualT++;
+    /* ⭐⭐⭐⭐ A MEDIAN LEAGUE'S WEEK IS TWO GAMES — b140. Sleeper's league_average_match puts every team
+       against the league median as well as its scheduled opponent, and the standings count both in one
+       record. `medianResult` is absent for leagues that do not play it, so nothing changes there. */
+    if (m.medianResult === 'W') { actualW++; medW++; }
+    else if (m.medianResult === 'L') { actualL++; medL++; }
+    else if (m.medianResult === 'T') actualT++;
     if (m.allPlay) { apW += m.allPlay.w; apL += m.allPlay.l; }
     pf += m.pts || 0;
     if (Number.isFinite(m.oppPts)) pa += m.oppPts;
     left += m.left || 0;
   }
   const games = actualW + actualL + actualT;
+  const medianGames = medW + medL;
   // The all-play record scaled back down to the number of games actually played.
   const deservedW = apW + apL ? Math.round((apW / (apW + apL)) * games) : null;
   return {
-    games, actualW, actualL, actualT,
+    games, actualW, actualL, actualT, medianGames, medianW: medW, medianL: medL,
     deservedW, deservedL: deservedW == null ? null : games - deservedW,
     luck: deservedW == null ? null : actualW - deservedW,
     pointsFor: r2(pf), pointsAgainst: r2(pa),

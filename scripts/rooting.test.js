@@ -242,4 +242,52 @@ const P = (sid, pts, state = 'pre') => ({ sid, pts, state });
   ok('10 · ⭐⭐⭐⭐⭐ the week state separates "something finished" from "everything finished" — the second gates the review');
 }
 
+/* ⭐⭐⭐⭐⭐ 11 ── HOW MUCH OF HIS GAME HAS BEEN PLAYED, ON THE BOARD ROW ITSELF — 29t.
+   ==================================================================================================
+   Game Day colours each points cell by how unusual the day is for the position. While a game is ON, that
+   judgement is meaningless without knowing how far through it he is: Jared Goff on 7.4 points is a poor
+   week and a perfectly ordinary first half, and the screen was calling it a poor week — painting every
+   live player toward failure, most strongly in the first quarter when the verdict is least earned.
+
+   The client used to derive the share from the payload's `at` stamp minus its kickoff map. Two fields,
+   one clock assumed, and the assumption broke the moment anything but the live route produced the
+   payload. The share is now computed HERE, from the same `remainOf` the forecast uses, so the colour on
+   the board and the projection in the table can never disagree about the same player.
+
+   ⚠ AND `remainOf` IS OPTIONAL. Every caller that predates this passes no such function and must still
+     get a usable row — a live player then reads as half-played, which is the least-wrong single guess,
+     and the two certain states stay certain. */
+{
+  const rows = [{ leagueId: 'L1', leagueName: 'One',
+    me: side(1, 'Me', [P('chase', 12.1, 'live'), P('hill', 14.1, 'done'), P('kelce', 0, 'pre')], 26.2),
+    opp: side(2, 'Them', [P('jacobs', 3.2, 'live')], 3.2) }];
+
+  const withRemain = rootingBoard(rows, { ...helpers({ chase: 'live', hill: 'done', kelce: 'pre', jacobs: 'live' }),
+    // Chase is 30% of the way through his game; Jacobs has barely started.
+    remainOf: (sid) => (sid === 'chase' ? 0.7 : sid === 'jacobs' ? 0.95 : 1) });
+  const by = Object.fromEntries(withRemain.map((p) => [p.sid, p]));
+
+  assert.ok(Math.abs(by.chase.elapsed - 0.3) < 1e-9, 'a live player carries 1 − remaining');
+  assert.strictEqual(by.hill.elapsed, 1, 'a finished game is all of it');
+  assert.strictEqual(by.kelce.elapsed, null, 'a game that has not kicked off has no share to report');
+  ok('11 · ⭐⭐⭐⭐⭐ every board row says how much of the player\'s game has been played');
+
+  /* ⚠ THE FLOOR AND THE CEILING ARE NOT DECORATION. A clock that has run past the nominal game length
+     would otherwise report more than 100% played, and the consumer divides by this number. */
+  const silly = rootingBoard(rows, { ...helpers({ chase: 'live', hill: 'done', kelce: 'pre', jacobs: 'live' }),
+    remainOf: (sid) => (sid === 'chase' ? -0.4 : sid === 'jacobs' ? 1.8 : 0.5) });
+  const s2 = Object.fromEntries(silly.map((p) => [p.sid, p]));
+  assert.ok(s2.chase.elapsed <= 1 && s2.chase.elapsed >= 0, 'an overrun clock cannot exceed a full game');
+  assert.ok(s2.jacobs.elapsed >= 0, 'nor can a nonsensical remainder go negative');
+  ok('11b · ⭐⭐⭐⭐ …clamped, because whoever reads it is going to divide by it');
+
+  /* The case that must not regress: no `remainOf` at all, which is every caller written before 29t. */
+  const legacy = rootingBoard(rows, helpers({ chase: 'live', hill: 'done', kelce: 'pre', jacobs: 'live' }));
+  const l2 = Object.fromEntries(legacy.map((p) => [p.sid, p]));
+  assert.strictEqual(l2.chase.elapsed, 0.5, 'a live player with no clock is assumed half-played');
+  assert.strictEqual(l2.hill.elapsed, 1);
+  assert.strictEqual(l2.kelce.elapsed, null);
+  ok('11c · ⭐⭐⭐⭐⭐ a caller that passes no clock still gets a readable row rather than a blank one');
+}
+
 console.log(`\n${n} passed`);

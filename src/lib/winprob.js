@@ -54,38 +54,75 @@ export function normalCdf(z) {
   return z >= 0 ? p : 1 - p;
 }
 
-/* One side of a matchup, projected forward.
-   `players` is the started lineup: { sid, pts, played, proj }.
-     pts    — what the platform has already awarded him (authoritative; never recomputed)
-     played — whether his game is over. See the route: this comes from the week's ACTUAL stats feed, not
-              from a clock, because "did this man play" is a fact the stats feed states directly.
-     proj   — his projection for the week in THIS league's scoring, used only if he has not played. */
+/* ⭐⭐⭐⭐⭐ A MAN IN A LIVE GAME IS NOT FINISHED — b140.
+   ================================================================================================
+   Trey, on a Monday night: "something isn't working right for games that are currently LIVE… it's showing
+   that there is no one left AND the scores are static (and it's showing that I'm projected to still go 8-2
+   when I'm more than likely to finish 5-5 because they are expected to score a lot in this game)."
+
+   The model had TWO states — played or not — and a live game fits neither. The route decides "played" from
+   the stats feed, which is the right call for the question it was built to answer (a stat line is a fact,
+   a clock is a guess) but it has one consequence nobody traced: a player in the SECOND QUARTER already has
+   a stat line. So he read as finished, his eleven points so far were taken as his final score, and the
+   thirteen more he is expected to add simply left the model. Every downstream number inherited it — the
+   projected total, the win probability, the projected record, and "left", which reported nobody remaining
+   while a game was on television.
+
+   Three states, and the middle one is the whole fix:
+     pre   — hasn't kicked off. Contributes his full projection.
+     live  — playing now. Contributes what he has scored PLUS the share of his projection still ahead of
+             him, with uncertainty scaled to match: a man with a quarter left is both less valuable and
+             less uncertain than one who has not started.
+     done  — his game is over. Contributes exactly what he scored, with no uncertainty at all.
+
+   ⚠ `remain` IS A FRACTION OF THE GAME LEFT, AND IT IS AN APPROXIMATION WE OWN. No feed this app talks to
+     reports a game clock, so the route derives it from elapsed time against a nominal game length. It is
+     wrong in the details — a blowout empties late, a two-minute drill is worth more than its minutes — and
+     it is enormously closer to the truth than the two values it replaces, which were "all of it" and
+     "none of it".
+   ================================================================================================ */
 export function projectSide(players) {
   const list = (players || []).filter(Boolean);
-  let scored = 0, remaining = 0, variance = 0, left = 0, unknown = 0;
+  let scored = 0, remaining = 0, variance = 0, left = 0, playing = 0, unknown = 0;
   for (const p of list) {
     const pts = Number.isFinite(p.pts) ? p.pts : 0;
     scored += pts;
-    if (p.played) continue;
+    /* `phase` is authoritative when present; `played` is the old two-state flag and still decides for any
+       caller that has not been updated, so an older payload behaves exactly as it used to. */
+    const phase = p.phase || (p.played ? 'done' : 'pre');
+    if (phase === 'done') continue;
+    const isLive = phase === 'live';
+    // How much of his game is still ahead of him. Unstated for a live player means half, which is the
+    // least-wrong single guess; `pre` is all of it by definition.
+    const rem = isLive ? Math.max(0, Math.min(1, Number.isFinite(p.remain) ? p.remain : 0.5)) : 1;
     left++;
+    if (isLive) playing++;
+    if (rem <= 0) continue;                       // clock says his game is effectively over
     if (!Number.isFinite(p.proj)) {
       /* ⚠ NO PROJECTION IS NOT ZERO POINTS. A player the projection feed does not cover — a late promotion,
          an unusual position — would otherwise be silently forecast to score nothing, which quietly biases
          the whole matchup toward whoever has fewer of them. He is counted as unknown, carries the average
          uncertainty of a starter, and the caller can say the forecast is incomplete. */
       unknown++;
-      variance += UNKNOWN_SD * UNKNOWN_SD;
+      variance += (UNKNOWN_SD * rem) ** 2;
       continue;
     }
-    remaining += p.proj;
-    variance += sdFor(p.proj) ** 2;
+    const expected = p.proj * rem;
+    remaining += expected;
+    variance += sdFor(expected) ** 2;
   }
   return {
     scored: r2(scored),
     remaining: r2(remaining),
     projected: r2(scored + remaining),
     variance,
+    /* ⚠ "YET TO PLAY" NOW INCLUDES MEN WHO ARE PLAYING. Trey: "The players that are still playing should
+       also still show up in 'left'." He is right and it is not merely a label: the question the column
+       answers is "how much of this matchup is still undecided", and a man in the third quarter is very
+       much undecided. `playing` is broken out for anywhere that wants to say which of the two he is. */
     yetToPlay: left,
+    playing,
+    notStarted: left - playing,
     unknown,
   };
 }
@@ -122,7 +159,7 @@ export function matchupForecast(mine, theirs) {
 /* ⭐⭐⭐ THE RECORD HE ACTUALLY WANTED. "8-2 … is misleading … I'm projected to lose at least 5 total."
    Two records side by side: what the scoreboard says right now, and what the projections expect it to
    settle at. The second is the honest headline while games are in play. */
-export function projectedRecord(forecasts) {
+export function projectedRecord(forecasts, medians) {
   const list = (forecasts || []).filter(Boolean);
   let liveW = 0, liveL = 0, liveT = 0, projW = 0, projL = 0, projT = 0, settled = 0;
   for (const f of list) {
@@ -131,15 +168,34 @@ export function projectedRecord(forecasts) {
     if (f.margin > 0) projW++; else if (f.margin < 0) projL++; else projT++;
     if (f.settled) settled++;
   }
+  /* ⭐⭐⭐⭐⭐ A MEDIAN LEAGUE IS TWO GAMES A WEEK — b140.
+     Trey: "if your league has median scoring, you need to show how we relate to that as well."
+     Sleeper's `league_average_match` means every team also plays the league median, so a week is 2-0, 1-1
+     or 0-2. Counting only the head-to-head reports half the week: you can beat your opponent and still
+     take a loss on the day. These rows are folded into the SAME record, because that is how the standings
+     count them — a median league does not keep a separate table.
+     ⚠ `medians` is optional and absent for every caller that predates this, so a payload without it
+       produces exactly the record it always did. */
+  const meds = (medians || []).filter((m) => m && m.on && Number.isFinite(m.margin));
+  let medW = 0, medL = 0;
+  for (const m of meds) {
+    if (m.margin > 0) { projW++; medW++; } else if (m.margin < 0) { projL++; medL++; } else projT++;
+    const nowGap = Number.isFinite(m.myNow) && Number.isFinite(m.median) ? m.myNow - m.median : null;
+    if (nowGap != null) { if (nowGap > 0) liveW++; else if (nowGap < 0) liveL++; else liveT++; }
+  }
   return {
-    games: list.length, settled,
+    // ⚠ GAMES COUNTS THE MEDIAN HALVES TOO, so "2–1 across 2 leagues" adds up rather than looking wrong.
+    games: list.length + meds.length, matchups: list.length, medianGames: meds.length, settled,
     liveW, liveL, liveT,
     projW, projL, projT,
     // Expected wins is the sum of the probabilities, which is a truer summary than counting favourites:
     // ten coin-flips is 5 expected wins, not 10, however the individual leans fall.
-    expected: r2(list.reduce((s, f) => s + (f.win || 0), 0)),
+    expected: r2(list.reduce((s, f) => s + (f.win || 0), 0)
+      + meds.reduce((s, m) => s + (Number.isFinite(m.win) ? m.win : 0), 0)),
     // Matchups still genuinely in the balance — the ones worth a Sunday afternoon.
-    tossups: list.filter((f) => !f.settled && f.win > 0.2 && f.win < 0.8).length,
+    tossups: list.filter((f) => !f.settled && f.win > 0.2 && f.win < 0.8).length
+      + meds.filter((m) => Number.isFinite(m.win) && m.win > 0.2 && m.win < 0.8).length,
+    medianW: medW, medianL: medL,
   };
 }
 

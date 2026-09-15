@@ -180,4 +180,112 @@ const P = (pts, played, proj) => ({ sid: `p${Math.random()}`, pts, played, proj 
   ok('10 · ⭐⭐ empty lineups and empty weeks do not throw or invent a result');
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════════════════════════
+   11–14 ── ⭐⭐⭐⭐⭐ THE MONDAY NIGHT CASE: a man in a live game is not finished.
+
+   Trey, watching a Monday night game: "something isn't working right for games that are currently LIVE.
+   Tonight is Monday night football and a game is live, but it's showing that there is no one left AND the
+   scores are static (and it's showing that I'm projected to still go 8-2 when I'm more than likely to
+   finish 5-5 because they are expected to score a lot in this game)."
+
+   The model had two states and a live game fits neither. The route decides "played" from the stats feed —
+   correct for the question it answers — and a player in the second quarter already HAS a stat line, so he
+   read as done: his points so far became his final score and the rest of his game left the forecast.
+
+   ⚠ TEST 11 PINS THE OLD BEHAVIOUR ON PURPOSE so 12 has something to be measured against. If someone
+     collapses the three phases back to two, 12 fails and 11 says why.
+   ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+
+// 11 ── the bug, as arithmetic: treating a live player as finished freezes the score
+{
+  // He has 11 with roughly half his game left and a 24-point projection.
+  const asDone = projectSide([{ sid: 'a', pts: 11, played: true, proj: 24 }]);
+  assert.strictEqual(asDone.projected, 11, 'marked played, his projection is discarded entirely');
+  assert.strictEqual(asDone.yetToPlay, 0, 'and he is reported as nobody left');
+  ok('11 · ⭐⭐⭐⭐ a live player marked "played" freezes the projection at his current score (the bug)');
+}
+
+// 12 ── ⭐⭐⭐⭐⭐ THE FIX: he keeps what he has AND the share of his projection still ahead of him
+{
+  const live = projectSide([{ sid: 'a', pts: 11, phase: 'live', remain: 0.5, proj: 24 }]);
+  assert.strictEqual(live.scored, 11, 'what he has scored is authoritative and untouched');
+  assert.strictEqual(live.remaining, 12, 'half a game left of a 24-point projection is 12 more');
+  assert.strictEqual(live.projected, 23, 'so he is heading for 23, not frozen at 11');
+  assert.strictEqual(live.yetToPlay, 1, 'and he IS still to play — the matchup is undecided');
+  assert.strictEqual(live.playing, 1);
+  assert.strictEqual(live.notStarted, 0, 'playing and not-yet-started are told apart');
+  ok('12 · ⭐⭐⭐⭐⭐ a live player carries his score PLUS the rest of his projection');
+}
+
+// 13 ── ⭐⭐⭐⭐ uncertainty shrinks with the clock — the late game is less of a coin flip
+{
+  const early = projectSide([{ sid: 'a', pts: 0, phase: 'live', remain: 1, proj: 24 }]);
+  const late = projectSide([{ sid: 'a', pts: 20, phase: 'live', remain: 0.1, proj: 24 }]);
+  assert.ok(late.variance < early.variance,
+    'a man with a minute left is more predictable than one who just kicked off');
+  const done = projectSide([{ sid: 'a', pts: 22, phase: 'done', proj: 24 }]);
+  assert.strictEqual(done.variance, 0, 'and a finished game carries no uncertainty at all');
+  assert.strictEqual(done.projected, 22, 'nor any projection — the score IS the answer');
+  ok('13 · ⭐⭐⭐⭐ uncertainty scales with the time left, and reaches zero when the game ends');
+}
+
+/* 14 ── ⭐⭐⭐⭐⭐ THE 8-2 THAT SHOULD BE 5-5. His actual complaint, in miniature: I am ahead on the
+   scoreboard, their man is mid-game and expected to add a lot. Counting him as finished calls it a win;
+   counting the rest of his game calls it a loss, which is what Sleeper says and what actually happens. */
+{
+  const mine = [{ sid: 'm', pts: 95, phase: 'done', proj: 95 }];
+  const theirsLive = [{ sid: 't', pts: 80, phase: 'live', remain: 0.6, proj: 40 }];
+  const theirsAsDone = [{ sid: 't', pts: 80, played: true, proj: 40 }];
+
+  const wrong = matchupForecast(mine, theirsAsDone);
+  assert.strictEqual(wrong.win, 1, 'treating him as finished makes it a certain win');
+
+  const right = matchupForecast(mine, theirsLive);
+  assert.ok(right.opp.projected > 100, `their live man is still climbing (got ${right.opp.projected})`);
+  assert.ok(right.win < 0.5,
+    `and the game is more likely lost than won (got ${Math.round(right.win * 100)}%)`);
+  assert.strictEqual(right.settled, false, 'a game with a man on the field is not settled');
+  ok('14 · ⭐⭐⭐⭐⭐ a lead against a live opponent is no longer reported as a certain win');
+}
+
+/* 15–16 ── ⭐⭐⭐⭐⭐ MEDIAN SCORING: a week is two games, not one.
+   Trey: "if your league has median scoring, you need to show how we relate to that as well (based on
+   projected scoring and projected median). This is in sleeper when you look at leagues."
+   Sleeper's `league_average_match` means every team also plays the league median each week, so the result
+   is 2-0, 1-1 or 0-2. A record that counts only the head-to-head reports half of it. */
+
+// 15 ── the median half is folded into the same record, because that is how the standings count it
+{
+  const F = (margin, win) => ({ me: { scored: 100 }, opp: { scored: 100 - margin }, margin, win, settled: false });
+  const forecasts = [F(10, 0.7), F(-10, 0.3)];
+  const medians = [
+    { on: true, margin: 6, win: 0.65, myNow: 90, median: 84 },    // beating the median
+    { on: true, margin: -4, win: 0.4, myNow: 70, median: 74 },    // losing to it
+  ];
+  const plain = projectedRecord(forecasts);
+  assert.strictEqual(plain.games, 2, 'without medians it is two games, exactly as before');
+  assert.strictEqual(plain.projW, 1);
+
+  const withMed = projectedRecord(forecasts, medians);
+  assert.strictEqual(withMed.games, 4, 'two matchups plus two median games');
+  assert.strictEqual(withMed.matchups, 2);
+  assert.strictEqual(withMed.medianGames, 2);
+  assert.strictEqual(withMed.projW, 2, 'one head-to-head win and one median win');
+  assert.strictEqual(withMed.projL, 2);
+  assert.strictEqual(withMed.medianW, 1);
+  assert.strictEqual(withMed.medianL, 1);
+  ok('15 · ⭐⭐⭐⭐⭐ median games are counted in the same record, so a week can be 2-0, 1-1 or 0-2');
+}
+
+// 16 ── ⭐⭐⭐ and expected wins includes them, so the summary still adds up
+{
+  const F = (margin, win) => ({ me: { scored: 100 }, opp: { scored: 100 - margin }, margin, win, settled: false });
+  const r = projectedRecord([F(10, 0.75)], [{ on: true, margin: 5, win: 0.6, myNow: 90, median: 85 }]);
+  assert.strictEqual(r.expected, 1.35, '0.75 from the matchup plus 0.6 from the median');
+  // A league WITHOUT median scoring contributes nothing extra, even if the object is passed through.
+  const off = projectedRecord([F(10, 0.75)], [{ on: false, margin: 5, win: 0.6 }]);
+  assert.strictEqual(off.games, 1, 'a league that does not use median scoring is one game');
+  ok('16 · ⭐⭐⭐ expected wins counts both halves, and a non-median league is untouched');
+}
+
 console.log(`\n${n} passed`);
