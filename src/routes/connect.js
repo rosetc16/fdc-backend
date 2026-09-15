@@ -16,7 +16,7 @@ import {
 } from '../lib/sleeper.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
-import { lineupMisses, verdictFor, seasonLedger, pointRanks } from '../lib/review.js';
+import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
 import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../lib/rooting.js';
 import { matchupForecast, projectedRecord } from '../lib/winprob.js';
 import { scoreStatsFor } from '../lib/scoring.js';
@@ -768,6 +768,38 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
       pl.forEach((p) => { nameById.set(String(p.player_id), p.full_name); posById.set(String(p.player_id), p.position); });
     } catch { /* the review still works, with ids where names would be */ }
 
+    /* ⭐⭐⭐⭐⭐ WHO ACTUALLY PLAYED, PER WEEK — b138.
+       Trey: "In the weekly review, it says 'Worst Call - Started Kenneth Walker 0 over Chubba Hubbard 22.2'
+       — Kenneth Walker hasn't played yet."
+
+       The review believed he had, and the reason is a genuine ambiguity in the data rather than a slip:
+       Sleeper's `players_points` carries an entry for EVERY rostered player, set to 0 from the moment the
+       week opens. So a man who has not kicked off and a man who was targeted twice and dropped both look
+       identical — both are 0.0 — and the optimal-lineup pass, which is only ever asked "what did he
+       score", dutifully concluded that starting Walker cost 22.2 points. It is the worst class of wrong
+       output: confident, specific, checkable, and false.
+
+       The stat feed settles it, exactly as it does on the live board (see `playedBy` in /sleeper/live): a
+       STAT LINE means he was in the game. No stat line and we do not know what he will score, so he is not
+       a data point about a decision — he is excluded from the comparison rather than counted as a zero.
+
+       ⚠ THIS IS ALSO WHY THE RECORD READ 8–2. The same zeros flowed into the week's result: a matchup with
+         four starters still to play is not a settled win, and the review presented it as one. A week that
+         is not finished now says so and is summarised as in-progress instead.
+       ⚠ ONE CALL PER WEEK, CACHED, AND FAILURE IS NOT FATAL. If the stat feed is unavailable, `played`
+         falls back to "we cannot tell", and the code below then treats the week as complete exactly as it
+         used to — an unchanged review rather than a broken one. */
+    const playedByWeek = new Map();
+    await Promise.all(weekNums.map(async (w) => {
+      try {
+        const rows = await cachedCall(`stats:${season}:${w}`, LEAGUE_TTL_MS,
+          () => getWeeklyStats(season, w, { positions: ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'] }));
+        const set = new Set();
+        (rows || []).forEach((r) => { if (r && r.player_id != null) set.add(String(r.player_id)); });
+        if (set.size) playedByWeek.set(w, set);
+      } catch { /* no stat feed for this week: the week is judged as it always was */ }
+    }));
+
     const weeks = [];
     for (const [week, ms] of raw) {
       if (!ms || !ms.length) continue;
@@ -782,21 +814,36 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
       if (!mine) { weeks.push({ week, pointsByRoster, opponentByRoster, me: null }); continue; }
 
       const pp = mine.players_points || {};
-      // ⚠ A player with no entry has NO recorded score. Null, not zero — see review.js and its test 7.
-      const ptsOf = (sid) => (pp[String(sid)] == null ? null : Number(pp[String(sid)]));
+      const playedSet = playedByWeek.get(week) || null;
+      /* ⭐ THE KENNETH WALKER GATE, in lib/review.js so it is unit-testable — see playedGate there for the
+         full reasoning. A 0 from a man who has not kicked off is not a score. */
+      const { ptsOf } = playedGate(pp, playedSet);
       const posOf = (sid) => posById.get(String(sid)) || null;
       const nameOf = (sid) => nameById.get(String(sid)) || `Player ${sid}`;
       const roster = [...new Set([...(mine.players || []), ...(mine.starters || [])].filter(Boolean).map(String))];
+
+      /* How much of this week is actually in the books. A week with starters still to play can be SHOWN —
+         it is the week he is living in and he wants to see it — but it cannot be judged, and everything
+         downstream keys off this flag rather than guessing from the date. */
+      const oppRow = opponentByRoster[String(myRosterId)] != null ? byRoster.get(Number(opponentByRoster[String(myRosterId)])) : null;
+      const C = weekCompleteness(mine.starters, oppRow && oppRow.starters, playedSet, nameOf);
+      const complete = C.complete;
 
       const lm = lineupMisses(rosterPositions, mine.starters, roster, ptsOf, posOf, nameOf);
       const oppId = opponentByRoster[String(myRosterId)];
       const oppPts = oppId != null ? pointsByRoster[oppId] : null;
       const myPts = pointsByRoster[String(myRosterId)];
-      const result = !Number.isFinite(oppPts) ? null : myPts > oppPts ? 'W' : myPts < oppPts ? 'L' : 'T';
+      /* ⚠ NO RESULT UNTIL IT IS A RESULT. A scoreline with eight players still to play is not a win, and
+         calling it one is what produced "8–2 across 10 leagues" for an afternoon that was closer to 5–5. */
+      const result = !complete || !Number.isFinite(oppPts) ? null : myPts > oppPts ? 'W' : myPts < oppPts ? 'L' : 'T';
 
-      weeks.push({ week, pointsByRoster, opponentByRoster,
+      weeks.push({ week, pointsByRoster, opponentByRoster, complete,
         me: { pts: myPts, oppRosterId: oppId || null, oppPts: Number.isFinite(oppPts) ? oppPts : null, result,
-          optimal: lm.optimal, actual: lm.actual, left: lm.left, exact: lm.exact, misses: lm.misses.slice(0, 6) } });
+          complete, yetToPlay: C.yetToPlay, oppYetToPlay: C.oppYetToPlay,
+          // Named, so the page can say WHO it is waiting on rather than just that it is waiting.
+          waitingOn: C.waitingOn,
+          optimal: lm.optimal, actual: lm.actual, left: lm.left, exact: lm.exact, pending: lm.pending,
+          misses: lm.misses.slice(0, 6) } });
     }
 
     /* The opponent's own average has to be computed across the WHOLE season before any week's verdict can
@@ -808,6 +855,13 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
     }
     for (const w of weeks) {
       if (!w.me) continue;
+      /* ⚠ AN UNFINISHED WEEK GETS NO VERDICT — b138. Every one of these judgements assumes final scores:
+         "robbed" compares you to a league median half the league has not finished scoring, "blown" says
+         your best lineup would have won a game still being played, and the all-play record counts teams
+         with four starters on the bench waiting for Monday. Each would be a confident sentence about a
+         result that does not exist. The week still appears, with its live scores and a note saying what
+         it is waiting on; it simply is not graded until it is over. */
+      if (w.me.complete === false) { w.me.verdict = null; continue; }
       const field = Object.values(w.pointsByRoster);
       const v = verdictFor({ won: w.me.result === 'W', myPts: w.me.pts, allPtsThisWeek: field,
         optimalPts: w.me.optimal, oppPts: w.me.oppPts, oppAvg: w.me.oppRosterId ? avgByRoster[w.me.oppRosterId] : null });

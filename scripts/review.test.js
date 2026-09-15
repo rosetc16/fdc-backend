@@ -13,7 +13,7 @@
  *   for nested eligibility and admits it is approximate otherwise. §2 is the case that separates them.
  */
 import assert from 'assert';
-import { optimalLineup, lineupMisses, allPlay, median, verdictFor, seasonLedger, pointRanks, eligibleFor, isLineupSlot } from '../src/lib/review.js';
+import { optimalLineup, lineupMisses, allPlay, median, verdictFor, seasonLedger, pointRanks, eligibleFor, isLineupSlot, playedGate, weekCompleteness } from '../src/lib/review.js';
 
 let n = 0;
 const ok = (m) => { n++; console.log('  PASS  ' + m); };
@@ -232,6 +232,97 @@ const nameOf = (s) => s;
   assert.strictEqual(seasonLedger([]), null);
   assert.strictEqual(seasonLedger([{ week: 1, me: { pts: null } }]), null, 'an unplayed week is not a ledger');
   ok('13 · ⭐⭐ empty and not-yet-played inputs return null rather than a confident zero');
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════════
+   14–18 ── ⭐⭐⭐⭐⭐ THE KENNETH WALKER CASE, reproduced exactly.
+
+   Trey, looking at a live week: "it says 'Worst Call - Started Kenneth Walker 0 over Chubba Hubbard 22.2'
+   — Kenneth Walker hasn't played yet."
+
+   The setup below is his, in miniature. Sleeper's players_points carries an entry for every rostered
+   player from the moment the week opens, and it is 0 — so a man who has not kicked off is INDISTINGUISHABLE
+   from a man who played and scored nothing, unless you consult the stat feed. `walker` starts, sits at 0.0,
+   and has no stat line. `hubbard` is on the bench with 22.2.
+
+   ⚠ WITHOUT THE GATE THESE ARE THE NUMBERS THAT PRODUCED THE COMPLAINT: the optimiser sees a 0-point
+     starter and a 22.2-point bench player at the same position and reports a 22.2-point regret. Test 14
+     asserts the broken behaviour still follows from the raw map, so that this file documents the bug
+     itself rather than only its absence — if someone later "simplifies" ptsOf back to Number(raw), 15
+     fails and 14 explains why.
+   ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+const W_POS = { walker: 'RB', hubbard: 'RB', chase2: 'WR', nacua2: 'WR', goff2: 'QB', kelce2: 'TE' };
+const W_SLOTS = ['QB', 'RB', 'WR', 'TE', 'BN', 'BN'];
+const W_ROSTER = Object.keys(W_POS);
+const W_STARTERS = ['goff2', 'walker', 'chase2', 'kelce2'];
+// Exactly what Sleeper sends mid-week: a zero for the man who has not played.
+const W_PP = { goff2: 19.4, walker: 0, chase2: 15.1, kelce2: 8.2, hubbard: 22.2, nacua2: 3.1 };
+const wPos = (s) => W_POS[s] || null;
+const wName = (s) => s;
+
+// 14 ── the bug, stated as arithmetic so the fix has something to be measured against
+{
+  const naive = (sid) => (W_PP[sid] == null ? null : Number(W_PP[sid]));
+  const lm = lineupMisses(W_SLOTS, W_STARTERS, W_ROSTER, naive, wPos, wName);
+  const miss = lm.misses.find((m) => m.out === 'walker');
+  assert.ok(miss, 'reading the raw map, the optimiser blames the unplayed starter');
+  assert.strictEqual(miss.in, 'hubbard');
+  assert.strictEqual(Math.round(miss.gain * 10) / 10, 22.2, 'and prices the regret at the full bench score');
+  ok('14 · ⭐⭐⭐⭐ the raw players_points map DOES produce the bogus 22.2-point regret (the bug, reproduced)');
+}
+
+// 15 ── ⭐⭐⭐⭐⭐ THE FIX: a 0 from a man with no stat line is not a score
+{
+  const played = new Set(['goff2', 'chase2', 'kelce2', 'hubbard', 'nacua2']);   // walker absent: no stat line
+  const { ptsOf: gated } = playedGate(W_PP, played);
+  assert.strictEqual(gated('walker'), null, 'an unplayed starter has NO score, not zero');
+  assert.strictEqual(gated('hubbard'), 22.2, 'a player who did play keeps his points');
+  const lm = lineupMisses(W_SLOTS, W_STARTERS, W_ROSTER, gated, wPos, wName);
+  assert.ok(!lm.misses.some((m) => m.out === 'walker'),
+    'and no regret may be computed from a decision whose outcome does not exist yet');
+  ok('15 · ⭐⭐⭐⭐⭐ with the stat feed, the unplayed starter is invisible to the optimiser');
+}
+
+// 16 ── ⭐⭐⭐⭐ a REAL zero still counts against you
+{
+  // Same 0.0, but this time he played — he was targeted twice and dropped both. That IS a bad start.
+  const played = new Set(['goff2', 'walker', 'chase2', 'kelce2', 'hubbard', 'nacua2']);
+  const { ptsOf: gated } = playedGate(W_PP, played);
+  assert.strictEqual(gated('walker'), 0, 'a zero from a man who played is a zero');
+  const lm = lineupMisses(W_SLOTS, W_STARTERS, W_ROSTER, gated, wPos, wName);
+  assert.ok(lm.misses.some((m) => m.out === 'walker' && m.in === 'hubbard'),
+    'and starting him over a 22-point bench player is a genuine mistake worth reporting');
+  ok('16 · ⭐⭐⭐⭐ …while a zero from a man who DID play is still held against you');
+}
+
+// 17 ── ⭐⭐⭐⭐ no stat feed is a third state, and it must not blank the season
+{
+  const { ptsOf: gated } = playedGate(W_PP, null);
+  assert.strictEqual(gated('walker'), 0, 'with no feed we cannot tell, so the old behaviour stands');
+  assert.strictEqual(gated('nobody'), null, 'a player with no entry at all still has no score');
+  const c = weekCompleteness(W_STARTERS, ['hubbard'], null, wName);
+  assert.strictEqual(c.complete, true, 'and the week is judged exactly as it was before the feed existed');
+  ok('17 · ⭐⭐⭐⭐ a missing stat feed degrades to the old behaviour rather than emptying the review');
+}
+
+// 18 ── ⭐⭐⭐⭐⭐ an unfinished week is not a result — the other half of "I'm 8-2 across 10 leagues"
+{
+  const played = new Set(['goff2', 'chase2', 'kelce2', 'hubbard', 'nacua2']);
+  const c = weekCompleteness(W_STARTERS, ['hubbard', 'nacua2'], played, wName);
+  assert.strictEqual(c.complete, false);
+  assert.strictEqual(c.yetToPlay, 1);
+  assert.deepStrictEqual(c.waitingOn, ['walker'], 'and it names who it is waiting on');
+  assert.strictEqual(c.oppYetToPlay, 0, 'their side is done; mine is not');
+
+  // A week still being played must not reach the season record.
+  const weeks = [
+    { week: 1, me: { pts: 120, oppPts: 100, result: 'W', left: 0, complete: true } },
+    { week: 2, me: { pts: 42, oppPts: 30, result: 'W', left: 0, complete: false } },  // three starters to come
+  ];
+  const led = seasonLedger(weeks);
+  assert.strictEqual(led.games, 1, 'only the finished week counts');
+  assert.strictEqual(led.actualW, 1, 'and the in-progress "win" is not banked');
+  ok('18 · ⭐⭐⭐⭐⭐ an unfinished week is excluded from the record — a scoreline is not a result');
 }
 
 console.log(`\n${n} passed`);

@@ -117,12 +117,28 @@ export function lineupMisses(rosterPositions, starters, allPlayers, ptsOf, posOf
   const started = new Set((starters || []).map(String).filter(Boolean));
   const actual = [...started].reduce((s, sid) => s + (ptsOf(sid) || 0), 0);
 
+  /* ⭐⭐⭐⭐⭐ THE `|| 0` THAT UNDID THE KENNETH WALKER FIX — b139.
+     `optimalLineup` above already skips a player with no recorded score, correctly. This line did not: it
+     read `ptsOf(sid) || 0` and turned "no score yet" straight back into "scored nothing", which is the
+     precise coercion that produced "started Kenneth Walker 0 over Chubba Hubbard 22.2". Gating the route's
+     ptsOf was necessary and NOT sufficient — the null it produced died here, one function later, and the
+     bogus regret came out the far end exactly as before.
+
+     ⚠ CAUGHT ONLY BECAUSE THE TEST REPRODUCED THE BUG RATHER THAN ASSERTING ITS ABSENCE. A test that
+       merely checked "no miss mentions Walker" against a fixture where Walker had a real score would have
+       passed against the broken code. Test 14 in review.test.js pins the broken arithmetic on purpose, so
+       15 has something to be measured against — see the block comment there.
+
+     A starter whose game has not happened is not a benching you regret; he is a decision still pending. */
+  const pending = [...started].filter((sid) => ptsOf(sid) == null);
+
   /* The players the optimal lineup used that you did NOT start, and the players you started that it did
      not use. Matched within position so the swap it describes is a swap you could actually have made. */
   const shouldStart = opt.slots.filter((x) => x.sid && !started.has(x.sid));
   const optUsed = new Set(opt.slots.map((x) => x.sid).filter(Boolean));
   const shouldSit = [...started].filter((sid) => !optUsed.has(sid))
-    .map((sid) => ({ sid, pts: ptsOf(sid) || 0, pos: posOf(sid) }))
+    .map((sid) => ({ sid, pts: ptsOf(sid), pos: posOf(sid) }))
+    .filter((o) => o.pts != null)
     .sort((a, b) => a.pts - b.pts);
 
   const misses = [];
@@ -140,7 +156,12 @@ export function lineupMisses(rosterPositions, starters, allPlayers, ptsOf, posOf
     });
   }
   misses.sort((a, b) => b.gain - a.gain);
-  return { misses, left: r2(Math.max(0, opt.total - actual)), optimal: opt.total, actual: r2(actual), exact: opt.exact };
+  /* ⚠ `left` IS NOT FINAL WHILE ANYBODY IS STILL TO PLAY, and the number is misleading in a specific
+     direction: the optimal total counts only players with scores, while your actual total is missing the
+     points your unplayed starter is about to add — so mid-week it reads as waste that has not happened.
+     `pending` lets the caller say "not yet" instead of printing it. */
+  return { misses, left: r2(Math.max(0, opt.total - actual)), optimal: opt.total, actual: r2(actual),
+    exact: opt.exact, pending: pending.length };
 }
 
 /* ⭐⭐⭐⭐ ALL-PLAY: the single most honest luck number in fantasy football.
@@ -210,8 +231,68 @@ export function verdictFor({ won, myPts, allPtsThisWeek, optimalPts, oppPts, opp
    record next to the all-play record rounded to the same number of games. `luck` is the gap in wins:
    positive means the schedule has been kind. `ptsAgainstRank` is the slow-burn version — 1 means you have
    faced the most points in the league, which is nobody's fault and worth knowing. */
+/* ⭐⭐⭐⭐⭐ HAS HE PLAYED, AND IS THIS WEEK OVER — b139.
+   ================================================================================================
+   Trey: "it says 'Worst Call - Started Kenneth Walker 0 over Chubba Hubbard 22.2' — Kenneth Walker hasn't
+   played yet."
+
+   The ambiguity that caused it is worth stating precisely, because it is not obvious and it will come back
+   in some other shape: Sleeper's `players_points` holds an entry for EVERY rostered player from the moment
+   the week opens, and that entry is 0. So "he played and scored nothing" and "he has not kicked off" are
+   the same value, and any code that asks only "what did he score" will confidently mistake the second for
+   the first. The stat feed is the discriminator — a stat line means he was in the game.
+
+   ⚠ THIS LIVED INSIDE THE ROUTE HANDLER UNTIL b139, AND THAT IS WHY IT WAS NEVER PROPERLY TESTED. The
+     season-review fixture is a pre-baked response: it calls lineupMisses directly and emits a finished
+     payload, so it exercises none of the route's own logic. Every browser assertion about the Walker fix
+     was therefore testing the fixture's arithmetic rather than the fix. Pulled out here it is a pure
+     function with an obvious failing case, the route calls it, and the fixture builder can call it too —
+     so the stub can no longer be kinder than production on this exact point.
+
+   `playedSet` is null when we have no stat feed for the week. That is a THIRD state and it must behave
+   like the old code (assume the week is done), because a missing feed blanking every review in the season
+   would be a far worse failure than a stale one.
+   ================================================================================================ */
+export function playedGate(playersPoints, playedSet) {
+  const pp = playersPoints || {};
+  const didPlay = (sid) => (playedSet ? playedSet.has(String(sid)) : true);
+  return {
+    didPlay,
+    /* Points, or null where there is no score to speak of. Two different nulls, both correct: no entry at
+       all (he was never on this roster), and a 0 from a man whose game has not started. */
+    ptsOf: (sid) => {
+      const raw = pp[String(sid)];
+      if (raw == null) return null;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return null;
+      if (n === 0 && !didPlay(sid)) return null;
+      return n;
+    },
+  };
+}
+
+/* How much of a week is in the books, and who we are waiting on. `complete` gates every judgement the
+   review makes — see the note in connect.js on why an unfinished week gets no verdict and no result. */
+export function weekCompleteness(myStarters, oppStarters, playedSet, nameOf) {
+  const name = nameOf || ((sid) => String(sid));
+  if (!playedSet) return { complete: true, yetToPlay: 0, oppYetToPlay: 0, waitingOn: [] };
+  const mine = (myStarters || []).filter(Boolean).map(String).filter((sid) => !playedSet.has(sid));
+  const theirs = (oppStarters || []).filter(Boolean).map(String).filter((sid) => !playedSet.has(sid));
+  return {
+    complete: mine.length === 0 && theirs.length === 0,
+    yetToPlay: mine.length,
+    oppYetToPlay: theirs.length,
+    waitingOn: mine.slice(0, 6).map(name),
+  };
+}
+
 export function seasonLedger(weeks) {
-  const done = (weeks || []).filter((w) => w && w.me && Number.isFinite(w.me.pts));
+  /* ⚠ ONLY FINISHED WEEKS COUNT — b138. `complete === false` marks a week with starters still to play (see
+     the review route). Counting it here put an in-progress scoreline into the season record, which is how
+     a 5–5 season presented itself as 8–2: the current week contributed a "win" that was three unplayed
+     starters away from being anything at all. An absent flag means an older payload that predates the
+     check, and those weeks were all genuinely complete, so undefined counts. */
+  const done = (weeks || []).filter((w) => w && w.me && Number.isFinite(w.me.pts) && w.me.complete !== false);
   if (!done.length) return null;
   let actualW = 0, actualL = 0, actualT = 0, apW = 0, apL = 0, pf = 0, pa = 0, left = 0;
   for (const w of done) {
