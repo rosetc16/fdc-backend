@@ -567,6 +567,17 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
         players: players.map(String),
         reserve: reserve.map(String),
         taxi: taxi.map(String),
+        /* ⭐⭐⭐⭐ WHO IS BEING KEPT — added for 29z / b145.
+           Sleeper stores kept players on the roster's own `keepers` array, and the draft-settings route has
+           read it for a long time; the hub never carried it, so the in-season screens had no idea which of
+           a rival's players were already committed for next year. The trade calculator's long-term half
+           needs exactly that: Trey asked for "cost, control", and in a keeper league the cost of acquiring
+           a player is the keeper slot he occupies.
+           ⚠ WHAT IS NOT HERE, AND MUST NOT BE INVENTED: the league's keeper ESCALATOR rule (kept at his
+             draft round minus one, or plus one, or at a fixed cost) is not in Sleeper's API in any reliable
+             form. So this says who is kept and nothing about what keeping him costs next year. The client
+             is written to say nothing rather than guess — the FAAB lesson from 29w. */
+        keepers: (Array.isArray(r.keepers) ? r.keepers : []).filter((x) => x != null).map(String),
         starters: starters.map((x) => (x == null ? null : String(x))),
         weekPoints: m && m.points != null ? Number(m.points) : null,
         matchupId: m ? m.matchup_id : null,
