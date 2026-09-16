@@ -253,9 +253,14 @@ export function verdictFor({ won, myPts, allPtsThisWeek, optimalPts, oppPts, opp
    like the old code (assume the week is done), because a missing feed blanking every review in the season
    would be a far worse failure than a stale one.
    ================================================================================================ */
-export function playedGate(playersPoints, playedSet) {
+export function playedGate(playersPoints, playedSet, opts) {
   const pp = playersPoints || {};
-  const didPlay = (sid) => (playedSet ? playedSet.has(String(sid)) : true);
+  /* ⭐⭐⭐⭐⭐ A FINISHED WEEK NEEDS NO GATE — 29ab. `weekOver` says the schedule has already established
+     that every game in this week is final, and when that is true "did he play" is not a question the
+     STATS FEED gets to answer: he did, and a 0 from him is a real 0. The gate exists for the man whose
+     game has not kicked off, and in a finished week there is no such man. */
+  const over = !!(opts && opts.weekOver);
+  const didPlay = (sid) => (over || !playedSet ? true : playedSet.has(String(sid)));
   return {
     didPlay,
     /* Points, or null where there is no score to speak of. Two different nulls, both correct: no entry at
@@ -273,8 +278,20 @@ export function playedGate(playersPoints, playedSet) {
 
 /* How much of a week is in the books, and who we are waiting on. `complete` gates every judgement the
    review makes — see the note in connect.js on why an unfinished week gets no verdict and no result. */
-export function weekCompleteness(myStarters, oppStarters, playedSet, nameOf) {
+export function weekCompleteness(myStarters, oppStarters, playedSet, nameOf, opts) {
   const name = nameOf || ((sid) => String(sid));
+  /* ⭐⭐⭐⭐⭐ THE BUG THIS FIXES, IN TREY'S WORDS — 29ab: "When I go back to review week one it says I have
+     two left to play (DST and K) but week one is over."
+     He is right, and the cause is that this asked the wrong oracle. A starter counts as "yet to play" when
+     he is missing from the weekly STATS feed — and kickers and team defences are exactly the rows that
+     feed most often omits. So a finished week with a stat gap presented itself as a week still in
+     progress, which then suppressed the result, the verdict and the ledger entry for that week: one
+     missing row quietly withdrew a whole week's judgement.
+     ⚠ THE FIX IS NOT A BETTER STATS QUERY, IT IS ASKING A SOURCE THAT KNOWS. The review route already
+       establishes from the SCHEDULE which weeks are finished and reviews only those, so completeness is
+       settled before this function is called. Same shape as the 29t lesson: do not infer "has he played"
+       from the presence of a stat line when the clock can tell you. */
+  if (opts && opts.weekOver) return { complete: true, yetToPlay: 0, oppYetToPlay: 0, waitingOn: [] };
   if (!playedSet) return { complete: true, yetToPlay: 0, oppYetToPlay: 0, waitingOn: [] };
   const mine = (myStarters || []).filter(Boolean).map(String).filter((sid) => !playedSet.has(sid));
   const theirs = (oppStarters || []).filter(Boolean).map(String).filter((sid) => !playedSet.has(sid));

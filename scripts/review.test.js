@@ -305,6 +305,37 @@ const wName = (s) => s;
   ok('17 · ⭐⭐⭐⭐ a missing stat feed degrades to the old behaviour rather than emptying the review');
 }
 
+// 17b ── ⭐⭐⭐⭐⭐ A FINISHED WEEK IS FINISHED, WHATEVER THE STATS FEED LEFT OUT — 29ab
+{
+  /* Trey: "When I go back to review week one it says I have two left to play (DST and K) but week one is
+     over." Kickers and team defences are the rows the weekly stats feed omits most often, so a finished
+     week with a stat gap presented itself as still in progress — and that suppressed the RESULT, the
+     verdict and the ledger entry for the week. One missing row withdrew a whole week's judgement.
+     ⚠ THE FIXTURE IS THE BUG: `played` deliberately omits two starters, exactly as the feed did, and the
+       first assertion is the OLD behaviour so the difference `weekOver` makes is visible rather than
+       assumed. Without the flag the week reads incomplete; with it, complete. */
+  const gappy = new Set(['goff2', 'chase2', 'kelce2', 'nacua2']);   // walker + hubbard missing, as K/DST are
+  const before = weekCompleteness(W_STARTERS, ['hubbard'], gappy, wName);
+  assert.strictEqual(before.complete, false, 'without the flag a stat gap still reads as unfinished');
+  assert.ok(before.yetToPlay > 0);
+
+  const after = weekCompleteness(W_STARTERS, ['hubbard'], gappy, wName, { weekOver: true });
+  assert.strictEqual(after.complete, true, 'a week the schedule says is over is over');
+  assert.strictEqual(after.yetToPlay, 0, 'and nobody in it is "yet to play"');
+  assert.strictEqual(after.oppYetToPlay, 0);
+  assert.deepStrictEqual(after.waitingOn, []);
+  ok('17b · ⭐⭐⭐⭐⭐ a finished week reports nobody left to play, even where the stats feed has holes',
+    `was ${before.yetToPlay} left, now ${after.yetToPlay}`);
+
+  /* ⭐⭐⭐⭐ AND THE SAME FLAG MAKES A ZERO REAL. In a finished week a kicker on 0 scored zero; gating him
+     to null hides a genuine bad start from the optimiser and from the bench math. */
+  const { ptsOf: open } = playedGate(W_PP, gappy);
+  const { ptsOf: done } = playedGate(W_PP, gappy, { weekOver: true });
+  assert.strictEqual(open('walker'), null, 'mid-week his 0 is not a score');
+  assert.strictEqual(done('walker'), 0, 'in a finished week it is');
+  ok('17c · ⭐⭐⭐⭐ …and a 0 from a finished week counts, rather than being gated away as "not played"');
+}
+
 // 18 ── ⭐⭐⭐⭐⭐ an unfinished week is not a result — the other half of "I'm 8-2 across 10 leagues"
 {
   const played = new Set(['goff2', 'chase2', 'kelce2', 'hubbard', 'nacua2']);

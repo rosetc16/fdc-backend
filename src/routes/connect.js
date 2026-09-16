@@ -974,7 +974,10 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
       const playedSet = playedByWeek.get(week) || null;
       /* ⭐ THE KENNETH WALKER GATE, in lib/review.js so it is unit-testable — see playedGate there for the
          full reasoning. A 0 from a man who has not kicked off is not a score. */
-      const { ptsOf } = playedGate(pp, playedSet);
+      /* ⚠ EVERY WEEK THIS LOOP EMITS IS FINISHED. `lastDone` only advances to a week once the schedule
+         says `allDone`, so the stats-feed gate has no job here — see weekCompleteness for what believing
+         it did to week one. */
+      const { ptsOf } = playedGate(pp, playedSet, { weekOver: true });
       const posOf = (sid) => posById.get(String(sid)) || null;
       const nameOf = (sid) => nameById.get(String(sid)) || `Player ${sid}`;
       const roster = [...new Set([...(mine.players || []), ...(mine.starters || [])].filter(Boolean).map(String))];
@@ -983,7 +986,7 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
          it is the week he is living in and he wants to see it — but it cannot be judged, and everything
          downstream keys off this flag rather than guessing from the date. */
       const oppRow = opponentByRoster[String(myRosterId)] != null ? byRoster.get(Number(opponentByRoster[String(myRosterId)])) : null;
-      const C = weekCompleteness(mine.starters, oppRow && oppRow.starters, playedSet, nameOf);
+      const C = weekCompleteness(mine.starters, oppRow && oppRow.starters, playedSet, nameOf, { weekOver: true });
       const complete = C.complete;
 
       const lm = lineupMisses(rosterPositions, mine.starters, roster, ptsOf, posOf, nameOf);
