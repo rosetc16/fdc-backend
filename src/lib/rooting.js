@@ -73,6 +73,41 @@ export function playerPhase({ kickoff, hasStat, statsKnown, now = Date.now() }) 
   return { phase: played || clock === 'done' ? 'done' : 'pre', clock, statBeforeKickoff: false };
 }
 
+/* ⭐⭐⭐⭐⭐ DID HE ACTUALLY PLAY — b149, and this is the other half of the bug b148 half-fixed.
+   ==================================================================================================
+   Trey, a week after the DJ Moore fix: "you can see on the home screen that players that are still
+   scheduled to play today (but haven't started) show that they are not on the 'left' column even though
+   they are still left." Across eighteen leagues the strip said 94 of his starters were still to play —
+   roughly half — with every scoreline on zero and not a single game kicked off.
+
+   ⚠⚠ b148 MADE THE CLOCK WIN WHEN IT SAYS `pre`, AND LEFT THE BRANCH THIS BUG LIVES IN UNTOUCHED. Where
+     we hold no kickoff time at all the clock says `unknown` and the stats feed still decides — deliberately,
+     because that is b137's Monday-night fix. But "the feed decides" was reading the mere EXISTENCE of a row
+     as proof, and Sleeper publishes rows ahead of kickoff: a shell with no `gp` and every stat zero. A
+     player we cannot time plus a shell row equals "played", and half a roster vanishes off the column that
+     exists to say what is left.
+
+   ⭐ EVIDENCE OF PLAYING HAS TO BE POSITIVE. `gp: 0` was already rejected; the gap was that a MISSING `gp`
+     was treated as a yes. Now a row proves a man played only if it says so (`gp >= 1`) or carries a single
+     non-zero number. An all-zero row with no games-played flag is a placeholder, and placeholders are not
+     evidence.
+   ⚠ AND THIS IS DELIBERATELY NOT "TRUST THE CLOCK INSTEAD". The clock is missing in exactly this branch —
+     that is what makes it the branch. The fix is to read the feed more carefully, not to stop reading it:
+     a man who genuinely played and scored zero still has `gp: 1`, and he still comes back as played. */
+export function playedFromStatLine(stats) {
+  if (!stats || typeof stats !== 'object') return false;
+  const gp = Number(stats.gp);
+  if (Number.isFinite(gp)) return gp >= 1;
+  /* No games-played flag: fall back to whether anything at all happened. Any finite non-zero value
+     counts — a tackle, a target, a snap — because the question is "was he in the game", not "was he
+     any good". Negative values count too: a lost fumble is evidence. */
+  for (const k of Object.keys(stats)) {
+    const v = Number(stats[k]);
+    if (Number.isFinite(v) && v !== 0) return true;
+  }
+  return false;
+}
+
 /* ⭐⭐⭐⭐ WHERE THE NFL WEEK IS UP TO — b135.
    Trey: "when a week is live… the live badge shows up on the home page to see live results… then once
    games have finished (I'm thinking any game that's finished). There should be a review tab next to live."

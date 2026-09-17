@@ -32,7 +32,7 @@ export function gameLabel(opponent, home) {
   return `${home ? 'vs' : '@'} ${opp}`;
 }
 import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
-import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase } from '../lib/rooting.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase, playedFromStatLine } from '../lib/rooting.js';
 import { matchupForecast, projectedRecord, projectSide, normalCdf } from '../lib/winprob.js';
 import { scoreStatsFor } from '../lib/scoring.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
@@ -1245,7 +1245,8 @@ connectRouter.get('/sleeper/live', async (req, res) => {
     for (const row of weekStats || []) {
       const st = row && row.stats;
       if (!row || !row.player_id || !st) continue;
-      if (st.gp === 0) continue;
+      // ⚠ b149 — the presence of a row is not evidence; see playedFromStatLine in rooting.js.
+      if (!playedFromStatLine(st)) continue;
       playedSet.add(String(row.player_id));
     }
     const statsKnown = playedSet.size > 0;

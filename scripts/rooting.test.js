@@ -14,7 +14,7 @@
  *   afternoon. §4 pins that the spread survives instead of being averaged into something true nowhere.
  */
 import assert from 'assert';
-import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase } from '../src/lib/rooting.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase, playedFromStatLine } from '../src/lib/rooting.js';
 
 let n = 0;
 const ok = (m) => { n++; console.log('  PASS  ' + m); };
@@ -391,6 +391,52 @@ const P = (sid, pts, state = 'pre') => ({ sid, pts, state });
   assert.strictEqual(playerPhase({ kickoff: TNF, hasStat: true, statsKnown: false, now: NOW }).statBeforeKickoff,
     false, 'and with no usable stats feed there is nothing to disagree with');
   ok('12e · ⭐⭐⭐⭐ the disagreement flag fires ONLY on a real disagreement');
+}
+
+
+/* ⭐⭐⭐⭐⭐ §13 — A STAT ROW IS NOT PROOF THAT SOMEBODY PLAYED — b149.
+   ==================================================================================================
+   Trey, a week after the DJ Moore fix: "players that are still scheduled to play today (but haven't
+   started) show that they are not on the 'left' column even though they are still left." 94 of his
+   starters across eighteen leagues, every scoreline on zero, nothing kicked off.
+
+   b148 made the clock win where it says `pre`. This is the branch it did NOT touch: a player whose team
+   has no kickoff row at all reads `unknown`, the feed decides — correctly, that is b137 — and the feed
+   was being read as "a row exists" rather than "a row says he played". Sleeper publishes shells ahead of
+   kickoff. The two bugs are one sentence apart and took two builds.
+   ⚠ THE HARD PART IS NOT BREAKING b137 ON THE WAY. A man who played and scored nothing is the case that
+     rule exists for, and he still has gp: 1 — §13b is the check that would go red if this were "fixed"
+     by trusting the clock instead. */
+{
+  assert.strictEqual(playedFromStatLine({ gp: 0 }), false, 'an explicit zero was always rejected');
+  /* THE BUG: a pre-published shell — no gp, every number zero. */
+  assert.strictEqual(playedFromStatLine({ pts_ppr: 0, rec: 0, rush_att: 0 }), false,
+    'an all-zero row with no games-played flag is a placeholder, not evidence');
+  assert.strictEqual(playedFromStatLine({}), false, 'and an empty object is not evidence either');
+  assert.strictEqual(playedFromStatLine(null), false);
+  assert.strictEqual(playedFromStatLine('nonsense'), false);
+  ok('13 · ⭐⭐⭐⭐⭐ a shell row published before kickoff does not count as having played');
+
+  /* ⚠ b137 IS THE THING THAT MUST SURVIVE: the man who was on the field and did nothing. */
+  assert.strictEqual(playedFromStatLine({ gp: 1, pts_ppr: 0, rec: 0 }), true,
+    'he played and scored nothing — the whole reason the feed is trusted over the clock');
+  assert.strictEqual(playedFromStatLine({ gp: 1 }), true);
+  ok('13b · ⭐⭐⭐⭐⭐ …while a man who played and scored zero still reads as played (b137 intact)');
+
+  /* Without a gp flag, ANY real number is evidence he was in the game — the question is whether he was
+     on the field, not whether he was any good. */
+  assert.strictEqual(playedFromStatLine({ rec_tgt: 2 }), true, 'two targets is evidence');
+  assert.strictEqual(playedFromStatLine({ off_snp: 14 }), true, 'so are snaps');
+  assert.strictEqual(playedFromStatLine({ fum_lost: 1 }), true, 'so is a lost fumble');
+  assert.strictEqual(playedFromStatLine({ pts_ppr: -1 }), true, 'and so is a negative score');
+  ok('13c · ⭐⭐⭐⭐ …and with no flag at all, any non-zero number counts as being on the field');
+
+  /* ⚠ gp WINS OVER THE FALLBACK. A row carrying gp: 0 AND stray non-zero numbers (a leftover from the
+     previous week, a projection glued onto the same object) must stay rejected, or the fallback quietly
+     re-opens the hole the explicit flag was closing. */
+  assert.strictEqual(playedFromStatLine({ gp: 0, pts_ppr: 12.4, rec: 5 }), false,
+    'an explicit gp: 0 beats every other number in the row');
+  ok('13d · ⭐⭐⭐⭐⭐ …and an explicit games-played of zero outranks the fallback entirely');
 }
 
 
