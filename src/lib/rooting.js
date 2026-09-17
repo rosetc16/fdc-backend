@@ -39,6 +39,40 @@ export function gameState(kickoffIso, now = Date.now()) {
   return now - t < GAME_MS ? 'live' : 'done';
 }
 
+/* ⭐⭐⭐⭐⭐ WHICH PHASE ONE PLAYER IS IN — b148, and the reason it lives here is that it could not be
+   tested where it was.
+   ==================================================================================================
+   Trey, at 12:21 in the morning: "DJ Moore plays on Thursday, but his game hasn't started yet. Because
+   of that, he is showing up with a 0 projection AND he isn't listed as left to play."
+
+   ONE CAUSE, BOTH SYMPTOMS. `yetToPlay` counts everyone whose phase is not `done`, and the projected
+   finish is `points + projection × remain` with `remain = 0` once a man is done — so the moment a player
+   is wrongly called finished he drops off "left to play" AND his projection collapses to whatever is on
+   the board, which before kickoff is nothing. The two things he reported are the same bug seen twice.
+
+   ⭐⭐⭐ THE RULE THAT WAS WRONG: "THE STATS FEED WINS OVER THE CLOCK" — true, but not about this
+     question. The feed is authoritative about whether a man who COULD have played DID; it has no
+     authority over whether his game has BEGUN. That is what the schedule is for, and `gameState` says so
+     in its own comment three lines up: `pre` is CERTAIN, `live` and `done` are a window. So a stat row
+     against a game that has not kicked off is feed noise — a pre-published shell, a stale row, a
+     leftover from last week — and letting it overrule a kickoff time still hours away is how a Thursday
+     starter got filed as finished on Wednesday night.
+   ⚠ `unknown` IS UNCHANGED AND MUST BE. With no kickoff time at all there is no clock to believe, so the
+     feed decides — that is b137's fix for the Monday night game, and nothing here touches it. The
+     narrowing applies ONLY where we hold a kickoff and it is still ahead of us.
+   ⚠ AND THE DISAGREEMENT IS REPORTED, NOT SWALLOWED. `statBeforeKickoff` is true when the feed claimed a
+     stat line for a game our schedule says has not started. Silently picking a winner is what hid this
+     for as long as it hid; a caller that can count them can say so, and a schedule that is genuinely
+     stale shows up as a number instead of as a player quietly vanishing off a list. */
+export function playerPhase({ kickoff, hasStat, statsKnown, now = Date.now() }) {
+  const clock = gameState(kickoff, now);
+  if (clock === 'live') return { phase: 'live', clock, statBeforeKickoff: false };
+  if (clock === 'pre') return { phase: 'pre', clock, statBeforeKickoff: !!(statsKnown && hasStat) };
+  // 'done' or 'unknown': the feed is allowed to decide, and only here.
+  const played = statsKnown ? !!hasStat : clock === 'done';
+  return { phase: played || clock === 'done' ? 'done' : 'pre', clock, statBeforeKickoff: false };
+}
+
 /* ⭐⭐⭐⭐ WHERE THE NFL WEEK IS UP TO — b135.
    Trey: "when a week is live… the live badge shows up on the home page to see live results… then once
    games have finished (I'm thinking any game that's finished). There should be a review tab next to live."

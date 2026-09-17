@@ -69,4 +69,39 @@ const script = String((pkg.scripts && pkg.scripts.test) || '');
   ok('3 · ⭐⭐⭐⭐ …including this one, which would otherwise be a comment');
 }
 
+/* ⭐⭐⭐⭐⭐ §4 — EVERY WEEK-AWARE ROUTE APPLIES THE TUESDAY ROLL — b148.
+   ==================================================================================================
+   b143 established that Sleeper's `display_week` keeps pointing at a week long after its last whistle, and
+   that the cure is `defaultWeek`. /sleeper/team-hub got it. /sleeper/live did NOT, and nothing noticed for
+   five builds, because a route that is one week behind does not throw — it returns a complete, confident,
+   well-formed payload describing the wrong week. The home strip read the FINISHED week (every kickoff past,
+   every starter `done`, "left to play" zero) while My Week, on the same screen, had already rolled forward.
+
+   ⚠ THIS IS A MECHANICAL CHECK FOR A MISTAKE A CAREFUL PERSON MAKES ANYWAY — the same reasoning as the
+     unwired-test-file check above it, as icons-check and as css-check. "Remember to call defaultWeek in the
+     next week-aware route" is not a fix; this is. Any handler that derives a default from `display_week`
+     must pass it through `defaultWeek`, and a new one that forgets fails here rather than shipping. */
+{
+  const src = fs.readFileSync(path.join(here, '..', 'src/routes/connect.js'), 'utf8');
+  // Split the file into handler bodies so the two calls have to live in the SAME route, not merely in the
+  // same file — which is exactly the check that would have caught this, since the file already had one.
+  const parts = src.split(/connectRouter\.(?:get|post)\(/).slice(1);
+  const named = parts.map((b) => ({ name: (b.match(/^\s*'([^']+)'/) || [])[1] || '?', body: b }));
+  /* ⚠ THE RULE IS ABOUT ROUTES THAT PICK A WEEK TO SHOW, NOT EVERY ROUTE THAT MENTIONS ONE, and the first
+     cut of this check got that wrong — it flagged /sleeper/season-review, which reads `display_week` and is
+     CORRECT not to roll it: that route does not serve one chosen week, it walks every finished week and
+     decides whether the current one is reviewable with its own stricter `allDone` test (b135). Rolling
+     there would be meaningless at best. The routes this rule is for are the ones where the CALLER can pick
+     a week — they honour `?week=` when asked, so their no-week default is a display decision and must be
+     the rolled week. That is the discriminator, and it is the feature that makes the bug possible. */
+  const weekAware = named.filter((h) => h.body.includes('display_week') && h.body.includes('req.query.week'));
+  assert.ok(weekAware.length >= 2,
+    `expected at least two week-picking handlers, found ${weekAware.length} — has the parse drifted?`);
+  const missing = weekAware.filter((h) => !h.body.includes('defaultWeek('));
+  assert.deepStrictEqual(missing.map((h) => h.name), [],
+    `these routes take Sleeper's display_week without the b143 roll: ${missing.map((h) => h.name).join(', ')}`);
+  ok(`4 · ⭐⭐⭐⭐⭐ both week-picking routes apply the Tuesday roll [${weekAware.map((h) => h.name).join(', ')}]`);
+}
+
+
 console.log(`\n${n} passed`);

@@ -14,7 +14,7 @@
  *   afternoon. §4 pins that the spread survives instead of being averaged into something true nowhere.
  */
 import assert from 'assert';
-import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../src/lib/rooting.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase } from '../src/lib/rooting.js';
 
 let n = 0;
 const ok = (m) => { n++; console.log('  PASS  ' + m); };
@@ -315,5 +315,83 @@ const P = (sid, pts, state = 'pre') => ({ sid, pts, state });
   assert.strictEqual(l2.kelce.elapsed, null);
   ok('11c · ⭐⭐⭐⭐⭐ a caller that passes no clock still gets a readable row rather than a blank one');
 }
+
+/* ⭐⭐⭐⭐⭐ §12 — THE THURSDAY STARTER WHO WAS ALREADY FINISHED — b148.
+   ==================================================================================================
+   Trey, at 12:21 in the morning: "DJ Moore plays on Thursday, but his game hasn't started yet. Because
+   of that, he is showing up with a 0 projection AND he isn't listed as left to play."
+
+   This rule lived inline in /sleeper/live as a four-line arrow function between a database call and two
+   network calls, and the stub answers that route with CANNED phases — so it had never been executed by a
+   test in this project's history, which is why it shipped wrong and stayed wrong. The whole section
+   exists because the rule is now somewhere a test can reach it.
+   ⚠ THE CLOCK IS REAL, NOT ROUND. 12:21 AM ET Thursday and an 8:15 PM ET kickoff the same evening, so a
+     regression that reintroduces any "the calendar date matches, so it has started" shortcut fails here
+     rather than looking plausible. */
+{
+  const NOW = Date.parse('2026-09-17T04:21:00Z');     // 12:21 AM ET Thursday — his moment, to the minute
+  const TNF = '2026-09-18T00:15:00Z';                 // 8:15 PM ET the same Thursday: 19.9 hours away
+  const SUN = '2026-09-20T17:00:00Z';                 // 1:00 PM ET Sunday
+  const OVER = '2026-09-14T00:15:00Z';                // long finished
+
+  assert.strictEqual(gameState(TNF, NOW), 'pre', 'the clock itself must call tonight\'s game unstarted');
+
+  /* THE BUG, EXACTLY. The stats feed claims a line for a man whose game is still 20 hours away — a
+     pre-published shell, a stale row, whatever it is — and the old rule let that overrule the schedule. */
+  const moore = playerPhase({ kickoff: TNF, hasStat: true, statsKnown: true, now: NOW });
+  assert.strictEqual(moore.phase, 'pre',
+    'a stat line cannot start a game that has not kicked off');
+  assert.strictEqual(moore.statBeforeKickoff, true,
+    'and the disagreement is REPORTED rather than silently resolved');
+  ok('12 · ⭐⭐⭐⭐⭐ a Thursday starter is not finished on Wednesday night, whatever the feed says');
+
+  /* ⚠ THE CONSEQUENCE ASSERTED IN ITS OWN TERMS, because "phase" is not what he was looking at. Both of
+     his symptoms are arithmetic on the phase, so they are checked as arithmetic — a future refactor that
+     keeps the phase right and breaks the two derived numbers would otherwise pass §12 untouched. */
+  const starters = [
+    { sid: 'moore', kickoff: TNF, hasStat: true },     // Thursday night, not kicked off
+    { sid: 'sunday1', kickoff: SUN, hasStat: false },
+    { sid: 'sunday2', kickoff: SUN, hasStat: false },
+  ].map((p) => ({ ...p, ...playerPhase({ ...p, statsKnown: true, now: NOW }) }));
+  const yetToPlay = starters.filter((p) => p.phase !== 'done').length;
+  assert.strictEqual(yetToPlay, 3, 'all three are still to play — "left" counts him');
+  const remainOf = (p) => (p.phase === 'live' ? 0.5 : p.phase === 'pre' ? 1 : 0);
+  const projFinal = (p, pts, proj) => Math.round((pts + proj * remainOf(p)) * 10) / 10;
+  assert.strictEqual(projFinal(starters[0], 0, 13.4), 13.4,
+    'and his projected finish is his projection, not zero');
+  ok('12b · ⭐⭐⭐⭐⭐ …so he is counted in "left to play" AND keeps his projection — both symptoms');
+
+  /* ⚠ THE NARROWING IS NARROW. Everything the feed was right about it is still right about. */
+  assert.strictEqual(playerPhase({ kickoff: OVER, hasStat: true, statsKnown: true, now: NOW }).phase, 'done',
+    'a finished game with a stat line is still finished');
+  assert.strictEqual(playerPhase({ kickoff: OVER, hasStat: false, statsKnown: true, now: NOW }).phase, 'done',
+    'and a finished game without one is too — he was inactive, or scored nothing (b140)');
+  const live = '2026-09-17T03:00:00Z';                // kicked off 81 minutes ago
+  assert.strictEqual(playerPhase({ kickoff: live, hasStat: true, statsKnown: true, now: NOW }).phase, 'live',
+    'a man in the second quarter is playing, not finished (b140)');
+  assert.strictEqual(playerPhase({ kickoff: live, hasStat: false, statsKnown: true, now: NOW }).phase, 'live',
+    'and so is one who has not recorded anything yet — kickers often do not (b140)');
+  ok('12c · ⭐⭐⭐⭐ the three phases b140 established are untouched by the narrowing');
+
+  /* ⭐⭐⭐ `unknown` IS THE ONE PLACE THE FEED STILL DECIDES, and it must stay that way: with no kickoff
+     time there is no clock to believe, and b137's Monday night game depends on this branch. */
+  assert.strictEqual(playerPhase({ kickoff: null, hasStat: true, statsKnown: true, now: NOW }).phase, 'done',
+    'no clock at all: a stat line is the only evidence there is, so it decides');
+  assert.strictEqual(playerPhase({ kickoff: null, hasStat: false, statsKnown: true, now: NOW }).phase, 'pre',
+    'and no stat line with no clock is still to play, never quietly filed as played (b137)');
+  assert.strictEqual(playerPhase({ kickoff: null, hasStat: false, statsKnown: false, now: NOW }).phase, 'pre');
+  ok('12d · ⭐⭐⭐⭐⭐ a team we cannot put a clock on still reaches the feed — b137 is not regressed');
+
+  /* ⚠ AND THE FLAG IS NOT JUST "HE HAS A STAT". It means the two sources genuinely disagree, so it must
+     be false everywhere they do not — otherwise the diagnostic counts normal Sundays and means nothing. */
+  assert.strictEqual(playerPhase({ kickoff: TNF, hasStat: false, statsKnown: true, now: NOW }).statBeforeKickoff,
+    false, 'no stat line before kickoff is the ordinary case, not a disagreement');
+  assert.strictEqual(playerPhase({ kickoff: OVER, hasStat: true, statsKnown: true, now: NOW }).statBeforeKickoff,
+    false, 'a stat line after the game is the ordinary case too');
+  assert.strictEqual(playerPhase({ kickoff: TNF, hasStat: true, statsKnown: false, now: NOW }).statBeforeKickoff,
+    false, 'and with no usable stats feed there is nothing to disagree with');
+  ok('12e · ⭐⭐⭐⭐ the disagreement flag fires ONLY on a real disagreement');
+}
+
 
 console.log(`\n${n} passed`);

@@ -18,8 +18,21 @@ import { trendFor, auditFields } from '../lib/trending.js';
 import { defaultWeek } from '../lib/weekpick.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
+
+/* ⭐⭐⭐⭐ "vs KC" OR "@ KC", AND IT IS EXPORTED SO IT CAN BE TESTED — b147.
+   ⚠ THIS LIVED INLINE INSIDE THE LIVE ROUTE, three expressions deep in a row handler behind a database
+     query, which per the 29x weather-roof lesson means the only reachable tests are its INPUTS and its
+     FIXTURE — and the fixture is a hand-written string, so a test would have verified that I wrote what I
+     wrote. Inverting `home` is the single most likely mistake here, it reads perfectly plausibly on
+     screen either way ("CIN @ GB" is a real-looking sentence about the wrong game), and nothing else in
+     the app could contradict it. Three lines, extracted, so the assertion can fail. */
+export function gameLabel(opponent, home) {
+  const opp = String(opponent || '').trim().toUpperCase();
+  if (!opp) return null;
+  return `${home ? 'vs' : '@'} ${opp}`;
+}
 import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
-import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom } from '../lib/rooting.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase } from '../lib/rooting.js';
 import { matchupForecast, projectedRecord, projectSide, normalCdf } from '../lib/winprob.js';
 import { scoreStatsFor } from '../lib/scoring.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
@@ -936,7 +949,7 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
        score", dutifully concluded that starting Walker cost 22.2 points. It is the worst class of wrong
        output: confident, specific, checkable, and false.
 
-       The stat feed settles it, exactly as it does on the live board (see `playedBy` in /sleeper/live): a
+       The stat feed settles it, exactly as it does on the live board (see `playerPhase` in rooting.js): a
        STAT LINE means he was in the game. No stat line and we do not know what he will score, so he is not
        a data point about a decision — he is excluded from the comparison rather than counted as a zero.
 
@@ -1147,19 +1160,51 @@ connectRouter.get('/sleeper/live', async (req, res) => {
 
     const nfl = await getNflState().catch(() => null);
     const season = (nfl && nfl.season) || String(config.activeSeason);
+    const weekAsked = !!Number(req.query.week || 0);
     let week = Number(req.query.week || 0);
     if (!week || Number.isNaN(week)) {
       const st = nfl && nfl.season_type;
       week = (st && st !== 'regular' && st !== 'post') ? 1 : ((nfl && (nfl.display_week || nfl.week)) || 1);
     }
     week = Math.min(18, Math.max(1, week));
+    /* ⭐⭐⭐⭐⭐ THE TUESDAY ROLL, WHICH THIS ROUTE NEVER GOT — b148.
+       b143 established that Sleeper's `display_week` keeps pointing at a week long after its last whistle,
+       and every week-aware surface corrects for it with `defaultWeek`. Every surface except this one: the
+       live route has taken `display_week` raw since it was written, so from the Monday night final until
+       Sleeper decides to move, the home strip reads the FINISHED week — every kickoff in the past, every
+       starter `done`, "left to play" zero — while My Week, which does roll, is already on the week you are
+       actually trying to set a lineup for. Two panels on one screen, two different weeks.
+       ⚠ Same two guards as team-hub: an explicit `?week=` is the user driving the toggle and is obeyed
+         exactly, and no schedule rows means no opinion and no roll. */
+    if (!weekAsked) {
+      try {
+        const { rows: kick } = await q(
+          'SELECT DISTINCT kickoff FROM nfl_schedule WHERE season=$1 AND week=$2 AND kickoff IS NOT NULL',
+          [Number(season), week]);
+        week = defaultWeek(week, kick.map((r) => r.kickoff));
+      } catch { /* no schedule: the platform's week stands, which is the pre-b148 behaviour */ }
+    }
 
     // Kickoff times for the week — the only thing that lets a scoreline say "with four still to play".
     const kickoffByTeam = {};
+    /* ⭐⭐⭐⭐ WHO HE IS PLAYING, WHICH THIS ROUTE HAS BEEN THROWING AWAY — b147.
+       Trey, about Game Day's player hover: "show who his opponent is".
+       ⚠⚠ `oppOf: () => null` HAS BEEN HARDCODED SINCE THE BOARD WAS BUILT, so `opp` — a documented field on
+         the rooting contract, carried all the way to the client — was null for every player in production
+         and always had been. The query two lines below selected `team, kickoff` from a table that has
+         `opponent` and `home` sitting in the same row. DROP-ON-THE-FLOOR, and the fifth or sixth time on
+         this project: when a feature looks like it needs new data, check what the payload already carries.
+       ⚠ An away team's opponent is printed "@ KC" and a home team's "vs KC". That distinction is free here
+         and cannot be reconstructed downstream, so it is baked into the string once rather than shipping a
+         boolean three consumers would each have to remember to read. */
+    const gameByTeam = {};
     try {
       const { rows: sch } = await q(
-        'SELECT team, kickoff FROM nfl_schedule WHERE season=$1 AND week=$2', [Number(season), week]);
-      sch.forEach((r) => { if (r.kickoff) kickoffByTeam[String(r.team)] = new Date(r.kickoff).toISOString(); });
+        'SELECT team, opponent, home, kickoff FROM nfl_schedule WHERE season=$1 AND week=$2', [Number(season), week]);
+      sch.forEach((r) => {
+        if (r.kickoff) kickoffByTeam[String(r.team)] = new Date(r.kickoff).toISOString();
+        if (r.opponent) gameByTeam[String(r.team)] = gameLabel(r.opponent, r.home);
+      });
     } catch { /* no schedule loaded: every player reads as unknown, which the UI states rather than guesses */ }
 
     const nameById = new Map(), posById = new Map(), teamById = new Map();
@@ -1232,9 +1277,11 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       if (!k && team) missingKick.add(team);
       return gameState(k, now);
     };
-    /* ⚠ THE STATS FEED WINS OVER THE CLOCK. The clock is a three-and-a-half-hour window around kickoff and
-       is honest about being an approximation; a stat line is a fact. Where they disagree, believe the fact. */
-    const playedBy = (sid) => (statsKnown ? playedSet.has(String(sid)) : stateOf(sid) === 'done');
+    /* ⚠ THE STATS FEED WINS OVER THE CLOCK — ABOUT THE QUESTION IT CAN ANSWER. The 3.5-hour window around
+       kickoff is an approximation and a stat line is a fact, so where they disagree about whether a man
+       who COULD have played DID, believe the fact. ⚠ b148 NARROWED THIS: the feed says nothing about
+       whether a game has BEGUN, and letting it win there is what filed a Thursday starter as finished the
+       night before. `playedBy` is gone; `playerPhase` (rooting.js) owns the whole decision now. */
 
     /* ⭐⭐⭐⭐⭐ THREE PHASES, NOT TWO — b140.
        Trey, on a Monday night: "something isn't working right for games that are currently LIVE… it's
@@ -1251,6 +1298,10 @@ connectRouter.get('/sleeper/live', async (req, res) => {
          no stat line       + clock says the game is on    → LIVE   (he can still score; kickers often do)
          no stat line       + clock says it is over        → DONE   (he was inactive, or scored nothing)
          no stat line       + clock has not started        → PRE
+         stats say he played + clock has not started       → PRE    ⭐ b148 — see playerPhase in rooting.js.
+                                                                     The row this table never had, and the
+                                                                     one that filed a Thursday starter as
+                                                                     finished on a Wednesday night.
 
        ⚠ AND `remain` IS HOW MUCH OF HIS GAME IS LEFT, derived from elapsed time against a nominal game
          length. No feed here reports a game clock, so this is an approximation and it is worth being
@@ -1259,11 +1310,22 @@ connectRouter.get('/sleeper/live', async (req, res) => {
          vastly closer than the two values it replaces, which were "all of his projection" and "none of
          it". Everything downstream treats it as an estimate and says so. */
     const GAME_LEN_MS = 3.5 * 60 * 60 * 1000;
+    /* ⚠ THE DECISION ITSELF LIVES IN rooting.js NOW — b148. It was four lines of inline arrow function
+       wrapped in a database call and two network calls, which by the 29x rule means the only things a test
+       could reach were its inputs and the stub's hand-written fixture; the stub answers /sleeper/live with
+       canned phases, so this rule had never been executed by any test in the project's history. That is
+       why it shipped wrong. `playerPhase` is pure, exported and falsifiable — scripts/rooting.test.js now
+       runs it at Trey's exact moment. */
+    const earlyStat = new Set();
     const phaseOf = (sid) => {
-      const st = stateOf(sid);
-      if (st === 'live') return 'live';
-      if (playedBy(sid) || st === 'done') return 'done';
-      return 'pre';
+      const r = playerPhase({
+        kickoff: kickoffByTeam[String(teamById.get(String(sid)) || '')] || null,
+        hasStat: playedSet.has(String(sid)),
+        statsKnown,
+        now,
+      });
+      if (r.statBeforeKickoff) earlyStat.add(String(sid));
+      return r.phase;
     };
     const remainOf = (sid) => {
       const team = String(teamById.get(String(sid)) || '');
@@ -1417,7 +1479,8 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       stateOf,
       // The same fraction the forecast uses, so the board's colour and the projection agree by construction.
       remainOf,
-      oppOf: () => null,
+      // See `gameByTeam` above: "@ KC" / "vs KC", or null where no schedule row was loaded.
+      oppOf: (sid) => gameByTeam[String(teamById.get(String(sid)) || '')] || null,
     });
 
     res.json({
@@ -1458,6 +1521,14 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       /* The teams among your actual starters that we could not put a clock on — see stateOf above. Sent
          as the team codes rather than a count, so the page can name the players rather than say "some". */
       scheduleMissing: [...missingKick].sort(),
+      /* ⭐⭐⭐⭐ WHERE THE TWO SOURCES DISAGREED — b148, and it is reported rather than resolved silently.
+         These are starters the stats feed claimed a line for while the schedule says their game has not
+         kicked off. Under the old rule each one of these was filed as FINISHED, which is precisely the bug
+         Trey hit; under the new rule the clock wins and they stay `pre`. Either the feed is publishing
+         shells ahead of kickoff (harmless, and now harmless on screen too) or our schedule is stale for
+         those teams (not harmless) — and the only way to tell them apart is to be able to see the number,
+         which is the same reasoning as `scheduleMissing` beside it. */
+      statBeforeKickoff: [...earlyStat].sort(),
     });
   } catch (e) {
     res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
