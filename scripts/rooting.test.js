@@ -14,7 +14,8 @@
  *   afternoon. §4 pins that the spread survives instead of being averaged into something true nowhere.
  */
 import assert from 'assert';
-import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase, playedFromStatLine } from '../src/lib/rooting.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase, playedFromStatLine,
+  gameProgress, remainingFor, GAME_WALL_MS } from '../src/lib/rooting.js';
 
 let n = 0;
 const ok = (m) => { n++; console.log('  PASS  ' + m); };
@@ -439,5 +440,77 @@ const P = (sid, pts, state = 'pre') => ({ sid, pts, state });
   ok('13d · ⭐⭐⭐⭐⭐ …and an explicit games-played of zero outranks the fallback entirely');
 }
 
+
+/* ---- 14. ⭐⭐⭐⭐⭐ HOW MUCH OF THE GAME IS LEFT — b151 -------------------------------------------------
+   Trey, watching a live game: "Both Sleeper and the website have the same points currently (18.5). The
+   projected points is way different though (Sleeper: 22 / site: 27.4)... There are 3 minutes left in the
+   3rd quarter."
+   The projected finish is `points + projection × remain`, so with the score agreed, `remain` is the entire
+   disagreement. The old rule was a straight line across 3.5 hours; the two things wrong with it both
+   pointed the same way, which is why the number was high rather than merely noisy. */
+{
+  const KICK = '2026-09-14T17:00:00.000Z';                 // a 1:00pm Eastern kickoff
+  const at = (min) => Date.parse(KICK) + min * 60000;
+
+  // (a) The window is the length of a broadcast, not a round number.
+  assert.strictEqual(GAME_WALL_MS, 183 * 60 * 1000, 'a regulation game runs about 3h03m end to end');
+  assert.strictEqual(gameProgress(KICK, at(0)), 0, 'nothing has been played at kickoff');
+  assert.strictEqual(gameProgress(KICK, at(-30)), 0, 'and nothing before it either');
+  assert.strictEqual(gameProgress(KICK, at(183)), 1);
+  assert.strictEqual(gameProgress(KICK, at(400)), 1, 'long past the window it is simply over');
+  assert.strictEqual(gameProgress(null, at(60)), null, 'no kickoff means no opinion, NOT zero');
+  n++; console.log('  PASS  14 · the progress curve spans a real broadcast and refuses to guess without a kickoff');
+
+  /* (b) ⭐⭐⭐⭐⭐ HALFTIME. Thirteen minutes of wall clock during which no football is played — a straight
+     line through it has a man a quarter of the way into the second half while the teams are in the locker
+     room. The curve must be FLAT across the break and nowhere else. */
+  const atHalf = gameProgress(KICK, at(85));
+  assert.strictEqual(atHalf, 0.5, 'two quarters is half the game');
+  assert.strictEqual(gameProgress(KICK, at(91)), 0.5, 'and nothing moves during the break');
+  assert.strictEqual(gameProgress(KICK, at(98)), 0.5, 'right up to the second-half kickoff');
+  assert.ok(gameProgress(KICK, at(99)) > 0.5, 'and then it moves again');
+  n++; console.log('  PASS  14b · ⭐⭐⭐⭐⭐ the clock stops at halftime — the curve is flat for those thirteen minutes');
+
+  /* (c) ⭐⭐⭐⭐⭐ TREY'S MOMENT. Three minutes left in the third quarter is 42 of 60 game minutes played,
+     which on this broadcast shape lands about 2h13m after kickoff. The old rule and the new one differ by
+     a quarter of the projection, and on his running back that is the gap he reported. */
+  const HIS_MOMENT = at(133);
+  const rem = remainingFor(KICK, HIS_MOMENT);
+  const oldRem = Math.max(0, Math.min(1, 1 - (133 * 60000) / (3.5 * 3600000)));   // the rule b151 replaces
+  assert.ok(rem > 0.25 && rem < 0.33, `three minutes left in the third should leave under a third: ${rem}`);
+  assert.ok(oldRem - rem > 0.06,
+    `the old rule must be measurably more generous, or this test is not about the bug: ${oldRem} vs ${rem}`);
+  // Stated the way he stated it: the same points on the board, the same projection, two finishes.
+  const finish = (r) => Math.round((18.5 + 24 * r) * 10) / 10;
+  assert.ok(finish(oldRem) > finish(rem) + 1.5,
+    `the two rules must produce visibly different finishes: ${finish(oldRem)} vs ${finish(rem)}`);
+  n++; console.log(`  PASS  14c · ⭐⭐⭐⭐⭐ at three minutes left in the third, the finish drops from ${finish(oldRem)} to ${finish(rem)}   [remain ${oldRem.toFixed(2)} → ${rem.toFixed(2)}]`);
+
+  /* (d) ⚠ MONOTONIC AND BOUNDED, ACROSS THE WHOLE WINDOW. A curve assembled from three segments is exactly
+     the shape that develops a step or a dip at a join, and either would make a live projection go UP as a
+     game goes on. Walk every minute rather than spot-checking the ends. */
+  let prev = -1, bad = null;
+  for (let m = -10; m <= 200; m++) {
+    const v = gameProgress(KICK, at(m));
+    if (v < 0 || v > 1) { bad = `out of range at ${m}: ${v}`; break; }
+    if (v < prev - 1e-9) { bad = `went backwards at ${m}: ${prev} -> ${v}`; break; }
+    prev = v;
+  }
+  assert.strictEqual(bad, null, String(bad));
+  n++; console.log('  PASS  14d · ⭐⭐⭐ the curve never goes backwards and never leaves [0,1] — no step at either join');
+
+  /* (e) ⚠ AND THE NO-CLOCK FALLBACK IS UNCHANGED AT 0.5. A schedule outage must behave exactly as it did
+     before this moved, or b150's honest degradation quietly becomes a second bug. */
+  assert.strictEqual(remainingFor(null, HIS_MOMENT), 0.5);
+  assert.strictEqual(remainingFor('not a date', HIS_MOMENT), 0.5);
+  /* ⚠ `gameState` KEEPS ITS 3.5-HOUR WINDOW ON PURPOSE, and this is the assertion that stops a future edit
+     from "tidying" the two constants into one. They answer different questions and the right error is in
+     opposite directions: calling a game FINISHED early hides a player who can still score, so that window
+     should be generous; calling a game more than half REMAINING late inflates every projection on the
+     screen, so this one should not be. */
+  assert.strictEqual(gameState(KICK, at(190)), 'live', 'the state window is deliberately longer than the scoring curve');
+  assert.strictEqual(remainingFor(KICK, at(190)), 0, 'while nothing is left to project by then');
+  n++; console.log('  PASS  14e · ⭐⭐⭐⭐ no kickoff still falls back to 0.5, and gameState keeps its own wider window');
+}
 
 console.log(`\n${n} passed`);

@@ -73,6 +73,64 @@ export function playerPhase({ kickoff, hasStat, statsKnown, now = Date.now() }) 
   return { phase: played || clock === 'done' ? 'done' : 'pre', clock, statBeforeKickoff: false };
 }
 
+/* ⭐⭐⭐⭐⭐ HOW MUCH OF HIS GAME IS LEFT — b151, and it was wrong in the direction that flatters you.
+   ==================================================================================================
+   Trey, watching a live game: "Jahmyr Gibbs is playing right now. Both Sleeper and the website have the
+   same points currently (18.5). The projected points is way different though (Sleeper: 22 / site: 27.4)…
+   There are 3 minutes left in the 3rd quarter."
+
+   The projected finish is `points so far + full-game projection × remain`, so `remain` is the whole
+   disagreement, and the old rule was two approximations stacked in the same direction:
+
+   ⚠⚠ A GAME IS NOT 3.5 HOURS. A regulation NFL broadcast runs about 3h03m — 3.5 was a round number picked
+     for `gameState`, where being generous is CORRECT (declaring a game over early is the expensive
+     mistake) and then reused here, where being generous means over-projecting every live player all
+     afternoon. Two different questions, one constant. At three minutes left in the third quarter the
+     wall clock reads about 2h13m: against 3.5h that is 37% of the game still to come, against 3h03m it
+     is 27%, and on a 24-point projection those differ by two and a half points.
+
+   ⚠⚠ AND THE CLOCK STOPS AT HALFTIME. Thirteen minutes of wall time during which no football is played
+     and no fantasy points are scored — a straight line through it says a man is a quarter of the way
+     through the second half while the teams are still in the locker room.
+
+   ⭐ SO THE CURVE FOLLOWS THE BROADCAST'S OWN SHAPE: two halves of about 85 minutes each with a 13-minute
+     gap between them, and no progress during the gap. It is still an approximation and still says so —
+     a blowout empties in the fourth quarter, a two-minute drill is worth more than its two minutes, and
+     no feed this app talks to reports a game clock. It is simply an approximation of the right thing.
+
+   ⚠ IT LIVES HERE, PURE AND EXPORTED, BECAUSE THE LAST TWO BUGS IN THIS FILE'S SUBJECT WERE INLINE ARROW
+     FUNCTIONS INSIDE A ROUTE. `playerPhase` moved out in b148 for exactly this reason and the comment
+     there says why: wrapped in a database call and two network calls, the only thing a test could reach
+     was the stub's hand-written fixture, so the rule had never been executed by any test in the project's
+     history — which is why it shipped wrong. This is the same rule's twin, and it shipped wrong too. */
+const HALF_WALL_MS = 85 * 60 * 1000;          // two quarters of broadcast time
+const HALFTIME_MS = 13 * 60 * 1000;           // the break, during which nothing is scored
+export const GAME_WALL_MS = HALF_WALL_MS * 2 + HALFTIME_MS;   // ≈ 3h03m end to end
+
+/* The share of a game that has been PLAYED, from how long ago it kicked off. Returns 0 before kickoff and
+   1 once the broadcast window is over; `null` when there is no kickoff to measure from, which the caller
+   must treat as "no opinion" rather than as a number (see `remainingFor`). */
+export function gameProgress(kickoffIso, now = Date.now()) {
+  if (!kickoffIso) return null;
+  const t = Date.parse(kickoffIso);
+  if (!Number.isFinite(t)) return null;
+  const e = now - t;
+  if (e <= 0) return 0;
+  if (e >= GAME_WALL_MS) return 1;
+  if (e <= HALF_WALL_MS) return 0.5 * (e / HALF_WALL_MS);
+  if (e <= HALF_WALL_MS + HALFTIME_MS) return 0.5;            // halftime: the clock stops here
+  return 0.5 + 0.5 * ((e - HALF_WALL_MS - HALFTIME_MS) / HALF_WALL_MS);
+}
+
+/* What fraction of his scoring is still ahead of him. ⚠ THE FALLBACK IS 0.5 AND IT IS DELIBERATE: with no
+   kickoff time we know nothing about where the game is, and 0.5 is the least-wrong single guess — the same
+   value the route used before this moved, kept so a schedule outage behaves exactly as it did. */
+export function remainingFor(kickoffIso, now = Date.now()) {
+  const played = gameProgress(kickoffIso, now);
+  if (played == null) return 0.5;
+  return Math.max(0, Math.min(1, 1 - played));
+}
+
 /* ⭐⭐⭐⭐⭐ DID HE ACTUALLY PLAY — b149, and this is the other half of the bug b148 half-fixed.
    ==================================================================================================
    Trey, a week after the DJ Moore fix: "you can see on the home screen that players that are still

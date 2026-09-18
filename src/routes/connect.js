@@ -32,7 +32,7 @@ export function gameLabel(opponent, home) {
   return `${home ? 'vs' : '@'} ${opp}`;
 }
 import { lineupMisses, verdictFor, seasonLedger, pointRanks, playedGate, weekCompleteness } from '../lib/review.js';
-import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase, playedFromStatLine } from '../lib/rooting.js';
+import { rootingBoard, dayTotals, sideOf, gameState, weekStateFrom, playerPhase, playedFromStatLine, remainingFor } from '../lib/rooting.js';
 import { matchupForecast, projectedRecord, projectSide, normalCdf } from '../lib/winprob.js';
 import { scoreStatsFor } from '../lib/scoring.js';
 import { cached, picksKey, metaKey, draftsKey, TTL } from '../lib/draftCache.js';
@@ -1304,13 +1304,17 @@ connectRouter.get('/sleeper/live', async (req, res) => {
                                                                      one that filed a Thursday starter as
                                                                      finished on a Wednesday night.
 
-       ⚠ AND `remain` IS HOW MUCH OF HIS GAME IS LEFT, derived from elapsed time against a nominal game
-         length. No feed here reports a game clock, so this is an approximation and it is worth being
+       ⚠ AND `remain` IS HOW MUCH OF HIS GAME IS LEFT, derived from elapsed time against the shape of a
+         broadcast. No feed here reports a game clock, so this is an approximation and it is worth being
          explicit that it is a crude one: a blowout empties in the fourth quarter, a two-minute drill is
          worth more than its two minutes, and neither is visible from a kickoff timestamp. It is still
          vastly closer than the two values it replaces, which were "all of his projection" and "none of
-         it". Everything downstream treats it as an estimate and says so. */
-    const GAME_LEN_MS = 3.5 * 60 * 60 * 1000;
+         it". Everything downstream treats it as an estimate and says so.
+       ⚠⚠ b151 — IT USED TO BE A STRAIGHT LINE OVER 3.5 HOURS AND BOTH HALVES OF THAT WERE WRONG: a game runs
+         about 3h03m, and the clock stops for thirteen minutes at halftime. Both errors point the same way,
+         so every live player was over-projected all afternoon — Trey caught it on a running back reading
+         27.4 against Sleeper's 22 with three minutes left in the third quarter. `remainingFor` in
+         rooting.js owns the curve now, and it is pure and tested. */
     /* ⚠ THE DECISION ITSELF LIVES IN rooting.js NOW — b148. It was four lines of inline arrow function
        wrapped in a database call and two network calls, which by the 29x rule means the only things a test
        could reach were its inputs and the stub's hand-written fixture; the stub answers /sleeper/live with
@@ -1328,14 +1332,7 @@ connectRouter.get('/sleeper/live', async (req, res) => {
       if (r.statBeforeKickoff) earlyStat.add(String(sid));
       return r.phase;
     };
-    const remainOf = (sid) => {
-      const team = String(teamById.get(String(sid)) || '');
-      const k = kickoffByTeam[team] || null;
-      if (!k) return 0.5;                       // no clock for his game: the least-wrong single guess
-      const elapsed = now - Date.parse(k);
-      if (!Number.isFinite(elapsed)) return 0.5;
-      return Math.max(0, Math.min(1, 1 - elapsed / GAME_LEN_MS));
-    };
+    const remainOf = (sid) => remainingFor(kickoffByTeam[String(teamById.get(String(sid)) || '')] || null, now);
 
     const out = await pool(ids, 5, async (leagueId) => {
       const [league, users, rosters, ms] = await Promise.all([
