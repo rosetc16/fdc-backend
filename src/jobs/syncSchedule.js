@@ -38,6 +38,22 @@ export async function syncSchedule(opts = {}) {
     await q('ALTER TABLE nfl_schedule ADD COLUMN IF NOT EXISTS kickoff TIMESTAMPTZ');
   } catch (e) { log.error(e, 'syncSchedule: ensure table'); }
 
+  /* ⭐⭐⭐⭐⭐ SCRUB THE KICKOFFS b150 PROVED WERE PHANTOMS, BEFORE ANYTHING ELSE RUNS.
+     The parse fix in nflSchedule.js stops us storing a day as an instant, but it does nothing about the
+     season already sitting in the database — and the fix only reaches production data if the fetch below
+     happens to succeed. So the rows that CANNOT be real are cleared first, unconditionally, so a deploy
+     alone is enough to stop the lying clock even if every schedule source is down that night.
+     ⚠ EXACTLY MIDNIGHT UTC IS THE SIGNATURE, and it is a safe one to delete on: it is what
+     `new Date('2026-09-20')` produces, and no NFL game has ever kicked off at 00:00:00.000Z — Thursday and
+     Sunday night games are :15 and :20 past, afternoon games are on the hour in the afternoon. A game we
+     wrongly blank here is re-filled from the source minutes later; a phantom we leave reports half a
+     roster as finished before a ball is thrown. */
+  try {
+    const { rowCount } = await q(
+      "UPDATE nfl_schedule SET kickoff=NULL WHERE kickoff IS NOT NULL AND EXTRACT(EPOCH FROM kickoff)::bigint % 86400 = 0");
+    if (rowCount) log.warn({ season, cleared: rowCount }, 'syncSchedule: cleared midnight-UTC kickoffs (b150 date-only parse)');
+  } catch (e) { log.error(e, 'syncSchedule: midnight scrub'); }
+
   const { rows: had } = await q('SELECT count(*)::int AS n FROM nfl_schedule WHERE season=$1', [season]);
   const before = had[0].n;
 
@@ -100,10 +116,24 @@ export async function syncSchedule(opts = {}) {
   } else if (before > 0 && wrote === 0) {
     hints.push('Nothing was written and a schedule was already stored — the existing one is still in use.');
   }
+  /* ⭐⭐⭐⭐ THE NUMBER THAT WOULD HAVE CAUGHT b150 ON THE DAY IT SHIPPED. A schedule can be complete,
+     sane, 32 teams across 18 weeks, pass every check above — and carry no kickoff hour at all, which
+     turns "yet to play" into a guess and the weather forecast into the wrong hour. It was invisible for
+     three builds because nothing counted it. Now it is a hint, and a low one is an error-level log. */
+  const kcov = res.kickoffCoverage || { have: rows.filter((r) => r.kickoff).length, total: rows.length, ratio: 0 };
+  const kickoffPct = kcov.total ? Math.round((kcov.have / kcov.total) * 100) : 0;
+  if (usable && kickoffPct < 90) {
+    hints.push(`Only ${kickoffPct}% of games have a kickoff TIME (${kcov.have}/${kcov.total})`
+      + `${res.kickoffFill && res.kickoffFill.from ? `, after filling ${res.kickoffFill.filled} from "${res.kickoffFill.from}"` : ''}`
+      + '. Games with no hour read as "unknown" rather than being given a made-up one, so "yet to play"'
+      + ' falls back to the stats feed and the weather report is unavailable for them.');
+  }
 
   const detail = {
     season, games: games.length, rows: rows.length, wrote, hadBefore: before,
     teams: teamsSeen.size, weeks: weeksSeen.size,
+    kickoffs: { have: kcov.have, of: kcov.total, pct: kickoffPct },
+    ...(res.kickoffFill ? { kickoffFill: res.kickoffFill } : {}),
     byesFound: Object.keys(byes).length,
     ...(missing.length ? { missingTeams: missing.slice(0, 8) } : {}),
     sourceUsed: res.used,

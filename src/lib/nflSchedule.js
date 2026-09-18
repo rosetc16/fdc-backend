@@ -40,17 +40,95 @@ export function normTeam(t) {
    RECOGNISE a game record — it was simply never read off one. Every shape the parser accepts spells it
    differently, so this reads them all and returns an ISO string or null; a game with no readable time still
    stores fine and is simply skipped by anything that needs the hour. */
+/* ⭐⭐⭐⭐⭐ A DATE IS NOT A KICKOFF — b150, and this one line is the whole DJ Moore bug.
+   ==================================================================================================
+   Trey, three times now, and the third time after two fixes that both missed: "DJ Moore plays on Thursday,
+   but his game hasn't started yet (it's 12:21 AM). Because of that, he is showing up with a 0 projection
+   AND he isn't listed as left to play." Then: "players that are still scheduled to play today (but haven't
+   started) show that they are not on the 'left' column." Then: "the left to play is still not accurate and
+   games haven't started."
+
+   ⚠⚠ `new Date('2026-09-20')` IS MIDNIGHT UTC — 8pm Eastern the evening BEFORE. A payload that gives the
+     day of a game without its hour is not telling us when the game starts, and reading it as an instant
+     invents a kickoff that is thirteen to twenty hours early for every game on the slate. `gameState` then
+     does exactly what it is supposed to do with the time it was handed: 3.5 hours after that phantom
+     kickoff it says the game is OVER. Which means every player on Sunday's slate reads `done` from about
+     8:30pm Eastern on SATURDAY, and a Thursday-night starter reads `done` at 12:21 on Thursday morning —
+     which is the minute, to the minute, that Trey first reported.
+
+   ⭐⭐⭐ AND IT IS WHY b148 AND b149 BOTH FAILED. Both narrowed the rule that arbitrates between the stats
+     feed and the clock — and neither could help, because the clock itself was lying and it was lying in
+     the `done` direction, which is the branch where the feed never gets a say. Two correct fixes, applied
+     one layer downstream of the fault, is a pattern worth naming: when a fix does not move the symptom,
+     the next question is not "what else decides this" but "is the INPUT to the thing I fixed true".
+
+   ⚠ SO A VALUE WITHOUT A TIME OF DAY IS REFUSED, and a game with no readable hour stores with a NULL
+     kickoff — which every consumer already handles, says out loud (`scheduleMissing`), and degrades from
+     honestly. Refusing is not a loss of data: a kickoff that is seventeen hours wrong is worse than no
+     kickoff, because nothing downstream can tell that it is wrong. `fillKickoffs` below then goes and gets
+     the real hours from a source that publishes them. */
+const TIME_OF_DAY = /\d{1,2}:\d{2}/;
+export function hasTimeOfDay(v) {
+  if (v == null || v === '') return false;
+  // An epoch number is an instant by construction — there is no such thing as a date-only integer.
+  if (typeof v === 'number') return true;
+  return TIME_OF_DAY.test(String(v));
+}
+
 export function kickoffOf(node) {
   if (!node) return null;
   const cand = [node.date, node.kickoff, node.start_time, node.startTime, node.gameTime,
     node.competitions && node.competitions[0] && node.competitions[0].date];
   for (const c of cand) {
     if (c == null || c === '') continue;
+    // ⚠ b150 — "2026-09-20" parses perfectly and means midnight UTC. See the note above.
+    if (!hasTimeOfDay(c)) continue;
     // Sleeper gives epoch milliseconds; ESPN gives an ISO string.
     const d = typeof c === 'number' ? new Date(c) : new Date(String(c));
     if (!Number.isNaN(d.getTime()) && d.getUTCFullYear() > 2000) return d.toISOString();
   }
   return null;
+}
+
+/* ⭐⭐⭐⭐ HOW MUCH OF THE SCHEDULE WE CAN ACTUALLY PUT A CLOCK ON — b150.
+   With the refusal above, a source that publishes days rather than instants now yields a complete and
+   correct schedule with no kickoff times at all — which is the honest answer to "when does this start"
+   and the useless one for a page built around it. So coverage becomes a number the job reports and the
+   fill step below acts on, rather than a property nobody was measuring. */
+export function kickoffCoverage(records) {
+  const total = (records || []).length;
+  const have = (records || []).filter((r) => r && r.kickoff).length;
+  return { have, total, ratio: total ? have / total : 0 };
+}
+
+/* ⭐⭐⭐⭐⭐ FILL THE HOURS FROM WHOEVER PUBLISHES THEM — b150.
+   `trySources` stops at the first source that yields games, which is right for the schedule itself (two
+   sources disagreeing about an opponent is a corruption, not a merge) and wrong for the kickoff hour: the
+   hour is the same fact from whoever states it, and a source that has games but no times should be allowed
+   to borrow them from one that has both.
+
+   ⚠ MATCHED ON THE GAME, NOT ON POSITION IN THE LIST. The donor's ordering, count and week coverage are all
+     its own business; the only safe join key is the fixture itself. Home/away is not trusted to agree
+     between two unofficial feeds, so the pair is keyed unordered — a week plus two teams identifies an NFL
+     game uniquely, and if two feeds disagree about which side is home that is a separate (and much less
+     damaging) question than the kickoff hour.
+   ⚠ AND IT ONLY EVER FILLS A HOLE. A record that already carries a kickoff keeps it; the primary source
+     stays authoritative about everything it actually said. */
+export function mergeKickoffs(records, donors) {
+  const key = (r) => `${r.week}:${[r.home, r.away].sort().join('|')}`;
+  const times = new Map();
+  for (const d of donors || []) {
+    if (d && d.kickoff && d.week != null && d.home && d.away && !times.has(key(d))) times.set(key(d), d.kickoff);
+  }
+  let filled = 0;
+  const out = (records || []).map((r) => {
+    if (!r || r.kickoff) return r;
+    const t = times.get(key(r));
+    if (!t) return r;
+    filled++;
+    return { ...r, kickoff: t };
+  });
+  return { records: out, filled, donors: times.size };
 }
 
 // A game record carries these; metadata blocks in the same payloads carry at most one of them.
@@ -180,7 +258,29 @@ export function scheduleSourcesResolved(season) {
 // stub chain in lets the whole fetch → map → sanity-check → write path be exercised end to end. ESM exports
 // are live bindings and cannot be monkey-patched, so the seam has to be explicit.
 export async function fetchSchedule(season, sources) {
-  return trySources(sources || scheduleSourcesResolved(season));
+  const chain = sources || scheduleSourcesResolved(season);
+  const res = await trySources(chain);
+  /* ⭐⭐⭐⭐ THE SECOND PASS, WHICH EXISTS ONLY BECAUSE OF b150. If the winning source gave us games without
+     hours, ask the ones after it in the chain for hours alone. Best-effort throughout: a failed fill leaves
+     a correct schedule with null kickoffs, which every consumer already states rather than guesses at.
+     ⚠ The winner is never re-run and never overruled — `mergeKickoffs` only fills holes. */
+  const cov = kickoffCoverage(res.records);
+  if (!res.used || cov.ratio >= 0.9 || !res.records.length) return { ...res, kickoffCoverage: cov, kickoffFill: null };
+  const rest = chain.filter((s) => s.name !== res.used);
+  if (!rest.length) return { ...res, kickoffCoverage: cov, kickoffFill: null };
+  try {
+    const donor = await trySources(rest);
+    const m = mergeKickoffs(res.records, donor.records);
+    return {
+      ...res,
+      records: m.records,
+      attempts: [...res.attempts, ...donor.attempts.map((a) => ({ ...a, source: a.source + ' (kickoffs only)' }))],
+      kickoffCoverage: kickoffCoverage(m.records),
+      kickoffFill: { from: donor.used || null, filled: m.filled, before: cov.have, of: cov.total },
+    };
+  } catch {
+    return { ...res, kickoffCoverage: cov, kickoffFill: null };
+  }
 }
 
 // Turn game records into the per-team rows we store: two rows per game, one from each side.

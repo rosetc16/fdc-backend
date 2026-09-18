@@ -277,6 +277,44 @@ server = app.listen(config.port, () => {
       }
     } catch (e) { log.error(e, 'startup recovery failed'); }
   }, 10000);
+
+  /* ⭐⭐⭐⭐⭐ ALWAYS-ON: UNDO THE PHANTOM KICKOFFS — b150.
+     ================================================================================================
+     The parse fix stops us STORING a day as an instant. It does nothing whatever about the season
+     already in the database, and the nightly job that would overwrite it does not run for hours — so
+     without this the deploy that fixes the bug leaves the bug on screen until 4am, which for a fix to a
+     live in-season scoreboard is the same as not shipping it.
+
+     ⚠ THE SCRUB IS UNCONDITIONAL AND THE RE-FETCH IS NOT. Clearing a kickoff can only ever move a player
+       from a confidently wrong bucket into an honestly unknown one, so it needs no guard. Re-fetching
+       thirty-two teams' worth of schedule does need one, or every restart of every instance hits two
+       unofficial endpoints for a table that has not changed since July.
+     ⚠ AND IT IS NOT GUARDED BY AN `app_meta` FLAG. A one-shot flag would be exactly wrong here: the
+       question is not "have we run this before" but "is the schedule currently timed", and the answer can
+       go bad again on any night a source changes shape. Cheap to ask, so ask it every boot. */
+  setTimeout(async () => {
+    try {
+      const { q } = await import('./lib/db.js');
+      const scrub = await q(
+        "UPDATE nfl_schedule SET kickoff=NULL WHERE kickoff IS NOT NULL AND EXTRACT(EPOCH FROM kickoff)::bigint % 86400 = 0"
+      ).catch(() => null);
+      if (scrub && scrub.rowCount) {
+        log.warn({ cleared: scrub.rowCount }, 'startup b150: cleared midnight-UTC kickoffs — a date was being read as an instant');
+      }
+      const season = Number(config.activeSeason);
+      const cov = await q(
+        `SELECT count(*)::int AS total, count(kickoff)::int AS have FROM nfl_schedule WHERE season=$1`, [season]
+      ).catch(() => ({ rows: [] }));
+      const row = cov.rows && cov.rows[0];
+      if (!row || !row.total) return;                 // no schedule at all is syncSchedule's own business
+      const pct = row.have / row.total;
+      if (pct >= 0.9) return;
+      log.info({ season, have: row.have, of: row.total }, 'startup b150: schedule has games but few kickoff times — re-syncing once');
+      const { syncSchedule } = await import('./jobs/syncSchedule.js');
+      await withJobLock('startup:schedule150', () => syncSchedule({ season }));
+      log.info('startup b150: schedule re-sync complete');
+    } catch (e) { log.error(e, 'startup b150 schedule repair failed'); }
+  }, 15000);
 });
 
 // Long-running admin jobs (full refresh, harvest) run SYNCHRONOUSLY inside a request and can take minutes.

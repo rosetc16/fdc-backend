@@ -12,8 +12,9 @@
 // slate, and that a playoff bye — the single most decision-relevant thing this feature can surface — is
 // never quietly dropped.
 import assert from 'assert';
-import { mapSchedule, normTeam, teamsOf, weekOf, toTeamRows, byeWeeksFrom, scheduleSourcesResolved, TEAMS }
-  from '../src/lib/nflSchedule.js';
+import { mapSchedule, normTeam, teamsOf, weekOf, toTeamRows, byeWeeksFrom, scheduleSourcesResolved, TEAMS,
+  kickoffOf, hasTimeOfDay, mergeKickoffs, kickoffCoverage } from '../src/lib/nflSchedule.js';
+import { gameState } from '../src/lib/rooting.js';
 import { computePlayoffSos, playoffWeeks, sosBlurb } from '../src/lib/playoffSos.js';
 import { describeShape, findRecords, diagnoseEmpty } from '../src/lib/shapes.js';
 
@@ -282,4 +283,87 @@ const ok = (n) => { console.log('  PASS  ' + n); pass++; };
   ok('19 · ⭐ the shared walker counts $ref links instead of reporting an empty result');
 }
 
-console.log(`\n${pass}/20 playoff-SOS checks passed`);
+/* ---- 10. ⭐⭐⭐⭐⭐ A DATE IS NOT A KICKOFF — b150 -----------------------------------------------------------
+   This is the section that should have existed since 29h, and its absence is why one line of date parsing
+   survived two rounds of fixes aimed at the symptom it was causing. Section 2 above proved kickoffOf against
+   a payload WITH a full timestamp and a payload with NO date at all — the two easy cases — and never once
+   against the shape that actually breaks it: a day with no hour, which parses perfectly and means midnight
+   UTC. Every assertion here is Trey's bug stated as arithmetic. */
+{
+  // (a) The refusal itself, across the spellings a day can arrive in.
+  assert.strictEqual(hasTimeOfDay('2026-09-20'), false);
+  assert.strictEqual(hasTimeOfDay('09/20/2026'), false);
+  assert.strictEqual(hasTimeOfDay('2026-09-20T17:00Z'), true);
+  assert.strictEqual(hasTimeOfDay(1758150000000), true, 'an epoch integer is an instant by construction');
+  assert.strictEqual(kickoffOf({ date: '2026-09-20' }), null, 'a day must not become an instant');
+  assert.strictEqual(kickoffOf({ date: '09/20/2026' }), null);
+  assert.strictEqual(kickoffOf({ date: '2026-09-20T17:00Z' }), '2026-09-20T17:00:00.000Z');
+  // ⚠ And the refusal must not eat a REAL time that happens to sit later in the candidate list.
+  assert.strictEqual(kickoffOf({ date: '2026-09-20', kickoff: '2026-09-20T17:00:00Z' }), '2026-09-20T17:00:00.000Z',
+    'a day in the first field must fall through to a real timestamp in the second, not abort the search');
+  ok('21 · ⭐⭐⭐⭐⭐ a date with no time of day is REFUSED as a kickoff — b150, the DJ Moore bug');
+
+  /* (b) ⭐⭐⭐⭐⭐ TREY'S MOMENT, TO THE MINUTE, AS THE WHOLE PIPELINE SEES IT.
+     "DJ Moore plays on Thursday, but his game hasn't started yet (it's 12:21 AM)." A Sleeper-shaped record
+     for that Thursday night game, read the way the job reads it, then handed to the same `gameState` the
+     live route uses, at exactly that instant. Before b150 this asserted 'done' — which is the entire bug,
+     and which no test in this project could see because no fixture ever carried a date-only string. */
+  const tnf = { week: 3, date: '2026-09-17', home: 'CHI', away: 'DAL' };
+  const read = mapSchedule({ games: [tnf] });
+  assert.strictEqual(read.records.length, 1, 'the game must still STORE — refusing the hour is not dropping the game');
+  assert.strictEqual(read.records[0].kickoff, null);
+  const at1221am = Date.parse('2026-09-17T04:21:00Z');       // 12:21 AM US Eastern, Thursday
+  assert.strictEqual(gameState(read.records[0].kickoff, at1221am), 'unknown',
+    'with no hour the clock must say so; "unknown" lets the stats feed decide and leaves him yet to play');
+  // The counterfactual, stated so the regression is impossible to reintroduce quietly.
+  assert.strictEqual(gameState('2026-09-17T00:00:00.000Z', at1221am), 'done',
+    'this is what the phantom kickoff did, and why two fixes downstream of it could not help');
+  /* And the Sunday slate, which is the same fault at scale and in both directions: the phantom kickoff
+     makes every Sunday game "live" on Saturday EVENING and "finished" by Saturday midnight — so a person
+     checking his lineup on Sunday morning, hours before the 1pm slate, was told the whole week was over. */
+  assert.strictEqual(gameState('2026-09-20T00:00:00.000Z', Date.parse('2026-09-20T01:00:00Z')), 'live',
+    'a Sunday slate read as IN PROGRESS at 9pm Eastern on Saturday');
+  assert.strictEqual(gameState('2026-09-20T00:00:00.000Z', Date.parse('2026-09-20T14:00:00Z')), 'done',
+    'and as finished by 10am Eastern on Sunday, three hours before the first kickoff');
+  ok('22 · ⭐⭐⭐⭐⭐ at 12:21 AM Thursday a Thursday starter is NOT reported as finished');
+
+  // (c) Coverage is a measurement, so the job can say "complete schedule, no clocks" instead of nothing.
+  assert.deepStrictEqual(kickoffCoverage([{ kickoff: 'x' }, { kickoff: null }]), { have: 1, total: 2, ratio: 0.5 });
+  assert.strictEqual(kickoffCoverage([]).ratio, 0, 'an empty schedule is not 100% covered');
+  ok('23 · kickoff coverage is measured, so "32 teams, 18 weeks, no clocks" is a reportable state');
+
+  /* (d) ⭐⭐⭐ THE FILL. A source with games and no hours borrows hours from one that has both — matched on
+     the fixture, never on list position, and never overwriting what the winner actually said. */
+  const primary = [
+    { week: 1, home: 'KC', away: 'BAL', kickoff: null },
+    { week: 1, home: 'PHI', away: 'DAL', kickoff: '2026-09-11T00:20:00.000Z' },
+    { week: 2, home: 'SF', away: 'SEA', kickoff: null },
+  ];
+  const donor = [
+    // ⚠ Reversed home/away on purpose: two unofficial feeds disagreeing about which side is home must not
+    //   cost us the kickoff hour, which is the same fact either way.
+    { week: 1, home: 'BAL', away: 'KC', kickoff: '2026-09-07T17:00:00.000Z' },
+    { week: 1, home: 'PHI', away: 'DAL', kickoff: '1999-01-01T00:00:00.000Z' },
+    { week: 9, home: 'NYG', away: 'NYJ', kickoff: '2026-11-01T17:00:00.000Z' },
+  ];
+  const m = mergeKickoffs(primary, donor);
+  assert.strictEqual(m.filled, 1, 'exactly one hole was fillable');
+  assert.strictEqual(m.records[0].kickoff, '2026-09-07T17:00:00.000Z', 'the unordered pair must match');
+  assert.strictEqual(m.records[1].kickoff, '2026-09-11T00:20:00.000Z', 'a record that HAD a time keeps it');
+  assert.strictEqual(m.records[2].kickoff, null, 'a fixture the donor never mentioned stays unknown');
+  assert.strictEqual(m.records.length, 3, 'the fill must not add games the primary source did not have');
+  ok('24 · ⭐⭐⭐ kickoff hours are filled from a second source by fixture, never overwriting or inventing games');
+
+  /* (e) ⚠ AND THE ROLL DEPENDS ON THE SAME CLOCK, which is the second-order damage nobody would have traced
+     back. `weekFinished` reads those kickoffs: with midnight-UTC phantoms, the Monday night game reads as
+     four hours finished at midnight ET Sunday, so the app rolled to next week while MNF was still to be
+     played — and then asked the live route for a week with no stats in it. */
+  const mnfReal = '2026-09-22T00:15:00.000Z';               // 8:15pm ET Monday
+  const mnfPhantom = '2026-09-21T00:00:00.000Z';            // what "2026-09-21" parses to
+  const mondayMidnightEt = Date.parse('2026-09-21T04:00:00Z');
+  assert.strictEqual(gameState(mnfReal, mondayMidnightEt), 'pre', 'Monday night has not kicked off at midnight Monday');
+  assert.strictEqual(gameState(mnfPhantom, mondayMidnightEt), 'done', 'the phantom said it was already over');
+  ok('25 · ⭐⭐ the same phantom rolled the week forward before Monday night football had been played');
+}
+
+console.log(`\n${pass}/25 playoff-SOS checks passed`);
