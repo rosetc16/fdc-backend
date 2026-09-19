@@ -72,7 +72,29 @@ async function yGet(path, accessToken) {
     headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json', 'user-agent': UA },
   });
   if (res.status === 401) { const e = new Error('Yahoo session expired.'); e.status = 401; e.code = 'YAHOO_EXPIRED'; throw e; }
-  if (!res.ok) { const e = new Error(`Yahoo returned ${res.status}.`); e.status = 502; throw e; }
+  /* ⭐⭐⭐⭐ SAY WHAT HAPPENED, NOT WHAT THE PROTOCOL CALLED IT — b152. This used to surface as "Yahoo
+     returned 403." on the connect screen. Trey: "I don't want it to say 403 because no one knows what
+     that means." He is right, and the number was worse than useless here — it sat beside our own "No NFL
+     leagues on that Yahoo account for this season", so the screen offered a plausible wrong explanation
+     next to an unreadable right one, and the obvious conclusion was that the leagues were missing.
+     ⚠ BUT NOT "no leagues found" EITHER, which is what he suggested. A 403 is Yahoo refusing this
+       application access to the Fantasy API — usually because the developer app has not been provisioned
+       yet, which is a completely different thing to do about it than an empty account. Printing the
+       comfortable message would send the next person hunting for a league that was never the problem;
+       that is the same class of mistake as a fixture that cannot fail. Plain words, true cause, and the
+       status code kept in `detail` for a log or a bug report. */
+  if (res.status === 403) {
+    const e = new Error("Yahoo isn't allowing this app to read fantasy data yet. That's approval on Yahoo's side, not anything wrong with your account or your league.");
+    e.status = 502; e.code = 'YAHOO_NOT_APPROVED'; e.detail = 'HTTP 403 from the Yahoo Fantasy API'; throw e;
+  }
+  if (res.status === 429) {
+    const e = new Error('Yahoo is rate-limiting us right now. Give it a minute and try again.');
+    e.status = 502; e.code = 'YAHOO_RATE'; e.detail = 'HTTP 429 from the Yahoo Fantasy API'; throw e;
+  }
+  if (!res.ok) {
+    const e = new Error("Yahoo couldn't be reached just now. Try again in a moment.");
+    e.status = 502; e.code = 'YAHOO_UPSTREAM'; e.detail = `HTTP ${res.status} from the Yahoo Fantasy API`; throw e;
+  }
   return res.json();
 }
 
