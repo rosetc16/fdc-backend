@@ -448,3 +448,139 @@ export function parseStandings(json) {
     };
   }).filter((x) => x.teamKey);
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════════════
+   YAHOO TRANSACTIONS — b163
+   ───────────────────────────────────────────────────────────────────────────────────────────────────
+   Trey's activity feed named the Yahoo leagues it could not cover and skipped them. His own account is
+   mixed, so his feed was genuinely a league short every time he opened it.
+
+   ⭐⭐⭐⭐⭐ AND YAHOO PUBLISHES SOMETHING SLEEPER DOES NOT: PENDING AND REJECTED TRADES. Sleeper only
+     publishes a transaction once it has resolved, which is why both screens carry a sentence saying so —
+     it was the first thing Trey asked for and the one thing I had to tell him was impossible. Yahoo's
+     transaction resource carries `status` of `pending`, `accepted`, `rejected` or `successful`, so on a
+     Yahoo league the offer sitting in his inbox IS readable. The sentence about pending offers is
+     therefore PER PLATFORM from here on; printing Sleeper's limitation over a Yahoo league would be
+     false in the other direction.
+
+   ⚠⚠⚠⚠ I CANNOT REACH YAHOO FROM ANYWHERE THIS IS TESTED, so, exactly as with `parseRosters` and
+     `parseScoreboard` above, the parser is pure and its only instrument is a RECORDED-SHAPE fixture in
+     scripts/yahootx.test.js. Two pieces of Yahoo's ugliness are load-bearing and are in the fixture on
+     purpose:
+       · `transaction_data` is SOMETIMES A BARE OBJECT AND SOMETIMES AN ARRAY OF ONE. A parser that
+         handles only one of them silently drops half of every add/drop — the league then looks quiet
+         rather than broken, which is the failure this whole file exists to prevent.
+       · a player node is a nested array whose fields sit two levels down, so it needs `bag`, not a
+         property read.
+
+   ⚠ AND THE SAME "drops MEANS TWO THINGS" TRAP AS SLEEPER, IN YAHOO'S DIALECT. On an add/drop the
+     player leaving is a CUT; inside a trade the same shape means "gave up in the deal". Yahoo states it
+     unambiguously — `source_team_key` and `destination_team_key` are both present on a traded player —
+     so every side is reconstructed PER TEAM from those keys rather than from a give/get pair, which is
+     also why a three-team trade needs no special case here either.
+   ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* Yahoo's `status` vocabulary, mapped onto the one the screens already speak. */
+const YAHOO_STATUS = {
+  successful: 'complete', accepted: 'complete',
+  pending: 'pending', proposed: 'pending',
+  rejected: 'failed', vetoed: 'failed', cancelled: 'failed', canceled: 'failed',
+};
+
+/**
+ * One league's transactions, in the shape the activity feed already renders.
+ * @param {object} json      the raw Yahoo payload
+ * @param {object} opts      { slotOfTeamKey, slotNames, yourTeamKey, weekOf }
+ *                           `weekOf(ms)` maps a timestamp to an NFL week, or returns null.
+ */
+export function parseTransactions(json, opts = {}) {
+  const slotOf = opts.slotOfTeamKey || {};
+  const names = opts.slotNames || {};
+  const weekOf = typeof opts.weekOf === 'function' ? opts.weekOf : () => null;
+  const lg = json?.fantasy_content?.league;
+  const node = Array.isArray(lg) ? lg.find((x) => x && x.transactions) : (lg?.transactions ? lg : null);
+  const rows = list((node && node.transactions) || {});
+
+  return rows.map((row) => {
+    const raw = Array.isArray(row?.transaction) ? row.transaction : (row?.transaction ? [row.transaction] : [row]);
+    const head = bag(raw.filter((x) => x && !x.players));
+    if (!head.transaction_key && !head.transaction_id) return null;
+
+    const status = YAHOO_STATUS[String(head.status || '').toLowerCase()] || 'complete';
+    const at = head.timestamp ? Number(head.timestamp) * 1000 : null;
+    const kind = String(head.type || '').toLowerCase();
+    /* ⚠ "add", "drop" AND "add/drop" ARE ALL ONE MOVE FROM THE READER'S POINT OF VIEW, and which of the
+       three Yahoo calls it depends only on whether a corresponding cut happened in the same click. The
+       distinction that matters on the screen is waiver vs free agent, which is a different field. */
+    const isTrade = kind === 'trade';
+
+    const pNode = raw.find((x) => x && x.players);
+    const players = list((pNode && pNode.players) || {});
+    const sides = new Map();
+    const side = (teamKey) => {
+      const slot = slotOf[teamKey] != null ? slotOf[teamKey] : null;
+      if (slot == null) return null;
+      if (!sides.has(slot)) {
+        sides.set(slot, { rosterId: slot, teamName: names[slot] || `Team ${slot}`, ownerName: null,
+          isMe: opts.yourTeamKey ? teamKey === opts.yourTeamKey : false,
+          got: [], gave: [], picks: [], faabIn: 0, faabOut: 0 });
+      }
+      /* ⚠ `isMe` IS DECIDED ONCE, IN THE CONSTRUCTOR ABOVE, and re-deciding it here would be dead code:
+         `slotOfTeamKey` is one-to-one, so every visit to a slot arrives with the same team key and the
+         answer cannot change. I wrote that re-check first, with a comment about a three-team trade
+         overwriting the first visit — and the falsification proved it unreachable. A guard against a
+         failure the code cannot have is worse than no guard: it reads as a hazard that was considered
+         and handled, and the test beside it passes whatever happens. */
+      return sides.get(slot);
+    };
+
+    let waiver = false;
+    players.forEach((p) => {
+      const praw = Array.isArray(p?.player) ? p.player : (p?.player ? [p.player] : [p]);
+      const b = bag(praw);
+      /* ⚠ `transaction_data` IS SOMETIMES AN ARRAY OF ONE. Reading it as an object works on half of
+         Yahoo's replies and returns undefined on the other half, which drops the player silently. */
+      const tdNode = praw.find((x) => x && x.transaction_data);
+      const tdRaw = tdNode && tdNode.transaction_data;
+      const td = bag(Array.isArray(tdRaw) ? tdRaw : (tdRaw ? [tdRaw] : []));
+      const who = {
+        yahooId: b.player_id != null ? String(b.player_id) : null,
+        name: b.full || b.name_full || null,
+        pos: b.display_position || b.primary_position || null,
+        team: b.editorial_team_abbr ? String(b.editorial_team_abbr).toUpperCase() : null,
+      };
+      if (!who.name && !who.yahooId) return;
+      if (String(td.source_type || '').toLowerCase() === 'waivers') waiver = true;
+
+      const to = side(td.destination_team_key);
+      const from = side(td.source_team_key);
+      if (to) to.got.push(who);
+      if (from) from.gave.push(who);
+    });
+
+    /* FAAB rides on the transaction, not the player, and only exists where the league runs it. */
+    const bid = head.faab_bid != null && head.faab_bid !== '' ? Number(head.faab_bid) : null;
+
+    const teams = [...sides.values()].sort((a, b2) => a.rosterId - b2.rosterId);
+    if (!teams.length) return null;
+    return {
+      id: String(head.transaction_key || head.transaction_id),
+      type: isTrade ? 'trade' : waiver ? 'waiver' : 'free_agent',
+      status,
+      week: at ? weekOf(at) : null,
+      at,
+      mine: teams.some((t) => t.isMe),
+      teams,
+      bid: Number.isFinite(bid) ? bid : null,
+      note: status === 'pending' ? 'Waiting on a decision' : status === 'failed' ? "Didn't go through" : null,
+      platform: 'yahoo',
+    };
+  }).filter(Boolean).sort((a, b2) => (b2.at || 0) - (a.at || 0));
+}
+
+/** One league's transactions, fetched. */
+export async function yahooTransactions(leagueKey, accessToken, opts = {}) {
+  /* ⚠ `types` IS EXPLICIT so a commissioner edit does not arrive looking like a manager's move. */
+  const json = await yGet(`league/${leagueKey}/transactions;types=add,drop,trade`, accessToken);
+  return parseTransactions(json, opts);
+}

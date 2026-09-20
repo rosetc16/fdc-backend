@@ -42,7 +42,7 @@ import { importEspnPrivate } from '../lib/espnPrivate.js';
 import { mflLeague, mflPicks } from '../lib/mfl.js';
 import { fantraxLeagues, fantraxLeague, fantraxPicks } from '../lib/fantrax.js';
 import { yahooConfigured, yahooAuthUrl, yahooExchange, yahooRefresh, yahooMyLeagues, yahooLeague,
-  yahooRosters, yahooScoreboard, yahooStandings } from '../lib/yahoo.js';
+  yahooRosters, yahooScoreboard, yahooStandings, yahooTransactions } from '../lib/yahoo.js';
 import { buildYahooIndex, resolveRoster } from '../lib/yahooIds.js';
 
 export const connectRouter = Router();
@@ -2226,6 +2226,104 @@ connectRouter.get('/yahoo/league', async (req, res) => {
    ⚠ WHAT IS DELIBERATELY ABSENT: `trending` (Sleeper's add/drop feed is a Sleeper-population statistic
      and does not describe a Yahoo league) and `faabLeft`. Null rather than invented — the 29w rule.
    ⚠ AND YAHOO'S TERMS REQUIRE THE ATTRIBUTION, which rides on the payload so the screen can print it. */
+/* ═══════════════════════════════════════════════════════════════════════════════════════════════════
+   GET /api/connect/yahoo/transactions?league_keys=nfl.l.1,nfl.l.2   — b163
+   ───────────────────────────────────────────────────────────────────────────────────────────────────
+   ⭐ THE PAYLOAD IS THE SLEEPER ROUTE'S PAYLOAD, deliberately — the same decision 29ax made for
+     /yahoo/team-hub. The activity feed and the league's Recent activity tab already render this shape,
+     so a Yahoo league costs no new rendering code and a fix to either screen is a fix for both.
+
+   ⭐⭐⭐⭐⭐ BUT `pendingSupported` IS TRUE HERE, AND THAT IS NOT COSMETIC. Sleeper publishes a transaction
+     only once it has resolved; Yahoo carries `pending` and `rejected` ones. The screens say out loud
+     that pending offers cannot be read, which is TRUE OF SLEEPER AND FALSE OF YAHOO — so the claim
+     travels on the payload per platform rather than being written into the page. Printing Sleeper's
+     limitation over a Yahoo league would be a new false statement in the place the old one was fixed.
+
+   ⚠ ONE LEAGUE'S FAILURE MUST NOT EMPTY THE FEED. Each league is caught on its own and comes back with
+     an `error` string; a Yahoo token that expired mid-list should cost that league, not the other four.
+   ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+connectRouter.get('/yahoo/transactions', async (req, res) => {
+  const keys = String(req.query.league_keys || '').split(',').map((x) => x.trim()).filter(Boolean).slice(0, 20);
+  if (!keys.length) return res.status(400).json({ error: 'league_keys required' });
+  try {
+    const token = await yahooToken(req.user.id);
+    const nfl = await getNflState().catch(() => null);
+    const season = (nfl && nfl.season) || String(config.activeSeason);
+
+    /* A timestamp -> NFL week, from the schedule we already hold. ⚠ Yahoo dates a transaction and does
+       NOT week it, and the feed groups by week. Guessing from a fixed season start would be wrong every
+       year the calendar moves; with no schedule rows we say null rather than inventing one. */
+    let weekOf = () => null;
+    try {
+      const { rows: sched } = await q(
+        'SELECT week, MIN(kickoff) AS first FROM nfl_schedule WHERE season=$1 AND kickoff IS NOT NULL GROUP BY week ORDER BY week',
+        [Number(season)]);
+      const starts = sched.map((r) => ({ week: Number(r.week), at: new Date(r.first).getTime() }))
+        .filter((r) => Number.isFinite(r.at));
+      if (starts.length) {
+        weekOf = (ms) => {
+          let w = null;
+          /* The week a move belongs to is the last one whose games had already started — a Tuesday
+             waiver run belongs to the week that just began, not the one that just ended. */
+          for (const r of starts) { if (ms >= r.at - 3 * 24 * 3600 * 1000) w = r.week; }
+          return w;
+        };
+      }
+    } catch { /* no schedule: no opinion, and the date on the row carries it */ }
+
+    const leagues = await pool(keys, 3, async (leagueKey) => {
+      try {
+        /* ⚠ CACHED, because this is the expensive half. `yahooLeague` pulls settings, teams and draft
+           results, and the only thing this route needs from it is the team-key -> slot map. Without the
+           cache a five-league feed is five full league reads on every refresh of the screen. */
+        const meta = await cachedCall(`yl:${leagueKey}`, LEAGUE_TTL_MS, () => yahooLeague(leagueKey, token));
+        const items = await yahooTransactions(leagueKey, token, {
+          slotOfTeamKey: meta.slotOfTeamKey || {},
+          slotNames: meta.slotNames || {},
+          yourTeamKey: meta.yourTeamKey || null,
+          weekOf,
+        });
+        const myRosterId = meta.yourSlot != null ? meta.yourSlot : null;
+        /* ⚠ TRENDS COUNT WHAT HAPPENED, NOT WHAT WAS OFFERED. A pending trade is not a move anybody has
+           made yet, and counting it would rank a manager who proposes constantly and lands nothing as
+           the busiest in the league — the same mistake as folding a failed claim into "waivers". */
+        const settled = items.filter((x) => x.status !== 'pending');
+        /* ⭐⭐⭐⭐ WHETHER THE LEAGUE RUNS FAAB IS READ OFF THE MOVES, NOT GUESSED FROM A SETTING. Yahoo
+           exposes `uses_faab` in the league settings and I have no recorded payload to verify that node
+           against — and the cost of reading it wrong is a column of nulls pretending to be money, or a
+           real bid hidden. A bid on a transaction is direct evidence, needs no new parse, and cannot be
+           wrong in the dangerous direction: a waiver-priority league has no bids, so no bid column, and
+           a FAAB league with no claims in the window shows none either, which is also correct FOR THAT
+           WINDOW. ⚠ `budget` stays null — the remaining balance is per team and we have not read it, and
+           inventing 100 would be a number somebody would plan around. */
+        const faab = items.some((x) => Number.isFinite(x.bid) && x.bid > 0);
+        return {
+          leagueId: leagueKey, leagueName: meta.name || null,
+          myRosterId, ownerResolved: myRosterId != null,
+          faab, budget: null,
+          items,
+          trends: transactionTrends(settled, { myRosterId }),
+          platform: 'yahoo',
+        };
+      } catch (e) {
+        return { leagueId: leagueKey, leagueName: null, items: [], trends: null,
+          platform: 'yahoo', error: (e && e.message) || 'Could not read this league' };
+      }
+    });
+
+    res.json({
+      season,
+      leagues: leagues.filter(Boolean),
+      /* ⭐ THE HONEST FIELD, AND ON THIS PLATFORM IT IS THE GOOD NEWS. */
+      pendingSupported: true,
+      note: 'Yahoo publishes trades that are still waiting on a decision, and ones that were turned down.',
+      attribution: 'Fantasy data provided by Yahoo Fantasy.',
+    });
+  } catch (e) {
+    res.status(e && e.status === 401 ? 401 : 502).json({ error: (e && e.message) || 'Could not read Yahoo transactions' });
+  }
+});
+
 connectRouter.get('/yahoo/team-hub', async (req, res) => {
   const leagueKey = String(req.query.league_key || '').trim();
   if (!leagueKey) return res.status(400).json({ error: 'league_key required' });
