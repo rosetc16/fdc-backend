@@ -12,9 +12,10 @@ import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
-  getWeeklyProjections, getWeeklyStats, getTrendingAdds,
+  getWeeklyProjections, getWeeklyStats, getTrendingAdds, getTransactions,
 } from '../lib/sleeper.js';
 import { trendFor, auditFields } from '../lib/trending.js';
+import { rosterIndex, normalizeTransaction, transactionTrends } from '../lib/transactions.js';
 import { defaultWeek } from '../lib/weekpick.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
@@ -40,7 +41,9 @@ import { fetchEspnLeague, mapEspnLeague } from '../lib/espn.js';
 import { importEspnPrivate } from '../lib/espnPrivate.js';
 import { mflLeague, mflPicks } from '../lib/mfl.js';
 import { fantraxLeagues, fantraxLeague, fantraxPicks } from '../lib/fantrax.js';
-import { yahooConfigured, yahooAuthUrl, yahooExchange, yahooRefresh, yahooMyLeagues, yahooLeague } from '../lib/yahoo.js';
+import { yahooConfigured, yahooAuthUrl, yahooExchange, yahooRefresh, yahooMyLeagues, yahooLeague,
+  yahooRosters, yahooScoreboard, yahooStandings } from '../lib/yahoo.js';
+import { buildYahooIndex, resolveRoster } from '../lib/yahooIds.js';
 
 export const connectRouter = Router();
 connectRouter.use(requireAuth);
@@ -380,6 +383,63 @@ async function getRemainingSchedule(leagueId, season, fromWeek, toWeek) {
   return Object.keys(out).length ? out : null;
 }
 
+/* ⭐⭐⭐⭐⭐ THIS WEEK'S PROJECTIONS, KEYED BY SLEEPER PLAYER ID — extracted to module scope in b161.
+   ==================================================================================================
+   ⚠⚠ NOTHING IN HERE IS ABOUT SLEEPER *LEAGUES*. It is NFL-wide data — every player with a projection
+     this week, his opponent, his kickoff and his injury designation — and the only league-specific
+     input is the scoring function passed in. That is exactly why the Yahoo hub can reuse it: a Yahoo
+     league's rosters are resolved to Sleeper player ids (see lib/yahooIds.js) and from that point on
+     every in-season screen is reading the same numbers from the same source, whichever platform the
+     league came from.
+   ⚠ IT WAS INLINE IN /sleeper/team-hub AND COPYING IT WOULD HAVE BEEN THE 29y MISTAKE — two derivations
+     of "what is this player projected for this week", drifting apart the first time either is fixed.
+   ⚠ FAILS SOFT, DELIBERATELY. If the weekly call is unavailable the hub still renders and the frontend
+     falls back to its season-based estimate; an empty map is a degraded screen, an exception is no
+     screen at all. */
+async function weeklyProjectionMap({ season, week, ptsField, score }) {
+  const weekly = {};
+  try {
+    const wp = (await getWeeklyProjections(season, week)) || [];
+    for (const row of wp) {
+      const pid = row.player_id; if (!pid) continue;
+      const st = row.stats || {};
+      const position = (row.player && row.player.position) || null;
+      // Recompute with the league's real scoring; fall back to Sleeper's pre-summed field only if the
+      // raw-stat scoring couldn't run.
+      const custom = score(st, position);
+      const pts = custom != null ? custom : (st[ptsField] != null ? st[ptsField] : (st.pts_ppr != null ? st.pts_ppr : null));
+      const pl = row.player || {};
+      weekly[pid] = {
+        /* ⭐⭐⭐⭐ NAME AND POSITION RIDE ALONG — b132, and the reason the free-agent finder was empty.
+           This map is the ONLY complete list of "every NFL player with a projection this week". The
+           draft player pack is not: it is the draftable universe, and it drops anyone with neither an
+           ADP nor a season projection — which is the precise description of the waiver-wire pickup you
+           are looking for in October. My Week was intersecting the two, so its free-agent pool was the
+           draft board minus rostered players, and in a deep league that is close to nobody. Carrying
+           two extra strings here lets the page use THIS as its universe and the pack purely for
+           enrichment. Two strings on ~1,000 rows is a few tens of KB on a call that already ships the
+           whole league. */
+        name: pl.first_name || pl.last_name ? `${pl.first_name || ''} ${pl.last_name || ''}`.trim() : (pl.full_name || null),
+        pos: pl.position || null,
+        pts: pts != null ? Math.round(pts * 10) / 10 : null,
+        ptsPpr: st.pts_ppr != null ? Math.round(st.pts_ppr * 10) / 10 : null,
+        ptsHalf: st.pts_half_ppr != null ? Math.round(st.pts_half_ppr * 10) / 10 : null,
+        ptsStd: st.pts_std != null ? Math.round(st.pts_std * 10) / 10 : null,
+        opp: row.opponent || null,
+        team: row.team || (row.player && row.player.team) || null,
+        // Home/away if Sleeper provides it on the row (varies by season readiness). We check the common
+        // field names; when absent the frontend shows a neutral "vs". Also expose game_id, which Sleeper's
+        // schedule encodes, so we can resolve home/away later if needed.
+        home: (row.home != null ? !!row.home : (row.is_home != null ? !!row.is_home : (row.game && row.game.home ? row.game.home === (row.team) : null))),
+        gameId: row.game_id || null,
+        date: row.date || null,
+        inj: (row.player && row.player.injury_status) || null,
+      };
+    }
+  } catch { /* fails soft — see the header. The partial map so far is still better than nothing. */ }
+  return weekly;
+}
+
 // GET /api/connect/sleeper/team-hub?league_id=...[&week=N][&owner=username]
 //   -> { league:{cfg,name}, week, myRosterId, rostered:[ids], teams:[{rosterId,ownerName,teamName,players,
 //        starters,record,pointsFor,pointsAgainst}], matchup:{me,opp}|null, standings:[...] }
@@ -470,46 +530,7 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     // we already use. Build a per-player map: weekly points (in the league's scoring), opponent, game date,
     // and this week's injury status. Fails soft — if the weekly call is unavailable the hub still renders
     // (the frontend falls back to its season-based estimate).
-    let weekly = {};
-    try {
-      const wp = (await getWeeklyProjections(season, week)) || [];
-      for (const row of wp) {
-        const pid = row.player_id; if (!pid) continue;
-        const st = row.stats || {};
-        const position = (row.player && row.player.position) || null;
-        // Recompute with the league's real scoring; fall back to Sleeper's pre-summed field only if the
-        // raw-stat scoring couldn't run.
-        const custom = scoreFromSleeper(st, position);
-        const pts = custom != null ? custom : (st[ptsField] != null ? st[ptsField] : (st.pts_ppr != null ? st.pts_ppr : null));
-        const pl = row.player || {};
-        weekly[pid] = {
-          /* ⭐⭐⭐⭐ NAME AND POSITION RIDE ALONG — b132, and the reason the free-agent finder was empty.
-             This map is the ONLY complete list of "every NFL player with a projection this week". The
-             draft player pack is not: it is the draftable universe, and it drops anyone with neither an
-             ADP nor a season projection — which is the precise description of the waiver-wire pickup you
-             are looking for in October. My Week was intersecting the two, so its free-agent pool was the
-             draft board minus rostered players, and in a deep league that is close to nobody. Carrying
-             two extra strings here lets the page use THIS as its universe and the pack purely for
-             enrichment. Two strings on ~1,000 rows is a few tens of KB on a call that already ships the
-             whole league. */
-          name: pl.first_name || pl.last_name ? `${pl.first_name || ''} ${pl.last_name || ''}`.trim() : (pl.full_name || null),
-          pos: pl.position || null,
-          pts: pts != null ? Math.round(pts * 10) / 10 : null,
-          ptsPpr: st.pts_ppr != null ? Math.round(st.pts_ppr * 10) / 10 : null,
-          ptsHalf: st.pts_half_ppr != null ? Math.round(st.pts_half_ppr * 10) / 10 : null,
-          ptsStd: st.pts_std != null ? Math.round(st.pts_std * 10) / 10 : null,
-          opp: row.opponent || null,
-          team: row.team || (row.player && row.player.team) || null,
-          // Home/away if Sleeper provides it on the row (varies by season readiness). We check the common
-          // field names; when absent the frontend shows a neutral "vs". Also expose game_id, which Sleeper's
-          // schedule encodes, so we can resolve home/away later if needed.
-          home: (row.home != null ? !!row.home : (row.is_home != null ? !!row.is_home : (row.game && row.game.home ? row.game.home === (row.team) : null))),
-          gameId: row.game_id || null,
-          date: row.date || null,
-          inj: (row.player && row.player.injury_status) || null,
-        };
-      }
-    } catch { weekly = {}; }
+    const weekly = await weeklyProjectionMap({ season, week, ptsField, score: scoreFromSleeper });
 
     /* ⭐⭐⭐⭐ WHO IS ON BYE, FROM THE SCHEDULE RATHER THAN FROM A PLAYER COLUMN — b132.
        Trey: "Yes, I want this to be focused on bye weeks."
@@ -1533,6 +1554,114 @@ connectRouter.get('/sleeper/live', async (req, res) => {
   }
 });
 
+/* ⭐⭐⭐⭐⭐ WHAT HAPPENED IN EVERY CONNECTED LEAGUE — b161.
+   ==================================================================================================
+   GET /api/connect/sleeper/transactions?league_ids=a,b&owner=u1,u2&weeks=4
+
+   Trey wanted pending trades most of all, an aggregated view across leagues, and FAAB on every row.
+   Two of those three exist; the first does not, and the payload says so rather than leaving the screen
+   to infer it from an empty list. See the note at the head of lib/transactions.js — this route is the
+   plumbing and that file is the argument.
+
+   ⚠⚠ A SEASON OF ACTIVITY IS N HTTP CALLS, ONE PER WEEK, and that is the whole cost model of this
+     route. Sleeper has no "recent transactions" endpoint, so `weeks` is clamped hard: fifteen leagues
+     × eighteen weeks would be 270 upstream calls for one page load, which is how an app gets rate
+     limited into a half-loaded screen (the same reason `pool` exists two hundred lines up). The default
+     window is the last four weeks, which is what "recent" means to a manager, and the cache TTL is
+     generous because a transaction that has already resolved never changes again.
+   ⚠ THE PLAYER MAP IS THE EXPENSIVE PART AND IT IS FETCHED ONCE for all leagues — getAllPlayers is a
+     ~5MB document that lib/sleeper.js already caches. Resolving names per league would multiply that
+     by the number of leagues for no benefit whatsoever. */
+connectRouter.get('/sleeper/transactions', async (req, res) => {
+  const ids = String(req.query.league_ids || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 20);
+  if (!ids.length) return res.status(400).json({ error: 'league_ids required' });
+  const weeksBack = Math.min(18, Math.max(1, Number(req.query.weeks || 4) || 4));
+  try {
+    await ensureLinkCols();
+    const mineIds = new Set((await accountsFor(req.user.id, 'sleeper')).map((a) => a.id));
+    const { rows: urow } = await q('SELECT sleeper_user_id FROM users WHERE id=$1', [req.user.id]);
+    if (urow[0] && urow[0].sleeper_user_id) mineIds.add(urow[0].sleeper_user_id);
+    const hints = String(req.query.owner || '').split(',').map((s) => s.trim()).filter(Boolean);
+    for (const h of [...new Set(hints)]) {
+      try { const u = await getUser(h); if (u && u.user_id) mineIds.add(u.user_id); } catch { /* best-effort */ }
+    }
+
+    const nfl = await getNflState().catch(() => null);
+    const season = (nfl && nfl.season) || String(config.activeSeason);
+    let week = Number(req.query.week || 0);
+    if (!week || Number.isNaN(week)) {
+      const st = nfl && nfl.season_type;
+      week = (st && st !== 'regular' && st !== 'post') ? 1 : ((nfl && (nfl.display_week || nfl.week)) || 1);
+    }
+    week = Math.min(18, Math.max(1, week));
+    /* ⭐⭐⭐⭐ THE TUESDAY ROLL, HERE TOO — and scripts/wiring.test.js §4 is why it is here rather than
+       five builds from now. Sleeper's `display_week` keeps pointing at a week long after its last
+       whistle, so on a Tuesday the top of this window would be the FINISHED week and the look-back
+       would end one short — quietly missing exactly the waiver run that just processed, which is the
+       most interesting thing on this screen. Same guards as team-hub and /sleeper/live: an explicit
+       `?week=` is the caller driving and is obeyed, and no schedule rows means no opinion. */
+    if (!Number(req.query.week || 0)) {
+      try {
+        const { rows: kick } = await q(
+          'SELECT DISTINCT kickoff FROM nfl_schedule WHERE season=$1 AND week=$2 AND kickoff IS NOT NULL',
+          [Number(season), week]);
+        week = defaultWeek(week, kick.map((r) => r.kickoff));
+      } catch { /* no schedule: the platform's week stands */ }
+    }
+    const weeks = [];
+    for (let w = week; w > 0 && weeks.length < weeksBack; w--) weeks.push(w);
+
+    const players = await getAllPlayers().catch(() => ({}));
+
+    const leagues = await pool(ids, 4, async (leagueId) => {
+      const [league, users, rosters] = await Promise.all([
+        cachedCall(`l:${leagueId}`, LEAGUE_TTL_MS, () => getLeague(leagueId)),
+        cachedCall(`u:${leagueId}`, LEAGUE_TTL_MS, () => getLeagueUsers(leagueId)),
+        cachedCall(`r:${leagueId}`, LEAGUE_TTL_MS, () => getLeagueRosters(leagueId)),
+      ]);
+      let myRosterId = null;
+      (rosters || []).forEach((r) => { if (myRosterId == null && r.owner_id && mineIds.has(r.owner_id)) myRosterId = r.roster_id; });
+      const index = rosterIndex({ rosters, users, myRosterId });
+      /* ⚠ FAAB IS A LEAGUE SETTING, NOT A FIELD ON THE TRANSACTION. `waiver_type` 2 is FAAB; anything
+         else is waiver priority, where a bid column would be a column of nulls pretending to be data.
+         Trey's own sample league uses priority, which is exactly why this is checked rather than
+         assumed from the presence of `waiver_bid`. */
+      const st = (league && league.settings) || {};
+      const faab = Number(st.waiver_type) === 2 || Number(st.waiver_budget) > 0;
+      const rows = await pool(weeks, 3, (w) =>
+        cachedCall(`tx:${leagueId}:${w}`, LEAGUE_TTL_MS, () => getTransactions(leagueId, w)).catch(() => []));
+      const items = rows.flat()
+        .filter((x) => x && !x.error)
+        .map((tx) => normalizeTransaction(tx, { index, players, faab, myRosterId,
+          leagueId, leagueName: (league && league.name) || null }))
+        .filter(Boolean)
+        /* Newest first, and `at` can be null on a malformed row — sorting those to the end rather than
+           to the top, because an undated row at the head of a "recent activity" list is a lie. */
+        .sort((a, b) => (b.at || 0) - (a.at || 0));
+      return {
+        leagueId, leagueName: (league && league.name) || null,
+        myRosterId, ownerResolved: myRosterId != null,
+        faab, budget: faab ? (Number(st.waiver_budget) || 100) : null,
+        items,
+        trends: transactionTrends(items, { myRosterId }),
+      };
+    });
+
+    res.json({
+      season, week, weeks: weeks.slice().sort((a, b) => a - b),
+      leagues: leagues.filter(Boolean),
+      /* ⭐⭐⭐⭐⭐ THE HONEST FIELD. Sleeper publishes resolved transactions only: there is no pending
+         trade to read and a declined one leaves no trace. The screen prints this as a sentence instead
+         of showing an empty "Pending" section, which would say something false about the league. */
+      pendingSupported: false,
+      rejectedSupported: false,
+      note: 'Sleeper publishes transactions once they resolve. Pending offers and declined trades are not available through its API.',
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not reach Sleeper. Try again in a moment.' });
+  }
+});
+
 // 1) A user's leagues (so they can pick which one to connect)
 connectRouter.get('/sleeper/leagues', async (req, res) => {
   const username = String(req.query.username || '').trim();
@@ -2067,6 +2196,202 @@ connectRouter.get('/yahoo/my-leagues', async (req, res) => {
 connectRouter.get('/yahoo/league', async (req, res) => {
   try { res.json(await yahooLeague(req.query.league_key, await yahooToken(req.user.id))); }
   catch (e) { res.status(e.status || 502).json({ error: e.message, code: e.code || null }); }
+});
+
+/* ⭐⭐⭐⭐⭐ THE YAHOO IN-SEASON HUB — b161.
+   ==================================================================================================
+   GET /api/connect/yahoo/team-hub?league_key=nfl.l.12345[&week=N]
+
+   Trey: "I want to build Yahoo so that you can also get live roster recommendations, free agents,
+   league trends, etc. like we have for the in-season view for Sleeper."
+
+   ⭐⭐⭐⭐⭐ IT RETURNS THE SLEEPER TEAM-HUB'S PAYLOAD SHAPE, AND THAT IS THE WHOLE DESIGN. The in-season
+     screens are several thousand lines that have been corrected against his screenshots for months and
+     every one of them reads that one shape. Producing it here means Yahoo gets My Week, the matchup, the
+     free-agent finder, the trade finder, the league tab and the weekly review for free — and, more
+     importantly, means a fix to any of them is a fix for both platforms. A parallel Yahoo hub would be a
+     second implementation of every screen: the 29y one-number rule applied to a product surface.
+
+   ⭐ THE NFL-WIDE DATA IS SHARED VERBATIM. Projections, byes, defence-vs-position — none of that is
+     about Sleeper LEAGUES, it is about football, so `weeklyProjectionMap`, `byeTeamsForWeek` and
+     `getDefVsPos` are the same calls the Sleeper route makes. Only the league itself comes from Yahoo.
+
+   ⚠⚠ THE HARD PART IS IDENTITY AND IT IS REPORTED, NOT ASSUMED. Every screen is keyed by Sleeper player
+     id; Yahoo knows its own ids. lib/yahooIds.js bridges them through the `yahoo_id` Sleeper already
+     publishes on every player, with a name+position fallback. `idAudit` on the payload says how many
+     players mapped and names the ones that did not — because a roster that silently loses a quarter of
+     its players does not look broken, it looks short, and that is the failure this whole feature is one
+     mistake away from.
+
+   ⚠ WHAT IS DELIBERATELY ABSENT: `trending` (Sleeper's add/drop feed is a Sleeper-population statistic
+     and does not describe a Yahoo league) and `faabLeft`. Null rather than invented — the 29w rule.
+   ⚠ AND YAHOO'S TERMS REQUIRE THE ATTRIBUTION, which rides on the payload so the screen can print it. */
+connectRouter.get('/yahoo/team-hub', async (req, res) => {
+  const leagueKey = String(req.query.league_key || '').trim();
+  if (!leagueKey) return res.status(400).json({ error: 'league_key required' });
+  try {
+    const token = await yahooToken(req.user.id);
+    const meta = await yahooLeague(leagueKey, token);
+    const cfg = meta.cfg || {};
+
+    const nfl = await getNflState().catch(() => null);
+    const season = (nfl && nfl.season) || String(config.activeSeason);
+    const weekAsked = !!Number(req.query.week || 0);
+    let week = Number(req.query.week || 0);
+    if (!week || Number.isNaN(week)) {
+      const st = nfl && nfl.season_type;
+      week = (st && st !== 'regular' && st !== 'post') ? 1 : ((nfl && (nfl.display_week || nfl.week)) || 1);
+    }
+    week = Math.min(18, Math.max(1, week));
+    /* The same Tuesday roll every week-picking route applies — see the note on /sleeper/live and
+       scripts/wiring.test.js §4, which is what would have caught this being forgotten. */
+    if (!weekAsked) {
+      try {
+        const { rows: kick } = await q(
+          'SELECT DISTINCT kickoff FROM nfl_schedule WHERE season=$1 AND week=$2 AND kickoff IS NOT NULL',
+          [Number(season), week]);
+        week = defaultWeek(week, kick.map((r) => r.kickoff));
+      } catch { /* no schedule: the platform's week stands */ }
+    }
+
+    const [rosters, board, standingsRaw, allPlayers] = await Promise.all([
+      yahooRosters(leagueKey, token, week).catch(() => []),
+      yahooScoreboard(leagueKey, token, week).catch(() => []),
+      yahooStandings(leagueKey, token).catch(() => []),
+      getAllPlayers().catch(() => ({})),
+    ]);
+
+    const index = buildYahooIndex(allPlayers);
+    const slotOf = meta.slotOfTeamKey || {};
+    const standBy = new Map((standingsRaw || []).map((r) => [r.teamKey, r]));
+    const ptsByTeam = new Map();
+    (board || []).forEach((m) => (m.teams || []).forEach((t) => ptsByTeam.set(t.teamKey, t)));
+
+    const rostered = new Set();
+    const unresolvedAll = [];
+    let myRosterId = null;
+    let resolvedN = 0, totalN = 0;
+    const teams = (rosters || []).map((t) => {
+      /* ⚠ THE ROSTER ID IS YAHOO'S TEAM ORDER, not an invented index — `slotOfTeamKey` comes from the
+         same `league/{key}/teams` read that names them, so a roster id means the same thing on every
+         screen and across reloads. */
+      const rosterId = slotOf[t.teamKey] || null;
+      const { players, unresolved } = resolveRoster(index, t.players);
+      totalN += (t.players || []).length;
+      resolvedN += players.length;
+      unresolved.forEach((u) => unresolvedAll.push({ ...u, team: t.teamName }));
+      players.forEach((p) => rostered.add(String(p.sid)));
+      const st = standBy.get(t.teamKey) || {};
+      const live = ptsByTeam.get(t.teamKey) || {};
+      if (t.isMine && myRosterId == null) myRosterId = rosterId;
+      return {
+        rosterId,
+        ownerId: t.teamKey,
+        ownerName: t.teamName || 'Team',
+        teamName: t.teamName || 'Team',
+        players: players.map((p) => String(p.sid)),
+        /* ⚠ YAHOO'S "IR" IS A SLOT, NOT A SEPARATE ARRAY, so reserve is derived from the slot rather
+           than from a field that does not exist. The union still has to be complete or a man on IR
+           gets offered back to the league as the best free agent in football (the b123 lesson). */
+        reserve: players.filter((p) => p.slot === 'IR').map((p) => String(p.sid)),
+        taxi: [],
+        keepers: [],
+        starters: players.filter((p) => p.starting).map((p) => String(p.sid)),
+        setStarters: players.filter((p) => p.starting).map((p) => String(p.sid)),
+        weekPoints: live.points != null ? Number(live.points) : null,
+        matchupId: null,
+        record: { wins: st.wins || 0, losses: st.losses || 0, ties: st.ties || 0 },
+        pointsFor: st.pointsFor != null ? Number(st.pointsFor) : 0,
+        pointsAgainst: st.pointsAgainst != null ? Number(st.pointsAgainst) : 0,
+      };
+    }).filter((t) => t.rosterId != null);
+
+    /* The week's matchup pairing, in the shape the hub reads: my side and my opponent's. */
+    let matchup = null;
+    const teamByRoster = new Map(teams.map((t) => [t.rosterId, t]));
+    if (myRosterId != null) {
+      const mine = (board || []).find((m) => (m.teams || []).some((x) => slotOf[x.teamKey] === myRosterId));
+      if (mine) {
+        const oppT = (mine.teams || []).find((x) => slotOf[x.teamKey] !== myRosterId);
+        const oppId = oppT ? slotOf[oppT.teamKey] : null;
+        matchup = {
+          me: teamByRoster.get(myRosterId) || null,
+          opp: oppId != null ? (teamByRoster.get(oppId) || null) : null,
+        };
+      }
+    }
+
+    const scoring = (cfg.scoring || {});
+    const rec = Number(scoring.rec) || 0;
+    const ptsField = rec >= 0.75 ? 'pts_ppr' : rec >= 0.25 ? 'pts_half_ppr' : 'pts_std';
+    const weekly = await weeklyProjectionMap({
+      season, week, ptsField,
+      score: (stats, position) => scoreStatsFor(stats, position, { rec }),
+    });
+
+    let byeTeams = null, byeTeamsNext = null;
+    try {
+      const { rows: sch } = await q('SELECT team, week FROM nfl_schedule WHERE season=$1', [Number(season)]);
+      byeTeams = byeTeamsForWeek(sch, week);
+      byeTeamsNext = week < 18 ? byeTeamsForWeek(sch, week + 1) : null;
+    } catch { byeTeams = null; byeTeamsNext = null; }
+
+    let matchupDifficulty = {};
+    try { matchupDifficulty = (await getDefVsPos(season, week)) || {}; } catch { matchupDifficulty = {}; }
+
+    const standings = (standingsRaw || []).map((r) => ({
+      rosterId: slotOf[r.teamKey] || null,
+      teamName: r.teamName,
+      ownerName: r.teamName,
+      rank: r.rank,
+      record: { wins: r.wins, losses: r.losses, ties: r.ties },
+      pointsFor: r.pointsFor,
+      pointsAgainst: r.pointsAgainst,
+    })).filter((r) => r.rosterId != null).sort((a, b) => (a.rank || 99) - (b.rank || 99));
+
+    res.json({
+      platform: 'yahoo',
+      leagueName: meta.name,
+      cfg,
+      week, defaultWeek: week, minWeek: 1, maxWeek: 18, season,
+      scoringField: ptsField,
+      seasonType: nfl ? nfl.season_type : null,
+      myRosterId,
+      linked: true,
+      ownerResolved: myRosterId != null,
+      ownerHint: null,
+      byeTeams, byeTeamsNext,
+      rostered: Array.from(rostered),
+      /* Sleeper's add/drop feed describes the Sleeper population, not this league. Null, not invented. */
+      trending: null, trendAudit: null,
+      teams,
+      matchup,
+      medianScoring: false, medianProjected: null,
+      standings,
+      playoffStartWeek: 15,
+      regularSeasonWeeks: 14,
+      playoffTeams: null,
+      faabBudget: null, faabLeft: null,
+      schedule: null,
+      weekly,
+      matchupDifficulty,
+      /* ⚠⚠ THE CENSUS IS THE POINT — see lib/yahooIds.js. A Yahoo hub that silently drops a quarter of
+         every roster looks thin rather than broken, so the numbers are on the payload and the first ten
+         names that did not map are named. This is the instrument the next person will need. */
+      idAudit: {
+        players: totalN, resolved: resolvedN,
+        rate: totalN ? Math.round((resolvedN / totalN) * 100) : null,
+        withYahooId: index.stats.withYahooId, poolSize: index.stats.total,
+        unresolved: unresolvedAll.slice(0, 10),
+      },
+      /* ⚠ YAHOO HAS NO LIVE DRAFT FEED and no pending-trade resource; both are stated rather than left
+         for the screen to infer from an empty section. */
+      liveSync: false,
+      attribution: 'Fantasy data provided by Yahoo Fantasy.',
+    });
+  } catch (e) {
+    res.status(e.status || 502).json({ error: e.message || 'Could not reach Yahoo.', code: e.code || null });
+  }
 });
 
 /* ---- The two we are not building, and why -------------------------------------------------------

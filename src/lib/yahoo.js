@@ -142,6 +142,67 @@ export async function yahooMyLeagues(accessToken) {
 
 const POS = (p) => ({ QB: 'QB', RB: 'RB', WR: 'WR', TE: 'TE', K: 'K', DEF: 'DST' })[String(p || '').toUpperCase()] || null;
 
+/* ⭐⭐⭐⭐⭐ YAHOO'S DRAFT RESULTS CARRY NO NAMES, AND THAT IS A SHIPPED BUG — b161.
+   ==================================================================================================
+   `draftresults` returns `{ pick, round, team_key, player_key }` and nothing else. The draft room places
+   an incoming pick by looking its NAME up in the player pool (`nameToId[normName(pk.name)]`) — our ids
+   are Sleeper's, so the name is the only identifier a Yahoo league and our pool have in common. Until
+   now `yahooLeague` set `name: null` on every pick and nothing filled it in, which means a completed
+   Yahoo league imported as a tidy list of 180 picks, every one of them unresolvable, and the board
+   filled with holes WHILE REPORTING A HEALTHY IMPORT.
+
+   ⚠⚠ THAT IS EXACTLY THE FAILURE lib/playerIds.js WAS WRITTEN TO PREVENT — for MFL and Fantrax, which
+     both publish a bulk directory. Yahoo does not, so it was skipped, and the same bug shipped in the
+     platform the directory file's own header warns about. "No sync is visibly manual, whereas this looks
+     connected right up until you notice the picks are missing."
+
+   ⭐ YAHOO'S ANSWER IS A BULK KEY LOOKUP: `league/{key}/players;player_keys=a,b,c` takes up to 25 keys a
+     call, so a 12×15 draft is eight requests rather than the hundreds a paginated crawl of the whole
+     player universe would need. Fetched once per import, not once per pick.
+   ⚠ A FAILED LOOKUP MUST NOT TAKE THE PICKS WITH IT — the same rule playerIds.js states. A batch that
+     errors leaves those picks name-less, which is today's behaviour, rather than failing the import. */
+const YAHOO_KEY_BATCH = 25;
+export async function yahooPlayerNames(leagueKey, playerKeys, accessToken) {
+  const keys = [...new Set((playerKeys || []).map((k) => String(k || '').trim()).filter(Boolean))];
+  const out = new Map();
+  for (let i = 0; i < keys.length; i += YAHOO_KEY_BATCH) {
+    const chunk = keys.slice(i, i + YAHOO_KEY_BATCH);
+    let j = null;
+    try {
+      j = await yGet(`league/${leagueKey}/players;player_keys=${chunk.join(',')}`, accessToken);
+    } catch { continue; }                    // this batch is nameless; the rest still resolve
+    parsePlayerBag(j).forEach((v, k) => out.set(k, v));
+  }
+  return out;
+}
+
+/* The pure half, so it can be tested against a recorded Yahoo payload without a network call.
+   ⚠ KEYED BOTH WAYS — by the full `nfl.p.12345` player_key and by the bare id — because `draftresults`
+     hands back a key while a roster entry is read for its id, and one map serving both callers is how
+     the two cannot disagree about who a player is. */
+export function parsePlayerBag(json) {
+  const out = new Map();
+  const root = json?.fantasy_content?.league;
+  const node = Array.isArray(root) ? root.find((x) => x && x.players) : (root && root.players ? root : null);
+  const players = (node && node.players) || root?.[1]?.players || {};
+  list(players).forEach((p) => {
+    const b = bag(p);
+    if (!b.player_key) return;
+    /* Yahoo's name node is `{ full, first, last, ascii_first, ascii_last }`; `bag` flattens it, so
+       `full` is already at the top level. The fallback is for a shape that only carries the parts. */
+    const full = b.full || [b.first, b.last].filter(Boolean).join(' ') || null;
+    if (!full) return;
+    const rec = {
+      name: full,
+      pos: POS(b.display_position || b.primary_position) || null,
+      team: b.editorial_team_abbr ? String(b.editorial_team_abbr).toUpperCase() : null,
+    };
+    out.set(String(b.player_key), rec);
+    out.set(String(b.player_key).split('.').pop(), rec);
+  });
+  return out;
+}
+
 export async function yahooLeague(leagueKey, accessToken) {
   const key = String(leagueKey || '').trim();
   if (!key) { const e = new Error('A Yahoo league key is required.'); e.status = 400; throw e; }
@@ -181,26 +242,48 @@ export async function yahooLeague(leagueKey, accessToken) {
 
   const slotNames = {};
   const slotOfTeamKey = {};
+  /* ⭐⭐⭐⭐⭐ WHICH OF THESE TWELVE IS HIS — b161, and `yourSlot` has been null since this was written.
+     Yahoo marks the signed-in user's team with `is_owned_by_current_login: 1` in the teams collection,
+     so the answer is already in a payload we were fetching and discarding. ⚠ WITHOUT IT EVERY
+     IN-SEASON SCREEN IS DARK: "which roster is mine" is the question My Week, the matchup, the trade
+     finder and the roster tab are all built on — the exact fault b132 documented for Sleeper, where a
+     league you could see but that could not see YOU dropped silently out of every personalised view. */
+  let yourSlot = null;
+  let yourTeamKey = null;
   list(teamsJson?.fantasy_content?.league?.[1]?.teams || {}).forEach((t, i) => {
     const b = bag(t);
     if (!b.team_key) return;
     const slot = i + 1;
     slotOfTeamKey[b.team_key] = slot;
     slotNames[slot] = b.name || `Team ${slot}`;
+    if (yourSlot == null && (Number(b.is_owned_by_current_login) === 1 || b.is_owned_by_current_login === '1')) {
+      yourSlot = slot; yourTeamKey = b.team_key;
+    }
   });
 
-  const picks = list(draftJson?.fantasy_content?.league?.[1]?.draft_results || {})
+  const rawPicks = list(draftJson?.fantasy_content?.league?.[1]?.draft_results || {})
     .map((d) => bag(d))
     .filter((d) => d.player_key)
-    .sort((a, b) => (Number(a.pick) || 0) - (Number(b.pick) || 0))
-    .map((d) => ({
+    .sort((a, b) => (Number(a.pick) || 0) - (Number(b.pick) || 0));
+  /* ⭐ THE NAMES, IN BULK. Without this every pick is unresolvable in the draft room — see
+     `yahooPlayerNames`. A lookup that fails leaves the name null, which is the old behaviour, rather
+     than failing the whole import. */
+  const names = rawPicks.length
+    ? await yahooPlayerNames(key, rawPicks.map((d) => d.player_key), accessToken).catch(() => new Map())
+    : new Map();
+  const picks = rawPicks.map((d) => {
+    const hit = names.get(String(d.player_key)) || null;
+    return {
       overall: Number(d.pick) || null,
       round: Number(d.round) || null,
       slot: slotOfTeamKey[d.team_key] || null,
       player_id: String(d.player_key).split('.').pop(),
-      name: null,
+      name: hit ? hit.name : null,
+      pos: hit ? hit.pos : null,
+      team: hit ? hit.team : null,
       keeper: false,
-    }));
+    };
+  });
 
   const cfg = {
     name: lg.name || `Yahoo league ${lg.league_id || ''}`.trim(),
@@ -220,8 +303,8 @@ export async function yahooLeague(leagueKey, accessToken) {
     cfg, teams,
     draftType: String(st.draft_type || '').toLowerCase() === 'auction' ? 'auction' : 'snake',
     status: String(lg.draft_status || '') === 'postdraft' ? 'complete' : picks.length ? 'drafting' : 'pre_draft',
-    yourSlot: null,
-    slotNames, tradedPicks: [], keepers: [], existingRosters: null,
+    yourSlot, yourTeamKey,
+    slotNames, slotOfTeamKey, tradedPicks: [], keepers: [], existingRosters: null,
     picks,
     /* ⚠ NO LIVE DRAFT. Yahoo's draft room is a separate real-time client with no public streaming or push
        endpoint; `draftresults` is a post-hoc resource and polling it during a live draft is neither
@@ -229,4 +312,139 @@ export async function yahooLeague(leagueKey, accessToken) {
     liveSync: false,
     attribution: 'Fantasy data provided by Yahoo Fantasy.',
   };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════════════
+   THE IN-SEASON SIDE — b161
+   ───────────────────────────────────────────────────────────────────────────────────────────────────
+   Trey: "I want to build Yahoo so that you can also get live roster recommendations, free agents, league
+   trends, etc. like we have for the in-season view for Sleeper."
+
+   ⭐⭐⭐⭐⭐ THE DESIGN DECISION IS THAT THERE IS NO YAHOO HUB. The in-season screens — My Week, the
+     matchup, free agents, the trade finder, the league tab, the weekly review — are several thousand
+     lines that have been corrected against Trey's screenshots for months, and every one of them reads
+     ONE payload shape: the Sleeper team-hub's. So these functions exist to produce THAT SHAPE from
+     Yahoo's data. A parallel Yahoo hub would be a second implementation of every screen and a second
+     place for each of those fixes to be re-learned; the 29y one-number rule, applied to a whole product
+     surface rather than to a number.
+
+   ⚠⚠ WHICH MEANS THE HARD PART IS IDENTITY, NOT DATA. Every one of those screens is keyed by SLEEPER
+     PLAYER ID, because that is what our projection pack is keyed by. Yahoo hands back its own ids and
+     its own names. See lib/yahooIds.js for the bridge and why it prefers an id over a name.
+
+   ⚠ THE FETCHES ARE SPLIT FROM THE PARSING on purpose. Yahoo's JSON is an array pretending to be an
+     object (see `bag`), the shapes are undocumented, and this app cannot reach Yahoo from its test
+     environment at all — so the parsers take a recorded payload and are tested against it, and the
+     fetchers are three lines each with nothing in them to get wrong.
+   ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* Every team's roster for a week, in ONE call. Yahoo allows `teams/roster` as a sub-resource, which is
+   the difference between 1 request and 12 — and at 12 the rate limiter starts to matter on a Sunday. */
+export async function yahooRosters(leagueKey, accessToken, week) {
+  const wk = Number(week) > 0 ? `;week=${Number(week)}` : '';
+  return parseRosters(await yGet(`league/${leagueKey}/teams/roster${wk}/players`, accessToken));
+}
+export async function yahooScoreboard(leagueKey, accessToken, week) {
+  const wk = Number(week) > 0 ? `;week=${Number(week)}` : '';
+  return parseScoreboard(await yGet(`league/${leagueKey}/scoreboard${wk}`, accessToken));
+}
+export async function yahooStandings(leagueKey, accessToken) {
+  return parseStandings(await yGet(`league/${leagueKey}/standings`, accessToken));
+}
+
+/* One team's roster → { teamKey, teamName, slot?, isMine, players:[{yahooId,name,pos,team,slot,starting}] }
+   ⚠ `selected_position` IS THE SLOT HE IS IN THIS WEEK, and "BN" / "IR" are slots like any other. A
+     starter is anyone NOT in one of those, which is the same rule the Sleeper side applies to an empty
+     slot: read the layout, do not guess from the position he plays. */
+export function parseRosters(json) {
+  const teams = list(json?.fantasy_content?.league?.[1]?.teams || json?.fantasy_content?.league?.teams || {});
+  return teams.map((t) => {
+    const b = bag(t);
+    const players = list(bag(b.roster || {}).players || {}).map((p) => {
+      const raw = Array.isArray(p && p.player) ? p.player : ((p && p.player) ? [p.player] : [p]);
+      const pb = bag(raw);
+      if (!pb.player_key) return null;
+      /* ⚠⚠ READ `selected_position` OFF ITS OWN NODE, NOT THROUGH bag(). It is
+         `[{coverage_type},{position}]`, so the flattener lifts a bare `position` to the top level where
+         it sits beside `display_position` and `primary_position` — three fields with similar names, one
+         of which means something completely different (the slot he is in this week versus the position
+         he plays). Reading the flattened one made EVERY player a starter, because the slot was never
+         "BN". Same trap as `roster_position.count` in yahooLeague, thirty lines up. */
+      const spNode = raw.find((x) => x && x.selected_position);
+      const sp = spNode ? bag(spNode.selected_position) : {};
+      const slot = String(sp.position || '').toUpperCase() || null;
+      return {
+        yahooId: String(pb.player_key).split('.').pop(),
+        playerKey: String(pb.player_key),
+        name: pb.full || [pb.first, pb.last].filter(Boolean).join(' ') || null,
+        pos: POS(pb.display_position || pb.primary_position) || null,
+        team: pb.editorial_team_abbr ? String(pb.editorial_team_abbr).toUpperCase() : null,
+        slot,
+        starting: !!slot && slot !== 'BN' && slot !== 'IR',
+        /* Yahoo's own injury designation, which is the one thing here our own feed cannot always beat:
+           it is the league's view of the player, and it is what the manager sees in his own app. */
+        status: pb.status || null,
+      };
+    }).filter(Boolean);
+    return {
+      teamKey: b.team_key || null,
+      teamName: b.name || null,
+      isMine: Number(b.is_owned_by_current_login) === 1 || b.is_owned_by_current_login === '1',
+      players,
+    };
+  }).filter((t) => t.teamKey);
+}
+
+/* The week's matchups → [{ week, teams:[{teamKey, points, projected}] }].
+   ⚠ `team_points` AND `team_projected_points` ARE DIFFERENT NODES with the same inner shape, and `bag`
+     flattens both into one object — so the second silently overwrites the first. They are read off the
+     raw team node instead, which is the whole reason this parser does not use `bag` for the points. */
+export function parseScoreboard(json) {
+  const lg = json?.fantasy_content?.league;
+  const sb = (Array.isArray(lg) ? lg.find((x) => x && x.scoreboard) : lg?.scoreboard ? lg : null);
+  const matchups = list(bag((sb && sb.scoreboard) || {}).matchups || {});
+  return matchups.map((m) => {
+    const mb = (m && m.matchup) || m;
+    const teams = list(bag(mb || {}).teams || {}).map((t) => {
+      const raw = Array.isArray(t?.team) ? t.team : (t?.team ? [t.team] : [t]);
+      const b = bag(raw);
+      const pts = raw.find((x) => x && x.team_points);
+      const proj = raw.find((x) => x && x.team_projected_points);
+      return {
+        teamKey: b.team_key || null,
+        teamName: b.name || null,
+        points: pts && pts.team_points && pts.team_points.total != null ? Number(pts.team_points.total) : null,
+        projected: proj && proj.team_projected_points && proj.team_projected_points.total != null
+          ? Number(proj.team_projected_points.total) : null,
+      };
+    }).filter((x) => x.teamKey);
+    const b = bag(mb || {});
+    return { week: Number(b.week) || null, teams };
+  }).filter((x) => x.teams.length);
+}
+
+/* Records and season points → [{ teamKey, teamName, wins, losses, ties, pointsFor, pointsAgainst, rank }] */
+export function parseStandings(json) {
+  const lg = json?.fantasy_content?.league;
+  const node = Array.isArray(lg) ? lg.find((x) => x && x.standings) : (lg?.standings ? lg : null);
+  const teams = list(bag((node && node.standings) || {}).teams || {});
+  return teams.map((t) => {
+    const raw = Array.isArray(t?.team) ? t.team : (t?.team ? [t.team] : [t]);
+    const b = bag(raw);
+    /* ⚠ `team_standings` CARRIES ITS OWN `rank` AND A NESTED `outcome_totals`. Flattening the whole team
+       node would put the roster's `rank` (if any) and the standings `rank` in the same slot, so the
+       standings node is located and read on its own. */
+    const stNode = raw.find((x) => x && x.team_standings);
+    const st = bag((stNode && stNode.team_standings) || {});
+    return {
+      teamKey: b.team_key || null,
+      teamName: b.name || null,
+      rank: Number(st.rank) || null,
+      wins: Number(st.wins) || 0,
+      losses: Number(st.losses) || 0,
+      ties: Number(st.ties) || 0,
+      pointsFor: st.points_for != null ? Number(st.points_for) : null,
+      pointsAgainst: st.points_against != null ? Number(st.points_against) : null,
+    };
+  }).filter((x) => x.teamKey);
 }

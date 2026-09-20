@@ -149,6 +149,13 @@ export const getLeague = (leagueId) => getJson(`/league/${leagueId}`);
 export const getLeagueRosters = (leagueId) => getJson(`/league/${leagueId}/rosters`);
 // Current NFL state (season, week, etc.) — used to know which week's matchups to pull.
 export const getNflState = () => getJson(`/state/nfl`);
+/* ⭐⭐⭐⭐ EVERY TRANSACTION THAT RESOLVED IN A GIVEN WEEK — b161.
+   ⚠⚠ THE PATH SEGMENT IS THE WEEK ("leg"), NOT AN OFFSET OR A PAGE. There is no "recent transactions"
+     endpoint: a season's activity is fetched one week at a time and stitched together by the caller.
+     ⚠ AND IT ONLY EVER RETURNS RESOLVED ROWS. Nothing here is pending and nothing here was rejected —
+       see the long note at the top of lib/transactions.js, which is the whole reason the feature that
+       reads this cannot be the feature Trey asked for. */
+export const getTransactions = (leagueId, week) => getJson(`/league/${leagueId}/transactions/${week}`);
 // A league's matchups for a given week (each roster's starters, points, matchup pairing).
 export const getMatchups = (leagueId, week) => getJson(`/league/${leagueId}/matchups/${week}`);
 
