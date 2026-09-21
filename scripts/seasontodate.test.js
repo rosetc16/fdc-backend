@@ -81,4 +81,29 @@ const r = addWeek({}, [null, { stats: { gp: 1 } }, row(1, 'WR', null)]);
 assert.equal(Object.keys(r).length, 0);
 ok('rows with no id or no stats are skipped rather than crashing the walk');
 
-console.log(`\n${n} passed`);
+// ---- b165: the read WAITS for a cold build, and concurrent callers share it ---------------------------
+{
+  const { getSeasonToDate } = await import('../src/lib/seasonToDate.js');
+  let calls = 0;
+  /* A slow, fake Sleeper: 120 players who each played, 40ms per week. No database — every q() fails and is
+     caught, which is exactly the path a cold cache takes. */
+  const fetchWeek = async (wk) => { calls++; await new Promise((r) => setTimeout(r, 40));
+    return Array.from({ length: 120 }, (_, i) => row(`p${i}`, 'WR', { gp: 1, rec: 5, rec_yd: 60 + wk })); };
+  const t0 = Date.now();
+  const [a, b2] = await Promise.all([
+    getSeasonToDate(2099, 4, { wait: 5000, fetchWeek }),
+    getSeasonToDate(2099, 4, { wait: 5000, fetchWeek }),
+  ]);
+  assert.ok(!a.warming && Object.keys(a.players).length === 120, 'first caller waited for the build');
+  ok('⭐⭐⭐⭐⭐ b165 — a cold cache WAITS for the build instead of answering "projections only"', `${Object.keys(a.players).length} players, ${Date.now() - t0}ms`);
+  assert.ok(!b2.warming && Object.keys(b2.players).length === 120, 'second caller got the same table');
+  assert.equal(calls, 3);
+  ok('⭐⭐⭐⭐⭐ two callers at once share ONE build — 3 weekly fetches for weeks 1-3, not 6, and neither gets "warming"', `${calls} fetches`);
+  assert.equal(a.players.p7.gp, 3);
+  ok('the waited-for table is the real accumulation (3 games through week 3)');
+  const slow = async () => { await new Promise((r) => setTimeout(r, 400)); return []; };
+  const c = await getSeasonToDate(2098, 3, { wait: 50, fetchWeek: slow });
+  assert.equal(c.warming, true);
+  ok('and the wait is BOUNDED — past it, the answer is an honest "warming", never a hang');
+  console.log(`\n${n} passed`);
+}

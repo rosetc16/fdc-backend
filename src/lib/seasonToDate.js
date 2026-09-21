@@ -73,11 +73,13 @@ export function addWeek(acc, rows) {
   return acc;
 }
 
-async function compute(season, throughWeek) {
+/* `fetchWeek` is injectable for the test — production always uses Sleeper's weekly actuals. */
+async function compute(season, throughWeek, fetchWeek) {
+  const get = fetchWeek || ((wk) => getWeeklyStats(season, wk, { positions: POSITIONS }));
   const acc = {};
   for (let wk = 1; wk <= throughWeek; wk++) {
     let rows = [];
-    try { rows = (await getWeeklyStats(season, wk, { positions: POSITIONS })) || []; } catch { rows = []; }
+    try { rows = (await get(wk)) || []; } catch { rows = []; }
     addWeek(acc, rows);
   }
   /* A slate this thin means the feed failed rather than that nobody played. Refuse to cache it, so a
@@ -87,7 +89,7 @@ async function compute(season, throughWeek) {
 
 // Public read: the table through the last COMPLETED week. Cache-only; kicks a background warm on a miss
 // and returns {} (which the client reads as "projections only") rather than making a hub load wait.
-export async function getSeasonToDate(season, currentWeek) {
+export async function getSeasonToDate(season, currentWeek, opts = {}) {
   const throughWeek = Math.max(0, Number(currentWeek || 1) - 1);
   if (throughWeek < 1) return { throughWeek: 0, players: {} };
   const key = `${season}:${throughWeek}`;
@@ -100,25 +102,38 @@ export async function getSeasonToDate(season, currentWeek) {
       return { throughWeek, players: rows[0].table_json };
     }
   } catch { /* fall through */ }
-  warmSeasonToDate(season, currentWeek).catch(() => {});
+  /* ⭐⭐⭐⭐ b165 — WAIT FOR IT, BOUNDED. b164 answered a cold cache with `players: {}` and warmed in the
+     background, so the first load after a new week showed PROJECTIONS ONLY and a later load showed blended
+     values. Trey priced a trade on one and checked the result on the other, and the whole league had been
+     re-valued underneath him: "it told me I wouldn't move... then I made the trade and I dropped 3 spots."
+     The calculator was right both times; the ground moved. This endpoint is fetched in the background by
+     the hub — nothing renders waiting on it — so it can afford to finish the job: up to `wait` ms for the
+     build (about one Sleeper call per completed week), and only then fall back to the warming answer. */
+  const build = warmSeasonToDate(season, currentWeek, opts).catch(() => ({}));
+  if (opts.wait > 0) {
+    const t = await Promise.race([build, new Promise((r) => setTimeout(() => r(null), opts.wait))]);
+    if (t && Object.keys(t).length) return { throughWeek, players: t };
+  }
   return { throughWeek, players: {}, warming: true };
 }
 
-const warming = new Set();
-export async function warmSeasonToDate(season, currentWeek) {
+/* In-flight builds by key. ⚠ A MAP OF PROMISES, NOT A SET — b165. A Set could only say "someone is already
+   building" and hand the second caller `{}`, so two hubs opening together meant one got blended values and
+   the other got projections. Now every caller for the same week waits on the same build. */
+const inflight = new Map();
+export async function warmSeasonToDate(season, currentWeek, opts = {}) {
   const throughWeek = Math.max(0, Number(currentWeek || 1) - 1);
   if (throughWeek < 1) return {};
   const key = `${season}:${throughWeek}`;
-  if (warming.has(key)) return {};
-  warming.add(key);
-  try {
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
     await ensureTable();
     try {
       const { rows } = await q('SELECT table_json FROM season_to_date WHERE season=$1 AND through_week=$2', [season, throughWeek]);
       if (rows[0] && rows[0].table_json) { memo = { key, table: rows[0].table_json, at: Date.now() }; return rows[0].table_json; }
     } catch { /* compute */ }
     let table = null;
-    try { table = await compute(season, throughWeek); } catch { table = null; }
+    try { table = await compute(season, throughWeek, opts.fetchWeek); } catch { table = null; }
     if (table) {
       try {
         await q(
@@ -131,7 +146,7 @@ export async function warmSeasonToDate(season, currentWeek) {
       memo = { key, table, at: Date.now() };
     }
     return table || {};
-  } finally {
-    warming.delete(key);
-  }
+  })();
+  inflight.set(key, p);
+  try { return await p; } finally { inflight.delete(key); }
 }

@@ -471,8 +471,9 @@ connectRouter.get('/season-to-date', async (req, res) => {
         week = defaultWeek(week, kick.map((r) => r.kickoff));
       } catch { /* no schedule: the platform's week stands */ }
     }
-    const out = await getSeasonToDate(season, week);
-    res.set('Cache-Control', 'private, max-age=600');
+    const out = await getSeasonToDate(season, week, { wait: 12000 });
+    /* A warming answer must not be cached by the browser, or the next load re-serves "projections only". */
+    res.set('Cache-Control', out.warming ? 'no-store' : 'private, max-age=600');
     res.json({ season, week, ...out });
   } catch (e) {
     res.status(500).json({ error: 'Could not load season-to-date stats' });
