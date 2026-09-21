@@ -12,13 +12,14 @@ import { q } from '../lib/db.js';
 import {
   getUser, getUserLeagues, getLeague, getLeagueDrafts, getLeagueUsers, getLeagueRosters,
   getDraft, getDraftPicks, getDraftTradedPicks, getAllPlayers, getNflState, getMatchups,
-  getWeeklyProjections, getWeeklyStats, getTrendingAdds, getTransactions,
+  getWeeklyProjections, getWeeklyStats, getTrendingAdds, getTransactions, getLeagueTradedPicks,
 } from '../lib/sleeper.js';
 import { trendFor, auditFields } from '../lib/trending.js';
 import { rosterIndex, normalizeTransaction, transactionTrends } from '../lib/transactions.js';
 import { defaultWeek } from '../lib/weekpick.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
 import { getSeasonToDate } from '../lib/seasonToDate.js';
+import { futurePicks } from '../lib/futurePicks.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
 
 /* ⭐⭐⭐⭐ "vs KC" OR "@ KC", AND IT IS EXPORTED SO IT CAN BE TESTED — b147.
@@ -503,11 +504,13 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     }
 
     // Pull league, its users (owners), rosters, and NFL state in parallel.
-    const [league, users, rosters, nfl] = await Promise.all([
+    const [league, users, rosters, nfl, tradedPicksRaw] = await Promise.all([
       getLeague(leagueId),
       getLeagueUsers(leagueId),
       getLeagueRosters(leagueId),
       getNflState().catch(() => null),
+      /* b166 — future pick ownership for the trade calculator; see lib/futurePicks.js. Best-effort. */
+      getLeagueTradedPicks(leagueId).catch(() => null),
     ]);
     if (!league) return res.status(404).json({ error: 'League not found on Sleeper' });
 
@@ -831,9 +834,13 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       );
     } catch { trending = null; trendAudit = null; }
 
+    let picksInfo = { enabled: false, seasons: [], rounds: 0, picks: [] };
+    try { picksInfo = futurePicks({ league, rosters, traded: tradedPicksRaw, season }); } catch { /* the hub works without picks */ }
     res.json({
       leagueName: league.name,
       cfg,
+      /* b166 — { enabled, seasons, rounds, picks:[{season, round, originalRosterId, ownerRosterId}] } */
+      futurePicks: picksInfo,
       week,
       defaultWeek: week,   // the current/upcoming week the hub should open on
       minWeek: 1,

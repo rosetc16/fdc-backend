@@ -147,6 +147,8 @@ export const getUserLeagues = (userId, season) => getJson(`/user/${userId}/leagu
 export const getLeagueUsers = (leagueId) => getJson(`/league/${leagueId}/users`);
 export const getLeague = (leagueId) => getJson(`/league/${leagueId}`);
 export const getLeagueRosters = (leagueId) => getJson(`/league/${leagueId}/rosters`);
+/* b166 — every future pick that has changed hands: { season, round, roster_id (original), owner_id (now) }. */
+export const getLeagueTradedPicks = (leagueId) => getJson(`/league/${leagueId}/traded_picks`);
 // Current NFL state (season, week, etc.) — used to know which week's matchups to pull.
 export const getNflState = () => getJson(`/state/nfl`);
 /* ⭐⭐⭐⭐ EVERY TRANSACTION THAT RESOLVED IN A GIVEN WEEK — b161.
