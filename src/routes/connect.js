@@ -18,6 +18,7 @@ import { trendFor, auditFields } from '../lib/trending.js';
 import { rosterIndex, normalizeTransaction, transactionTrends } from '../lib/transactions.js';
 import { defaultWeek } from '../lib/weekpick.js';
 import { getDefVsPos } from '../lib/defVsPos.js';
+import { getSeasonToDate } from '../lib/seasonToDate.js';
 import { byeTeamsForWeek } from '../lib/nflSchedule.js';
 
 /* ⭐⭐⭐⭐ "vs KC" OR "@ KC", AND IT IS EXPORTED SO IT CAN BE TESTED — b147.
@@ -443,6 +444,41 @@ async function weeklyProjectionMap({ season, week, ptsField, score }) {
 // GET /api/connect/sleeper/team-hub?league_id=...[&week=N][&owner=username]
 //   -> { league:{cfg,name}, week, myRosterId, rostered:[ids], teams:[{rosterId,ownerName,teamName,players,
 //        starters,record,pointsFor,pointsAgainst}], matchup:{me,opp}|null, standings:[...] }
+/* ⭐⭐⭐⭐ GET /api/connect/season-to-date?week=N — b164.
+   Every player's summed ACTUAL stat line across weeks 1..N-1, plus games played, NFL-wide. The client
+   blends it with the season projection so trade values and power rankings move with what players are
+   actually doing (see lib/seasonToDate.js and the client's src/form.js).
+   ⚠ NOT LEAGUE-SPECIFIC ON PURPOSE: raw stats, keyed by Sleeper id, scored on the client with each
+     league's own settings — so one cached answer serves every league on every platform (Yahoo reaches it
+     through the same id bridge the Yahoo hub already uses).
+   ⚠ CACHE-ONLY: a miss returns `players: {}` with `warming: true` and the client falls back to pure
+     projections for that load, saying so, rather than holding the hub up for a nine-call walk. */
+connectRouter.get('/season-to-date', async (req, res) => {
+  try {
+    const nfl = await getNflState().catch(() => null);
+    const season = Number((nfl && nfl.season) || config.activeSeason);
+    const asked = Number(req.query.week);
+    let week = Number.isFinite(asked) && asked >= 1 ? Math.min(19, Math.floor(asked))
+      : Number((nfl && (nfl.display_week || nfl.week)) || 1);
+    /* ⚠ THE TUESDAY ROLL (b143), required of every week-picking route by scripts/wiring.test.js §4. Only
+       when no week was asked for — the hub always sends one, but a default that silently lags a week is
+       exactly the bug that rule exists to stop. */
+    if (!(Number.isFinite(asked) && asked >= 1)) {
+      try {
+        const { rows: kick } = await q(
+          'SELECT DISTINCT kickoff FROM nfl_schedule WHERE season=$1 AND week=$2 AND kickoff IS NOT NULL',
+          [season, week]);
+        week = defaultWeek(week, kick.map((r) => r.kickoff));
+      } catch { /* no schedule: the platform's week stands */ }
+    }
+    const out = await getSeasonToDate(season, week);
+    res.set('Cache-Control', 'private, max-age=600');
+    res.json({ season, week, ...out });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not load season-to-date stats' });
+  }
+});
+
 connectRouter.get('/sleeper/team-hub', async (req, res) => {
   const leagueId = String(req.query.league_id || '').trim();
   if (!leagueId) return res.status(400).json({ error: 'league_id required' });

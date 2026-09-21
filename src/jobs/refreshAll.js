@@ -60,6 +60,19 @@ export async function refreshAll() {
       clearPlayerPackCache(); clearSosMemo();
     } catch { /* the caches expire on their own; this only makes it immediate */ }
   } catch (e) { log.error(e, 'refreshAll: defVsPos'); out.defVsPos = { error: String((e && e.message) || e) }; }
+  /* ⭐ b164 — SEASON-TO-DATE ACTUALS, warmed nightly so the first hub load after a week completes already
+     has them (the read path is cache-only and would otherwise serve pure projections for one load).
+     Wrapped like the two above: not load-bearing enough to fail a refresh. */
+  try {
+    const { warmSeasonToDate } = await import('../lib/seasonToDate.js');
+    const { getNflState } = await import('../lib/sleeper.js');
+    const { config } = await import('../lib/config.js');
+    const nfl = await getNflState().catch(() => null);
+    const season = Number((nfl && nfl.season) || config.activeSeason);
+    const week = Number((nfl && (nfl.display_week || nfl.week)) || 1);
+    const t = await warmSeasonToDate(season, week);
+    out.seasonToDate = { season, throughWeek: Math.max(0, week - 1), players: Object.keys(t || {}).length };
+  } catch (e) { log.error(e, 'refreshAll: seasonToDate'); out.seasonToDate = { error: String((e && e.message) || e) }; }
   // Published ADP gives broad, clean veteran coverage immediately; harvested drafts refine specific
   // buckets. Both are observations the consensus step blends — published must land before consensus.
   try { out.publishedAdp = await syncPublishedAdp(); } catch (e) { out.publishedAdp = { error: e.message }; log.error(e); }
