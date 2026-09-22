@@ -629,7 +629,16 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       const taxi = Array.isArray(r.taxi) ? r.taxi : [];
       players.concat(reserve, taxi).forEach((pid) => { if (pid != null) rostered.add(String(pid)); });
       const m = matchupByRoster.get(r.roster_id);
-      const starters = (m && Array.isArray(m.starters)) ? m.starters : (Array.isArray(r.starters) ? r.starters : []);
+      const starters0 = (m && Array.isArray(m.starters)) ? m.starters : (Array.isArray(r.starters) ? r.starters : []);
+      /* ⚠ b168 — A STARTER WHO IS NO LONGER ON THE ROSTER IS AN EMPTY SLOT, for any week not yet finished.
+         Trey: "last week I traded Ja'Marr Chase and Jeremiyah Love for Lamar Jackson, Bucky Irving, and Ladd
+         McConkey... I'm seeing ALL of those players on my team for the 'matchup' screen." Sleeper seeds the new
+         week's matchup `starters` from the old lineup, so the two men he traded away were still in it while
+         the three he received sat on the bench. A finished week keeps its lineup as played (that is history);
+         the current and future weeks are read against who is actually on the team now. */
+      const onTeam = new Set(players.concat(reserve, taxi).filter((x) => x != null).map(String));
+      const weekOpen = !(nfl && Number(nfl.display_week || nfl.week) > week);
+      const starters = weekOpen ? starters0.map((x) => (x != null && String(x) !== '0' && !onTeam.has(String(x)) ? '0' : x)) : starters0;
       (starters || []).forEach((pid) => { if (pid != null && pid !== '0') rostered.add(String(pid)); });
       const s = r.settings || {};
       if (myRosterId == null && r.owner_id && mineIds.has(r.owner_id)) myRosterId = r.roster_id;
@@ -841,6 +850,9 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       cfg,
       /* b166 — { enabled, seasons, rounds, picks:[{season, round, originalRosterId, ownerRosterId}] } */
       futurePicks: picksInfo,
+      /* b168 — the slot list, so an EMPTY starting slot ('0') still has a position. Trey lost both his QBs
+         to injury and My Week recommended no QB; a hole needs to know what shape it is. */
+      rosterPositions: (league.roster_positions || []).filter(Boolean),
       week,
       defaultWeek: week,   // the current/upcoming week the hub should open on
       minWeek: 1,
@@ -1068,6 +1080,17 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
       const complete = C.complete;
 
       const lm = lineupMisses(rosterPositions, mine.starters, roster, ptsOf, posOf, nameOf);
+      const startSlots = rosterPositions.filter((x) => !/^(BN|IR|TAXI)$/i.test(String(x)));
+      const lineOf = (row) => {
+        if (!row || !Array.isArray(row.starters)) return null;
+        const pts = row.players_points || {};
+        return row.starters.map((sid, i) => {
+          const empty = sid == null || String(sid) === '0';
+          const v = empty ? null : pts[String(sid)];
+          return { slot: startSlots[i] || '', sid: empty ? null : String(sid), name: empty ? null : nameOf(sid), pos: empty ? null : posOf(sid),
+            pts: Number.isFinite(Number(v)) ? Math.round(Number(v) * 100) / 100 : null };
+        });
+      };
       const oppId = opponentByRoster[String(myRosterId)];
       const oppPts = oppId != null ? pointsByRoster[oppId] : null;
       const myPts = pointsByRoster[String(myRosterId)];
@@ -1100,7 +1123,10 @@ connectRouter.get('/sleeper/season-review', async (req, res) => {
           // Named, so the page can say WHO it is waiting on rather than just that it is waiting.
           waitingOn: C.waitingOn,
           optimal: lm.optimal, actual: lm.actual, left: lm.left, exact: lm.exact, pending: lm.pending,
-          misses: lm.misses.slice(0, 6) } });
+          misses: lm.misses.slice(0, 6),
+          /* b168 — both starting lineups, slot by slot, for the result hover. Trey: "When I hover the
+             'result' on this, can you show the side by side of both teams and what we scored." */
+          lineup: lineOf(mine), oppLineup: lineOf(oppRow) } });
     }
 
     /* The opponent's own average has to be computed across the WHOLE season before any week's verdict can
