@@ -18,7 +18,12 @@ export function futurePicks({ league, rosters, traded, season, years = 3 }) {
   const s = (league && league.settings) || {};
   const type = Number(s.type || 0);
   const list = Array.isArray(traded) ? traded.filter((t) => t && t.season != null && t.round != null) : [];
-  const enabled = type === 1 || type === 2 || list.length > 0;
+  /* ⚠ b167 — ONLY A FUTURE PICK IS PROOF. Trey: "I'm looking at a re-draft league and there are still draft
+     picks (it's not eligible to trade draft picks)." Sleeper keeps traded-pick rows for drafts that have
+     ALREADY HAPPENED (this season's, traded before draft day), so "any traded pick" was true for plenty of
+     redraft leagues. A redraft league qualifies only if a pick in a draft that is still to come has moved. */
+  const future = list.filter((t) => Number(t.season) > Number(season));
+  const enabled = type === 1 || type === 2 || future.length > 0;
   if (!enabled) return { enabled: false, seasons: [], rounds: 0, picks: [] };
   /* Dynasty rookie drafts are short; Sleeper's `draft_rounds` is the NEXT draft's length. A startup-sized
      number in a dynasty league would be the startup draft, which never repeats — cap at 5 for type 2. */

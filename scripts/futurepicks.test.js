@@ -43,6 +43,11 @@ const r1 = futurePicks({ league: { settings: { type: 0, draft_rounds: 15 } }, ro
 assert.equal(r1.enabled, true);
 ok('a league with any traded pick has pick trading, whatever its type says');
 
+// ---- b167: a redraft league whose only traded pick is THIS season's (already drafted) has no pick trading
+const r2 = futurePicks({ league: { settings: { type: 0, draft_rounds: 15 } }, rosters, traded: [{ season: '2026', round: 3, roster_id: 2, owner_id: 4 }], season: '2026' });
+assert.equal(r2.enabled, false); assert.equal(r2.picks.length, 0);
+ok('⭐⭐⭐⭐⭐ a redraft league whose traded pick is from a draft already held offers no picks (Trey\'s redraft league)');
+
 // ---- junk is ignored ------------------------------------------------------------------------------------
 const j = futurePicks({ league: { settings: { type: 1, draft_rounds: 2 } }, rosters, traded: [null, { season: '2031', round: 1, roster_id: 2, owner_id: 3 }], season: '2026' });
 assert.equal(j.picks.length, 3 * 2 * 4);
