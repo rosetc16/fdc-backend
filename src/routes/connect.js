@@ -398,6 +398,30 @@ async function getRemainingSchedule(leagueId, season, fromWeek, toWeek) {
    ⚠ FAILS SOFT, DELIBERATELY. If the weekly call is unavailable the hub still renders and the frontend
      falls back to its season-based estimate; an empty map is a degraded screen, an exception is no
      screen at all. */
+/* b169 — the three weeks after this one, never past the regular season's last week. Pure, so the shaping
+   can be tested without Sleeper (scripts/weekahead.test.js). */
+export function weeksAfter(week, last = 18, n = 3) {
+  const w = week == null || week === '' ? NaN : Number(week);
+  if (!Number.isFinite(w) || w < 1) return [];
+  return Array.from({ length: n }, (_, i) => w + i + 1).filter((x) => x >= 1 && x <= last);
+}
+/* [{ pid: {pts, opp} }, ...] (one map per week, in week order) → { pid: [[pts, opp] | null, ...] }.
+   ⚠ A PLAYER WITH NO PROJECTION IN A WEEK KEEPS HIS SLOT AS null rather than shifting the others along:
+     the array is read positionally against `weeksNext`, so a missing bye week must not slide week 12's
+     number into week 11's column. */
+export function packNextWeeks(maps, weeks) {
+  const out = {};
+  (maps || []).forEach((m, i) => {
+    Object.keys(m || {}).forEach((pid) => {
+      const r = m[pid];
+      if (!r || r.pts == null) return;
+      if (!out[pid]) out[pid] = (weeks || []).map(() => null);
+      out[pid][i] = [r.pts, r.opp || null];
+    });
+  });
+  return out;
+}
+
 async function weeklyProjectionMap({ season, week, ptsField, score }) {
   const weekly = {};
   try {
@@ -571,6 +595,21 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
     // and this week's injury status. Fails soft — if the weekly call is unavailable the hub still renders
     // (the frontend falls back to its season-based estimate).
     const weekly = await weeklyProjectionMap({ season, week, ptsField, score: scoreFromSleeper });
+
+    /* ⭐⭐⭐⭐⭐ b169 — THE NEXT THREE WEEKS, SO A PICKUP IS NOT JUDGED ON ONE SUNDAY. Trey: "It might also be
+       helpful to see the next 3 weeks and how they project comparatively to ensure it's not just a one week
+       thing... This is particularly important for defenses for matchups."
+       Compact on purpose: `{ [player_id]: [[pts, opp], [pts, opp], [pts, opp]] }` for the three weeks after
+       this one, in THIS league's scoring, with the opponent so a streaming defence can be read as a schedule.
+       ⚠ FAILS SOFT AND COSTS NOTHING EXTRA IN PRACTICE: the projection feed is fetched per (season, week) and
+         cached upstream, so eleven leagues in the same week share three calls. A week past the end of the
+         season simply returns nothing and the field is shorter. */
+    const nextWeeks = weeksAfter(week);
+    let weeklyNext = {};
+    try {
+      const maps = await Promise.all(nextWeeks.map((w) => weeklyProjectionMap({ season, week: w, ptsField, score: scoreFromSleeper })));
+      weeklyNext = packNextWeeks(maps, nextWeeks);
+    } catch { /* the hover just shows this week */ }
 
     /* ⭐⭐⭐⭐ WHO IS ON BYE, FROM THE SCHEDULE RATHER THAN FROM A PLAYER COLUMN — b132.
        Trey: "Yes, I want this to be focused on bye weeks."
@@ -882,6 +921,9 @@ connectRouter.get('/sleeper/team-hub', async (req, res) => {
       faabLeft,      // { [rosterId]: dollars remaining }
       schedule,      // { [week]: [[rosterIdA, rosterIdB], ...] } for the rest of the regular season
       weekly,        // { [player_id]: { pts, opp, team, date, gameId, inj, ... } } for THIS week
+      /* b169 — the three weeks after this one: { [player_id]: [[pts, opp] | null, ...] }, aligned to weeksNext */
+      weeksNext: nextWeeks,
+      weeklyNext,
       matchupDifficulty,  // { [defTeam]: { QB/RB/WR/TE: { rank, of, tier, pg } } } season-to-date pts allowed/game
     });
   } catch (e) {
