@@ -422,10 +422,24 @@ export function packNextWeeks(maps, weeks) {
   return out;
 }
 
+/* ⭐⭐⭐⭐⭐ b170 — ONE FETCH PER WEEK, SHARED BY EVERY LEAGUE. Trey: "It's also taking 10-15 seconds to load."
+   b169 added the next three weeks to the hub, and this function fetched Sleeper's weekly projection feed
+   DIRECTLY and UNCACHED — so a home page with eleven leagues asked Sleeper for the same four weeks eleven
+   times over, forty-four paced downloads of a multi-megabyte file, most of them identical. The feed is a
+   fact about the NFL, not about a league, so it is cached by (season, week) with the same single-flight
+   helper the live route uses: eleven leagues now share four downloads, and a second visit shares zero.
+   ⚠ THE CACHE KEY MUST NOT INCLUDE THE LEAGUE OR ITS SCORING. The raw stat rows are shared; the SCORING is
+     applied per league below, which is what keeps a half-PPR league honest while still reusing the bytes.
+   `fetcher` is injectable so the sharing itself can be tested without Sleeper (scripts/weekahead.test.js). */
+export const WEEKLY_TTL_MS = 10 * 60 * 1000;
+export function weeklyRows(season, week, fetcher) {
+  const f = fetcher || getWeeklyProjections;
+  return cachedCall(`wp|${season}|${week}`, WEEKLY_TTL_MS, async () => (await f(season, week)) || []);
+}
 async function weeklyProjectionMap({ season, week, ptsField, score }) {
   const weekly = {};
   try {
-    const wp = (await getWeeklyProjections(season, week)) || [];
+    const wp = (await weeklyRows(season, week)) || [];
     for (const row of wp) {
       const pid = row.player_id; if (!pid) continue;
       const st = row.stats || {};

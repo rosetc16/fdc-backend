@@ -2,7 +2,7 @@
    they project comparatively to ensure it's not just a one week thing... particularly important for defenses
    for matchups." The shaping is pure so it can be checked without Sleeper. */
 import assert from 'assert';
-import { weeksAfter, packNextWeeks } from '../src/routes/connect.js';
+import { weeksAfter, packNextWeeks, weeklyRows } from '../src/routes/connect.js';
 
 let n = 0;
 const ok = (m, x) => { n++; console.log('  PASS  ' + m + (x ? `   [${x}]` : '')); };
@@ -33,5 +33,22 @@ ok('every player keeps one slot per week, opponent included (null when the feed 
 assert.deepEqual(packNextWeeks([], [10, 11, 12]), {});
 assert.deepEqual(packNextWeeks(null, null), {});
 ok('an unavailable projection feed packs to an empty table rather than throwing');
+
+/* ⭐⭐⭐⭐⭐ b170 — ELEVEN LEAGUES MUST NOT FETCH THE SAME WEEK ELEVEN TIMES. This is the 10-15 second home
+   page: the weekly projection feed was fetched per league, uncached and paced. */
+{
+  let calls = 0;
+  const fake = async () => { calls++; await new Promise((r) => setTimeout(r, 10)); return [{ player_id: '1', stats: {} }]; };
+  const all = await Promise.all(Array.from({ length: 11 }, () => weeklyRows('2026', 99, fake)));
+  assert.equal(calls, 1);
+  assert.ok(all.every((r) => r.length === 1));
+  ok('⭐⭐⭐⭐⭐ eleven concurrent readers of one week share ONE download', `${calls} fetch for 11 callers`);
+  await weeklyRows('2026', 99, fake);
+  assert.equal(calls, 1);
+  ok('and a later reader inside the TTL fetches nothing at all');
+  await weeklyRows('2026', 98, fake);
+  assert.equal(calls, 2);
+  ok('a different week is a different download, not a stale hit');
+}
 
 console.log(`\n${n} passed`);
